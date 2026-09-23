@@ -1,0 +1,48 @@
+name: OPPO R11T kernel build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex cpio rsync xz-utils \
+            libssl-dev libelf-dev device-tree-compiler \
+            gcc-aarch64-linux-gnu dwarves
+
+      - name: Configure (sdm660_defconfig)
+        run: |
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- sdm660_defconfig
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+      - name: Build Image + DTBs + modules
+        run: |
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image dtbs modules
+
+      - name: List gauge artifacts
+        run: |
+          ls -la out/arch/arm64/boot/Image
+          ls -la out/arch/arm64/boot/dts/qcom/sdm660-oppo-r11t.dtb
+          ls -la out/drivers/power/supply/bq27xxx_battery*.ko
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oppo-r11t-boot
+          if-no-files-found: error
+          path: |
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/dts/qcom/sdm660-oppo-r11t.dtb
+            out/drivers/power/supply/bq27xxx_battery.ko
+            out/drivers/power/supply/bq27xxx_battery_i2c.ko
