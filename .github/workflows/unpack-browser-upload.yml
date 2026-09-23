@@ -1,0 +1,21 @@
+name: unpack browser-upload
+on: push
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: extract uploaded zip
+        run: |
+          test -f browser-upload.zip || exit 0
+          unzip -o browser-upload.zip
+          git add -f .github
+          git add -A
+          git rm -f --ignore-unmatch browser-upload.zip
+          git config user.name "browser-upload"
+          git config user.email "browser-upload@local"
+          git diff --cached --quiet && exit 0
+          git commit -m "OPPO R11T: fix bq27541 gauge register map and stock charging policy"
+          git push
