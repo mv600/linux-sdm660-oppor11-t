@@ -316,7 +316,7 @@
 	status = "okay";
 
 	fuel-gauge@55 {
-		compatible = "ti,bq27541";
+		compatible = "oppo,bq27541-battery";
 		reg = <0x55>;
 	};
 };
@@ -344,12 +344,16 @@
 	};
 };
 
-/* Stock uses 4.35 V/2 A; keep conventional 5 V charging capped at 1.5 A. */
+/*
+ * Stock OPPO policy: bq27541 design 2925 mAh, 4.3725 V float, 2 A ceiling.
+ * VOOC fast charge is not ported yet; with a VOOC-only adapter the SMB2
+ * charger stays at SDP/UNKNOWN 100 mA, so use a standard 5 V/2 A adapter.
+ */
 &battery {
-	charge-full-design-microamp-hours = <3220000>;
+	charge-full-design-microamp-hours = <2925000>;
 	voltage-min-design-microvolt = <3400000>;
-	voltage-max-design-microvolt = <4350000>;
-	constant-charge-current-max-microamp = <1500000>;
+	voltage-max-design-microvolt = <4372500>;
+	constant-charge-current-max-microamp = <2000000>;
 };
 
 &pm660_charger {

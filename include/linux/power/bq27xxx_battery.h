@@ -36,6 +36,7 @@ enum bq27xxx_chip {
 	BQ28Z610,
 	BQ34Z100,
 	BQ78Z100,
+	BQ27541_OPPO, /* OPPO R11T stock bq27541 with OPPO-custom firmware map */
 };
 
 struct bq27xxx_device_info;
