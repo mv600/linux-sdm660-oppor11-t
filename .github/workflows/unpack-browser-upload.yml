@@ -2,7 +2,6 @@ name: unpack browser-upload
 on: push
 permissions:
   contents: write
-  workflows: write
 jobs:
   unpack:
     runs-on: ubuntu-latest
