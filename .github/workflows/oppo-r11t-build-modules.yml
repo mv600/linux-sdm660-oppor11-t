@@ -1,0 +1,85 @@
+name: OPPO R11T kernel module archive
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout deployment (self)
+        uses: actions/checkout@v4
+        with:
+          path: deploy
+      - name: Checkout kernel fork (battery+VOOC+NFC fixes)
+        uses: actions/checkout@v4
+        with:
+          repository: mv600/linux-sdm660-oppor11-t
+          ref: qcom-sdm660-7.0.y
+          path: deploy/linux
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex cpio rsync xz-utils bzip2 \
+            device-tree-compiler gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross libssl-dev libelf-dev python3-pip kmod
+      - name: Build kernel Image + dtb + modules
+        run: |
+          cd "$GITHUB_WORKSPACE/deploy/linux"
+          make O=build ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= sdm660_defconfig
+          make O=build ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= olddefconfig
+          # Match the deployment-layer GCC build (-sdm660-gcc+) so modules
+          # land in /lib/modules/<release> of the running kernel.
+          ./scripts/config --file build/.config \
+            --set-str LOCALVERSION -sdm660-gcc+ --disable LOCALVERSION_AUTO
+          make O=build ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= olddefconfig
+          make O=build ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= \
+            -j"$(nproc)" Image qcom/sdm660-oppo-r11t.dtb modules
+      - name: Install + archive full module set
+        run: |
+          cd "$GITHUB_WORKSPACE/deploy/linux"
+          REL=$(make -s O=build ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= kernelrelease)
+          VER=$(make -s O=build ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- kernelversion)
+          if [ "$REL" != "$VER-sdm660-gcc+" ]; then
+            echo "kernel release mismatch: got $REL want $VER-sdm660-gcc+" >&2
+            exit 1
+          fi
+          echo "kernel_release=$REL" >> "$GITHUB_ENV"
+          rm -rf out/modroot
+          make O=build ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= \
+            modules_install INSTALL_MOD_PATH="$PWD/out/modroot" INSTALL_MOD_STRIP=1
+          rm -f "out/modroot/lib/modules/$REL/build" "out/modroot/lib/modules/$REL/source"
+          depmod -b out/modroot "$REL"
+          tar --zstd -cf "$GITHUB_WORKSPACE/modules-r11t-gcc.tar.zst" \
+            -C out/modroot "lib/modules/$REL"
+          echo "kernel release: $REL"
+          echo "module dirs:"
+          ls out/modroot/lib/modules/
+      - name: List artifacts
+        run: |
+          ls -la deploy/linux/build/arch/arm64/boot/Image
+          ls -la deploy/linux/build/arch/arm64/boot/dts/qcom/sdm660-oppo-r11t.dtb
+          ls -la modules-r11t-gcc.tar.zst
+      - name: Upload module archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-r11t-gcc
+          if-no-files-found: error
+          path: modules-r11t-gcc.tar.zst
+      - name: Upload boot artifacts (Image/dtb/ko)
+        uses: actions/upload-artifact@v4
+        with:
+          name: oppo-r11t-boot
+          if-no-files-found: error
+          path: |
+            deploy/linux/build/arch/arm64/boot/Image
+            deploy/linux/build/arch/arm64/boot/dts/qcom/sdm660-oppo-r11t.dtb
+            deploy/linux/build/drivers/power/supply/bq27xxx_battery.ko
+            deploy/linux/build/drivers/power/supply/bq27xxx_battery_i2c.ko
+            deploy/linux/build/drivers/power/supply/oppo_vooc.ko
+            deploy/linux/build/drivers/nfc/nxp-nci/nxp-nci.ko
+            deploy/linux/build/drivers/nfc/nxp-nci/nxp-nci_i2c.ko
