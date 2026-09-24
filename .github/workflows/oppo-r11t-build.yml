@@ -25,16 +25,23 @@ jobs:
         run: |
           make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- sdm660_defconfig
           make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          # Match the deployment-layer GCC build (-sdm660-gcc+) so modules
+          # land in /lib/modules/<release> of the running kernel.
+          ./scripts/config --file out/.config \
+            --set-str LOCALVERSION -sdm660-gcc+ --disable LOCALVERSION_AUTO
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
       - name: Build Image + DTBs + modules
         run: |
           make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image dtbs modules
 
-      - name: List gauge artifacts
+      - name: List artifacts
         run: |
           ls -la out/arch/arm64/boot/Image
           ls -la out/arch/arm64/boot/dts/qcom/sdm660-oppo-r11t.dtb
           ls -la out/drivers/power/supply/bq27xxx_battery*.ko
+          ls -la out/drivers/power/supply/oppo_vooc.ko
+          ls -la out/drivers/nfc/nxp-nci/nxp-nci.ko out/drivers/nfc/nxp-nci/nxp-nci_i2c.ko
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -46,3 +53,6 @@ jobs:
             out/arch/arm64/boot/dts/qcom/sdm660-oppo-r11t.dtb
             out/drivers/power/supply/bq27xxx_battery.ko
             out/drivers/power/supply/bq27xxx_battery_i2c.ko
+            out/drivers/power/supply/oppo_vooc.ko
+            out/drivers/nfc/nxp-nci/nxp-nci.ko
+            out/drivers/nfc/nxp-nci/nxp-nci_i2c.ko
