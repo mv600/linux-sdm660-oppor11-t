@@ -319,6 +319,56 @@
 		compatible = "oppo,bq27541-battery";
 		reg = <0x55>;
 	};
+
+	/*
+	 * OPPO VOOC fast-charge MCU (STM8S), i2c-2 0x26.
+	 * GPIO/pinctrl values taken from the stock R11 device tree.
+	 * Driver: drivers/power/supply/oppo_vooc.c
+	 * Protocol: final-deliverables/VOOC_PROTOCOL.md
+	 */
+	stm8s-fastcg@26 {
+		compatible = "oppo,stm8s-fastcg";
+		reg = <0x26>;
+
+		qcom,charging_switch1-gpio = <&tlmm 75 GPIO_ACTIVE_HIGH>;
+		qcom,charging_reset-gpio = <&tlmm 55 GPIO_ACTIVE_HIGH>;
+		qcom,charging_clock-gpio = <&tlmm 51 GPIO_ACTIVE_HIGH>;
+		qcom,charging_data-gpio = <&tlmm 44 GPIO_ACTIVE_HIGH>;
+		qcom,chargerid_switch-gpio = <&tlmm 65 GPIO_ACTIVE_HIGH>;
+
+		/* stock R11: 4400 mV battery, STM8S fw type 5, low-temp 12.0 degC */
+		qcom,oppo_batt_4400mv;
+		qcom,vooc-fw-type = <5>;
+		qcom,vooc-low-temp = <0x78>;
+
+		firmware-name = "oppo/r11/oppo_vooc_fw.bin";
+
+		/* charger-ID ADC (PM660 VADC AMUX3, see &pm660_adc below) */
+		io-channels = <&pm660_adc ADC5_AMUX_THM3>;
+		io-channel-names = "chargerid";
+
+		pinctrl-names = "switch1_act_switch2_act",
+				"switch1_sleep_switch2_sleep",
+				"switch1_act_switch3_act",
+				"switch1_sleep_switch3_sleep",
+				"switch1_act_switch2_sleep",
+				"switch1_sleep_switch2_act",
+				"clock_active", "clock_sleep",
+				"data_active", "data_sleep",
+				"reset_active", "reset_sleep";
+		pinctrl-0 = <&vooc_sw1_act_sw2_act>;
+		pinctrl-1 = <&vooc_sw1_slp_sw2_slp>;
+		pinctrl-2 = <&vooc_sw1_act_sw3_act>;
+		pinctrl-3 = <&vooc_sw1_slp_sw3_slp>;
+		pinctrl-4 = <&vooc_sw1_act_sw2_slp>;
+		pinctrl-5 = <&vooc_sw1_slp_sw2_act>;
+		pinctrl-6 = <&vooc_clock_active>;
+		pinctrl-7 = <&vooc_clock_sleep>;
+		pinctrl-8 = <&vooc_data_active>;
+		pinctrl-9 = <&vooc_data_sleep>;
+		pinctrl-10 = <&vooc_reset_active>;
+		pinctrl-11 = <&vooc_reset_sleep>;
+	};
 };
 
 &blsp_i2c6 {
@@ -341,6 +391,25 @@
 
 		vddd-supply = <&vreg_l13a_1p8>;
 		reset-gpios = <&tlmm 80 GPIO_ACTIVE_HIGH>;
+	};
+
+	/* OPPO R11T NFC (NXP NQ, i2c-6 0x28). Stock DT evidence:
+	 * qcom,nq-irq=28, qcom,nq-ven=29, qcom,nq-firm=30,
+	 * qcom,nq-esepwr=31, qcom,nq-clkreq=4; pm660_l13 supplies 1.8V.
+	 * mainline nxp-nci driver consumes enable/firmware-gpios + IRQ. */
+	nq@28 {
+		compatible = "qcom,nq-nci";
+		reg = <0x28>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <28 IRQ_TYPE_LEVEL_HIGH>;
+
+		enable-gpios = <&tlmm 29 GPIO_ACTIVE_HIGH>;
+		firmware-gpios = <&tlmm 30 GPIO_ACTIVE_HIGH>;
+
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&r11t_nfc_int_active &r11t_nfc_enable_active>;
+		pinctrl-1 = <&r11t_nfc_int_suspend &r11t_nfc_enable_suspend>;
 	};
 };
 
@@ -381,6 +450,16 @@
 		color = <LED_COLOR_ID_WHITE>;
 		function = LED_FUNCTION_STATUS;
 		default-state = "off";
+	};
+};
+
+&pm660_adc {
+	/* OPPO charger-ID resistor network on AMUX3 (stock VADC ch 0x12) */
+	channel@f {
+		reg = <ADC5_AMUX_THM3>;
+		qcom,decimation = <1024>;
+		qcom,pre-scaling = <1 1>;
+		label = "charger_id";
 	};
 };
 
@@ -556,6 +635,36 @@
 		bias-pull-up;
 	};
 
+	/* NFC: stock nfc_int_active/suspend (gpio28), nfc_enable_* (gpio29-31),
+	 * all function=gpio, drive-strength 2 (from OPPO R11 device tree). */
+	r11t_nfc_int_active: r11t-nfc-int-active-state {
+		pins = "gpio28";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	r11t_nfc_int_suspend: r11t-nfc-int-suspend-state {
+		pins = "gpio28";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	r11t_nfc_enable_active: r11t-nfc-enable-active-state {
+		pins = "gpio29", "gpio30", "gpio31";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	r11t_nfc_enable_suspend: r11t-nfc-enable-suspend-state {
+		pins = "gpio29", "gpio30", "gpio31";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
 	r11t_ts_reset_active: r11t-ts-reset-active-state {
 		pins = "gpio66";
 		function = "gpio";
@@ -584,6 +693,84 @@
 			drive-strength = <8>;
 			bias-disable;
 		};
+	};
+
+	/*
+	 * OPPO VOOC pins (stock R11: switch1=75, clock=51, data=44,
+	 * reset=55, chargerid=65). "active" groups use bias-pull-up,
+	 * "sleep" groups bias-pull-down; mux is plain gpio, drive 2 mA.
+	 */
+	vooc_sw1_act_sw2_act: vooc-sw1-act-sw2-act-state {
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+	vooc_sw1_slp_sw2_slp: vooc-sw1-sleep-sw2-sleep-state {
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+	vooc_sw1_act_sw3_act: vooc-sw1-act-sw3-act-state {
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+	vooc_sw1_slp_sw3_slp: vooc-sw1-sleep-sw3-sleep-state {
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+	vooc_sw1_act_sw2_slp: vooc-sw1-act-sw2-sleep-state {
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+	vooc_sw1_slp_sw2_act: vooc-sw1-sleep-sw2-active-state {
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+	vooc_clock_active: vooc-clock-active-state {
+		pins = "gpio51";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+	vooc_clock_sleep: vooc-clock-sleep-state {
+		pins = "gpio51";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+	vooc_data_active: vooc-data-active-state {
+		pins = "gpio44";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+	vooc_data_sleep: vooc-data-sleep-state {
+		pins = "gpio44";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+	vooc_reset_active: vooc-reset-active-state {
+		pins = "gpio55";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+	vooc_reset_sleep: vooc-reset-sleep-state {
+		pins = "gpio55";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
 	};
 
 	r11t_sec_mi2s_active: r11t-sec-mi2s-active-state {

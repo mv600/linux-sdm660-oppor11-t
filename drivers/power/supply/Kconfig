@@ -1141,3 +1141,11 @@ config FUEL_GAUGE_MM8013
 	  capacity, etc.
 
 endif # POWER_SUPPLY
+
+config CHARGER_OPPO_VOOC
+	tristate "OPPO VOOC fast charger (R11/R11T)"
+	depends on I2C && GPIOLIB && POWER_SUPPLY && IIO
+	help
+	  OPPO VOOC fast-charge driver for CPH1707 (R11) / R11T.
+	  Reverse-engineered one-wire + STM8S firmware-update
+	  protocol; see final-deliverables/VOOC_PROTOCOL.md.

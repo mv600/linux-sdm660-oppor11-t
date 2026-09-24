@@ -342,12 +342,15 @@ static void nxp_nci_i2c_remove(struct i2c_client *client)
 
 static const struct i2c_device_id nxp_nci_i2c_id_table[] = {
 	{ "nxp-nci_i2c" },
+	{ "nq-nci" },
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, nxp_nci_i2c_id_table);
 
 static const struct of_device_id of_nxp_nci_i2c_match[] = {
 	{ .compatible = "nxp,nxp-nci-i2c", },
+	/* OPPO R11T: stock node compatible is qcom,nq-nci (NXP NQ family). */
+	{ .compatible = "qcom,nq-nci", },
 	{}
 };
 MODULE_DEVICE_TABLE(of, of_nxp_nci_i2c_match);
