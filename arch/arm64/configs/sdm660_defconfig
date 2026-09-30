@@ -65,7 +65,10 @@ CONFIG_CPU_FREQ_GOV_POWERSAVE=m
 CONFIG_CPU_FREQ_GOV_USERSPACE=m
 CONFIG_CPU_FREQ_GOV_ONDEMAND=m
 CONFIG_CPU_FREQ_GOV_CONSERVATIVE=m
-CONFIG_CPUFREQ_DT=y
+# CONFIG_CPUFREQ_DT is not set
+# OSM CPU clock/cpufreq for the R11T: the DTB node and the driver were both
+# missing, so neither cluster had a cpufreq policy at all.
+CONFIG_CPUFREQ_R11T_OSM=m
 CONFIG_ARM_QCOM_CPUFREQ_NVMEM=m
 CONFIG_ARM_QCOM_CPUFREQ_HW=m
 # CONFIG_SCHED_SMT is not set
@@ -963,6 +966,9 @@ CONFIG_CRYPTO_KRB5=m
 CONFIG_DMA_CMA=y
 CONFIG_CMA_SIZE_MBYTES=32
 CONFIG_PRINTK_TIME=y
+# HZ=250 made adreno_gpu.h's msecs_to_jiffies(1000) idle timeout land on
+# 250 jiffies and starved the hangcheck timer; 1000 Hz also makes the
+# hung-task and soft-lockup detectors fire on round second boundaries.
 CONFIG_HZ_1000=y
 CONFIG_HZ=1000
 CONFIG_DYNAMIC_DEBUG=y
