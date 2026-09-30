@@ -313,14 +313,30 @@ static int osm_parse_lut(struct device *dev, struct osm_cluster *c)
 	unsigned int prop_len, total, i, n_mv;
 	int ret, n_cpu, cpu;
 
-	ret = of_property_read_u32_array(np, cluster_lut_prop[c->num],
-					 NULL, 0);
+	/*
+	 * 元素个数**必须**用 of_property_count_u32_elems() 拿。
+	 *
+	 * CAF 时代那个"传 NULL 拿长度"的写法
+	 *     of_property_read_u32_array(np, name, NULL, 0)
+	 * 在本树 (7.0) 上返回的是 **0**，不是字节数：
+	 *   include/linux/of.h 的 inline 是
+	 *       ret = of_property_read_variable_u32_array(np, name, NULL, 0, 0);
+	 *       if (ret >= 0) return 0;
+	 *   而 of_property_read_variable_u32_array() 里有
+	 *       if (!sz_max) sz = sz_min;      // sz_min 就是传进来的 0
+	 *       return sz;                     // = 0
+	 * 于是 ret<=0 的判断把"读成功"当成"属性缺失"。2026-09-30 真机症状：
+	 *     missing qcom,pwrcl-speedbin0-v0
+	 *     probe with driver ... failed with error -22      (-EINVAL)
+	 * 属性在 DT 里是全的（pwrcl 8 行 x 5、perfcl 7 行 x 5），别再去查 DTS。
+	 */
+	ret = of_property_count_u32_elems(np, cluster_lut_prop[c->num]);
 	if (ret <= 0) {
 		dev_err(dev, "missing %s\n", cluster_lut_prop[c->num]);
 		return ret < 0 ? ret : -EINVAL;
 	}
-	prop_len = ret;
-	total = prop_len / sizeof(u32);
+	total = ret;
+	prop_len = total * sizeof(u32);
 	if (!total || total % OSM_LUT_NFIELDS) {
 		dev_err(dev, "%s: bad length %u bytes\n",
 			cluster_lut_prop[c->num], prop_len);
@@ -342,13 +358,12 @@ static int osm_parse_lut(struct device *dev, struct osm_cluster *c)
 	if (ret)
 		return ret;
 
-	ret = of_property_read_u32_array(np, cluster_volt_prop[c->num],
-					 NULL, 0);
+	ret = of_property_count_u32_elems(np, cluster_volt_prop[c->num]);
 	if (ret <= 0) {
 		dev_err(dev, "missing %s\n", cluster_volt_prop[c->num]);
 		return ret < 0 ? ret : -EINVAL;
 	}
-	n_mv = ret / sizeof(u32);
+	n_mv = ret;
 	if (!n_mv) {
 		dev_err(dev, "%s: empty\n", cluster_volt_prop[c->num]);
 		return -EINVAL;
@@ -407,13 +422,12 @@ static int osm_parse_lut(struct device *dev, struct osm_cluster *c)
 		}
 	}
 
-	ret = of_property_read_u32_array(np, cluster_cpu_prop[c->num],
-					 NULL, 0);
+	ret = of_property_count_u32_elems(np, cluster_cpu_prop[c->num]);
 	if (ret <= 0) {
 		dev_err(dev, "missing %s\n", cluster_cpu_prop[c->num]);
 		return ret < 0 ? ret : -EINVAL;
 	}
-	n_cpu = ret / sizeof(u32);
+	n_cpu = ret;
 
 	raw = devm_kcalloc(dev, n_cpu, sizeof(*raw), GFP_KERNEL);
 	if (!raw)
