@@ -205,6 +205,24 @@ config CPU_FREQ_GOV_SCHEDUTIL
 
 comment "CPU frequency scaling drivers"
 
+config CPUFREQ_R11T_OSM
+	tristate "OPPO R11T (SDM660) OSM cpufreq driver"
+	depends on CPU_FREQ && OF && ARM64
+	help
+	  Brings up the two CPU clusters of the OPPO R11T (Qualcomm SDM660)
+	  under cpufreq control, using the OSM (One Speed Manager) lookup
+	  table published in the device tree.  The R11T DTB has no
+	  qcom,msm-cpufreq node and no qcom,clk-cpu-osm node, so without this
+	  driver no cpufreq policy exists at all and both clusters stay at
+	  whatever rate the bootloader left them at.
+
+	  The driver defaults to "dryrun": the OSM table is not written and the
+	  frequency is never changed, so a first boot is inert.  Compare
+	  /sys/kernel/debug/qcom_r11t_osm/{regs,lut} and only then set
+	  dryrun=0.
+
+	  Say N if not applicable.
+
 config CPUFREQ_DT
 	tristate "Generic DT based cpufreq driver"
 	depends on HAVE_CLK && OF
