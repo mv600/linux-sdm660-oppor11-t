@@ -81,6 +81,28 @@
 #define OSM_DCVS_PERF_STATE_DESIRED	0x1F10	/* [caf:98] */
 
 /*
+ * Per cluster slot size INSIDE the single "osm" reg region.
+ *
+ * The reg window holds MAX_CLUSTER_CNT (2) slots back to back:
+ *
+ *   pwrcl slot  = reg->start + 0 * 8192 = reg->start
+ *   perfcl slot = reg->start + 1 * 8192 = reg->start + 0x2000
+ *
+ * CAF does exactly this [caf:1279-1282]:
+ *
+ *   perfcl_clk.pbases[OSM_BASE] = pwrcl_clk.pbases[OSM_BASE] +
+ *                               perfcl_clk.cluster_num * OSM_CORE_TABLE_SIZE;
+ *
+ * Two independent proofs that 8192 is right and not a guess:
+ *   - OSM_DCVS_PERF_STATE_DESIRED (0x1F10) + 8192 = 0x3F10 < 0x4000, so both
+ *     clusters' performance state request registers fit in the declared
+ *     window.  A single shared table would only need a 0x2000 window.
+ *   - the DT node declares reg = <0x179c0000 0x4000>, i.e. exactly 2 * 8192.
+ *     Nothing else in that window is 8192-aligned.
+ */
+#define OSM_CORE_TABLE_SIZE		8192	/* [caf:108] */
+
+/*
  * OSM_VOLT_REG field layout, from CAF's clk_osm_setup_hw_table() [caf:1544]:
  *     volt_val = BVAL(21, 16, virtual_corner) | BVAL(11, 0, open_loop_volt)
  * with BM(msb,lsb) = (((uint32_t)-1 << (31-msb)) >> (31-msb+lsb)) << lsb, so
@@ -141,7 +163,7 @@ static struct osm_dev *osmdev;
 static bool dryrun = true;
 module_param(dryrun, bool, 0644);
 MODULE_PARM_DESC(dryrun,
-		 "Default true: OSM table is not written and the frequency is never changed. Set to 0 only after /sys/kernel/debug/qcom_r11t_osm/regs has been compared against the parsed table.");
+		 "Default true: OSM table is not written, the frequency stays wherever the bootloader left it, and nothing can overclock the silicon. To go live you must reload the module with dryrun=0 (modprobe qcom_r11t_osm_cpufreq dryrun=0); writing 0 to /sys/module/qcom_r11t_osm_cpufreq/parameters/dryrun is WRONG because that only flips the bool and never builds the table, leaving the hardware indexing rows of an all-zero table. Note dryrun=0 is not a revert: it does not clear the table, so reboot to get back to the bootloader's clean state.");
 
 static int pwrcl_max_row = -1;
 module_param(pwrcl_max_row, int, 0444);
@@ -174,7 +196,25 @@ static inline void osm_mb(struct osm_cluster *c)
  * [caf:1533-1571]:
  *   write INDEX=i, then FREQ / VOLT / OVERRIDE / SPARE at
  *   <reg> + i * OSM_REG_SIZE, for i in 0 .. OSM_TABLE_SIZE-1.
- * Rows >= num_entries are written as zero, exactly like CAF.
+ *
+ * On the tail rows (i >= num_entries) CAF has NO else branch, so it
+ * repeats the last valid row's values into rows num_entries..39.  An
+ * earlier comment here claimed "rows >= num_entries are written as zero,
+ * exactly like CAF" -- that was wrong and has been measured to be wrong:
+ * with dryrun=0 the hardware row7 came back byte identical to row6.
+ * This port now does the same thing on purpose.
+ *
+ * The four value locals are still zero initialised, matching CAF [caf:1539].
+ * That only matters in the degenerate num_entries == 0 case, where CAF
+ * writes zeros into every row while an uninitialised port would have
+ * written whatever was on the stack -- real undefined behaviour, and the
+ * reason this port used to differ from CAF at all.
+ *
+ * The repeated tail rows are harmless: osm_set_row() rejects any index
+ * >= num_entries with -EINVAL before touching DCVS_PERF_STATE_DESIRED, so
+ * no code path can ever select them.  Do not "fix" this by zeroing the
+ * tail unless the CAF reference is changed too -- a zeroed FREQ_REG is a
+ * different hardware state from a repeated one.
  *
  * VOLT_REG is not a raw DT value, it is built as
  *     BVAL(21, 16, virtual_corner) | BVAL(11, 0, open_loop_volt)
@@ -184,7 +224,7 @@ static inline void osm_mb(struct osm_cluster *c)
 static int osm_setup_hw_table(struct osm_cluster *c)
 {
 	const struct osm_lut_entry *entry = c->lut;
-	u32 freq_val, volt_val, override_val, spare_val;
+	u32 freq_val = 0, volt_val = 0, override_val = 0, spare_val = 0;
 	u32 offset, last_spare = 0;
 	u16 last_vc = 0;
 	int i;
@@ -593,15 +633,29 @@ static unsigned int r11t_osm_get(unsigned int cpu)
  * Ask the OSM for LUT row @row.  Everything about voltage and ramp ordering is
  * the OSM's job; see osm_setup_hw_table() and the comment above.
  */
-static int r11t_osm_set_row(struct osm_cluster *c, unsigned int row,
-			    unsigned int khz)
+static int r11t_osm_set_row(struct osm_cluster *c, unsigned int row)
 {
-	if (dryrun) {
-		dev_info_ratelimited(c->dev,
-				    "%s: dryrun, refusing %u kHz (LUT row %u)\n",
-				    c->name, khz, row);
+	/*
+	 * dryrun=1 is the SAFE DEFAULT, so refusing to change the frequency is
+	 * normal operation, not an anomaly.  There used to be a
+	 * dev_info_ratelimited() here, which was wrong twice over:
+	 *
+	 *  - This is the cpufreq hot path: it runs on every frequency
+	 *    transition, so thousands of times a second under the performance
+	 *    governor.  Even the per-call-site bucket (burst 10, interval 5 s)
+	 *    lets the first 10 through immediately and then one every 5 s
+	 *    forever, which is just noise for the rest of the session.
+	 *  - ___ratelimit() takes raw_spin_trylock_irqsave() on EVERY call,
+	 *    including the ones whose message is about to be dropped.  Paying
+	 *    an atomic operation per frequency change to suppress a log line
+	 *    that should not exist at all is a bad trade.
+	 *
+	 * probe() already says "dryrun=1: OSM table NOT written, frequency
+	 * left as the bootloader set it" exactly once.  That is the whole
+	 * message; nothing is lost by staying silent from here.
+	 */
+	if (dryrun)
 		return 0;
-	}
 
 	return osm_set_row(c, row);
 }
@@ -621,7 +675,7 @@ static int r11t_osm_target_index(struct cpufreq_policy *policy,
 	pr_debug("%s: %u kHz -> LUT row %u\n", c->name,
 		 policy->freq_table[index].frequency, row);
 
-	return r11t_osm_set_row(c, row, policy->freq_table[index].frequency);
+	return r11t_osm_set_row(c, row);
 }
 
 /*
@@ -888,13 +942,33 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		c->name = cluster_name[i];
 		c->dev = dev;
 		/*
-		 * Both clusters share one OSM block.  The per cluster pwrcl /
-		 * perfcl RCGR and PLL offsets are deliberately NOT programmed
-		 * here: CAF's PLL_BASE writes (PLL_MODE = 0x0 then 0x7)
+		 * One reg window, TWO independent 8 KiB slots -- one per cluster.
+		 *
+		 * 2026-10-01: this used to be "c->base = p->base" for both
+		 * clusters, on the reading that the OSM block is a shared global
+		 * singleton.  That holds for OSM_ENABLE_REG and for the runtime
+		 * row switch, but NOT for the LUT: osm_setup_hw_table() WRITES to
+		 * c->base + OSM_INDEX_REG + i * OSM_REG_SIZE, so with a shared
+		 * base the second call (perfcl) overwrote every row the first
+		 * call (pwrcl) had just programmed.  Measured on hardware with
+		 * dryrun=0: the pwrcl rows came back identical to the perfcl rows
+		 * (0x404003a/0x4040049/0x404005b/... == perfcl freq_data), and a
+		 * 633.6 MHz request on a little core executed the 1113.6 MHz
+		 * definition.  The little cluster was running the big cluster's
+		 * frequency AND voltage table.
+		 *
+		 * CAF separates the slots by OSM_CORE_TABLE_SIZE [caf:1279-1282],
+		 * which is what i * OSM_CORE_TABLE_SIZE below reproduces.
+		 *
+		 * The per cluster pwrcl / perfcl PLL offsets are still NOT
+		 * programmed: CAF's PLL_BASE writes (PLL_MODE = 0x0 then 0x7)
 		 * [caf:1510-1517] are part of a bring up sequence we have not
 		 * reproduced, and the bootloader has already set up the PLLs.
+		 * Those live in separate "pwrcl_pll" / "perfcl_pll" resources,
+		 * not inside this window, so leaving them alone does not make the
+		 * LUT shared.
 		 */
-		c->base = p->base;
+		c->base = p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE;
 	}
 
 	p->per_policy_governor =
@@ -927,7 +1001,7 @@ static int r11t_osm_probe(struct platform_device *pdev)
 
 	if (dryrun) {
 		dev_warn(dev,
-			 "dryrun=1: OSM table NOT written, frequency frozen. Compare /sys/kernel/debug/qcom_r11t_osm/regs with lut, then echo 0 > .../dryrun\n");
+			 "dryrun=1: OSM table NOT written, frequency left as the bootloader set it. /sys/kernel/debug/qcom_r11t_osm/regs is all zero in this mode, so it CANNOT be compared against lut. To go live: rmmod qcom_r11t_osm_cpufreq; modprobe qcom_r11t_osm_cpufreq dryrun=0 -- then regs will hold the two per-cluster tables and CAN be compared. Reboot to clear the hardware table again.\n");
 	} else {
 		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 			ret = osm_setup_hw_table(&p->cluster[i]);
