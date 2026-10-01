@@ -466,11 +466,26 @@
 	 * qcom,nq-esepwr=31, qcom,nq-clkreq=4; pm660_l13 supplies 1.8V.
 	 * mainline nxp-nci driver consumes enable/firmware-gpios + IRQ. */
 	nq@28 {
-		compatible = "qcom,nq-nci";
+		/*
+		 * compatible 用上游 mainline nxp-nci 的字符串，不要自造
+		 * "qcom,nq-nci" —— 那需要往 drivers/nfc/nxp-nci/i2c.c 的
+		 * of_match_table 里加一行，那就是永久性的上游分叉。
+		 */
+		compatible = "nxp,nxp-nci-i2c";
 		reg = <0x28>;
 
 		interrupt-parent = <&tlmm>;
-		interrupts = <28 IRQ_TYPE_LEVEL_HIGH>;
+		/*
+		 * EDGE, not LEVEL。nxp-nci/i2c.c 在 DT 平台刻意读
+		 * irq_get_trigger_type()，再配 IRQF_ONESHOT。NQ 芯片没有 vendor
+		 * 固件 blob 时会把 INT 线一直留高，于是 handler 返回、内核重新
+		 * arm、同一电平立刻再次触发。本机实测 52,327 次/秒
+		 * (irq/158, msmgpio 28 Level)，占掉一个核的 17%。
+		 * 电平长期高时不会再产生边沿，风暴结构上不可能发生。
+		 * 代价：若 NQ 要求 host 读完才拉低，edge 可能丢中断 —— 没有
+		 * datasheet 这一点定不了，但边沿严格好过永久 level 风暴。
+		 */
+		interrupts = <28 IRQ_TYPE_EDGE_RISING>;
 
 		enable-gpios = <&tlmm 29 GPIO_ACTIVE_HIGH>;
 		firmware-gpios = <&tlmm 30 GPIO_ACTIVE_HIGH>;
