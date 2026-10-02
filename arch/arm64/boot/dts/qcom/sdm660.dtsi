@@ -444,3 +444,23 @@
 &tsens {
 	#qcom,sensors = <14>;
 };
+
+/* Fix CPU physical ID mapping: bootloader has hardware cluster order
+ * {0,5,6,7} / {1,2,3,4} but DT describes {0-3}/{4-7}.  Correct reg
+ * so Linux CPU numbering matches hardware topology.
+ */
+&cpu0 {
+	reg = <0x0 0x4>;
+};
+
+&cpu1 {
+	reg = <0x0 0x5>;
+};
+
+&cpu2 {
+	reg = <0x0 0x6>;
+};
+
+&cpu3 {
+	reg = <0x0 0x7>;
+};
