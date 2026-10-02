@@ -304,8 +304,11 @@
 
 	osm_cpu: qcom,clk-cpu-660@179c0000 {
 		compatible = "qcom,r11t-osm-cpufreq";
-		reg = <0x179c0000 0x4000>;
-		reg-names = "osm";
+		reg = <0x179c0000 0x4000
+		       0x17916000 0x1000  0x17816000 0x1000
+		       0x179d1000 0x1000  0x784130 0x08  0x784130 0x08>;
+		reg-names = "osm", "pwrcl_pll", "perfcl_pll",
+			    "apcs_common", "pwrcl_efuse", "perfcl_efuse";
 
 		/* Logical CPU ids per cluster -- NOT the DT reg values.
 		 *
