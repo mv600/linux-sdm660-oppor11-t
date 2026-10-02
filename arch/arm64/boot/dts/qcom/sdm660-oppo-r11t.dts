@@ -310,6 +310,25 @@
 		reg-names = "osm", "pwrcl_pll", "perfcl_pll",
 			    "apcs_common", "pwrcl_efuse", "perfcl_efuse";
 
+		/*
+		 * Address pairs CAF needs to let the OSM state machine actually
+		 * re-program the PLL [caf:2273-2285].  Without these the OSM
+		 * accepts our row number, ENABLE_REG reads back 1 and every LUT row
+		 * lands correctly in the index/freq/ovr registers -- but PLL_L_VAL
+		 * never moves off the value the bootloader left there, so the
+		 * silicon keeps running one fixed frequency.
+		 *
+		 * Measured 2026-10-03 with dryrun=0: DCVS_PERF_STATE_DESIRED=4 on
+		 * perfcl (row 4 = 1958.4 MHz, freq_data 0x4040066, L_VAL = 0x66 =
+		 * 102) while PLL_L_VAL stayed 0x20 across three separate probes,
+		 * before and after the switch.  Values copied verbatim from the
+		 * stock R11T DTB.
+		 */
+		qcom,l-val-base       = <0x17916004 0x17816004>;
+		qcom,apcs-pll-user-ctl = <0x1791600c 0x1781600c>;
+		qcom,apcs-cfg-rcgr     = <0x17911054 0x17811054>;
+		qcom,apcs-cmd-rcgr     = <0x17911050 0x17811050>;
+
 		/* Logical CPU ids per cluster -- NOT the DT reg values.
 		 *
 		 * The DT blob lists big cores first (cpu@100..103 occupy blob
