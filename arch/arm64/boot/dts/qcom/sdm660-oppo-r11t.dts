@@ -307,12 +307,28 @@
 		reg = <0x179c0000 0x4000>;
 		reg-names = "osm";
 
-		/* CPU ids per cluster.  The stock vendor script writes
-		 * /sys/devices/system/cpu/cpu0/... and cpu4/..., and
-		 * lpm_levels/system/{pwr=cpu0..3,perf=cpu4..7}, and
-		 * cpu4/core_ctl/is_big_cluster = 1, so: */
-		qcom,pwrcl-cpus  = <0 1 2 3>;
-		qcom,perfcl-cpus = <4 5 6 7>;
+		/* Logical CPU ids per cluster -- NOT the DT reg values.
+		 *
+		 * The DT blob lists big cores first (cpu@100..103 occupy blob
+		 * positions 0..3), but arch/arm64/kernel/smp.c
+		 * of_parse_and_init_cpus() walks the nodes in blob order and
+		 * pins the boot CPU (MPIDR 0, i.e. cpu@0, blob position 4) to
+		 * logical id 0.  The logical ids therefore come out as
+		 *
+		 *     logical 0        <- cpu@0      (A53)   --+-- pwrcl (little)
+		 *     logical 5,6,7    <- cpu@1,2,3  (A53)   --'
+		 *     logical 1,2,3,4  <- cpu@100..103 (A73) --- perfcl (big)
+		 *
+		 * Confirmed against the stock CAF DTB: cpu@0..3 carry
+		 * efficiency 0x400 / 36 KiB L1 / 10 KiB TLB (A53) and are served
+		 * by cpu0_clk, while cpu@100..103 carry 0x666 / 72 KiB / 18 KiB
+		 * (A73) and are served by cpu4_clk.  There is no fallback if the
+		 * boot CPU hwid is not found: smp_init_cpus() just prints "missing
+		 * boot CPU MPIDR, not enabling secondaries" and the board comes
+		 * up single core, so cpu@0 must keep reg 0x0.
+		 */
+		qcom,pwrcl-cpus  = <0 5 6 7>;
+		qcom,perfcl-cpus = <1 2 3 4>;
 
 		/* Stock DT carried this, so both clusters get an independent
 		 * governor, like the factory Android build. */
