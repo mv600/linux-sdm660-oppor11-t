@@ -114,6 +114,21 @@
 
 #define OSM_DCVS_TIMEOUT_US		50000
 
+/* --------------------------------------------------------------- */
+/* PLL register offsets (READ ONLY for now).  Ported from           */
+/* work/caf-ref/clk-cpu-osm-660.c:116-126.                         */
+/* These live in the separate "pwrcl_pll" / "perfcl_pll" resources */
+/* -- they are NOT inside the OSM window at 0x179c0000.            */
+/* ------------------------------------------------------------------ */
+#define PLL_MODE              0x00  /* caf:116 */
+#define PLL_L_VAL             0x04  /* caf:117 */
+#define PLL_USER_CTRL         0x0C  /* caf:119 */
+#define PLL_CONFIG_CTL_LO     0x10  /* caf:120 */
+#define PLL_STATUS            0x2C  /* caf:121 */
+#define PLL_MODE_MAIN         0x07  /* caf:131 */
+#define PLL_WAIT_LOCK_TIME_US 5
+
+
 #define R11T_NR_CLUSTERS		2
 #define R11T_CLUSTER_PWRCL		0
 #define R11T_CLUSTER_PERFCL		1
@@ -154,6 +169,7 @@ struct osm_cluster {
 struct osm_dev {
 	struct device *dev;
 	void __iomem *base;
+	void __iomem *pll_base[R11T_NR_CLUSTERS];
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
 	bool per_policy_governor;
 };
@@ -174,6 +190,11 @@ static int perfcl_max_row = -1;
 module_param(perfcl_max_row, int, 0444);
 MODULE_PARM_DESC(perfcl_max_row,
 		 "Cap the big cluster to this LUT row (0 = lowest available). -1 = use every row in DT.");
+
+static bool pll_probe = true;
+module_param(pll_probe, bool, 0644);
+MODULE_PARM_DESC(pll_probe,
+		 "Probe-only: dump OSM + PLL registers to dmesg/debugfs without writing PLL.");
 
 static inline void osm_write(struct osm_cluster *c, u32 val, u32 offset)
 {
@@ -339,6 +360,44 @@ static int osm_set_row(struct osm_cluster *c, unsigned int index)
  * in it.  So on this board CAF skips ACD as well and the remaining three
  * statements are the whole enable sequence.
  */
+/* --------------------------------------------------------------- */
+/* Probe-only PLL dump (READ ONLY).  Ported from                  */
+/* clk_osm_setup_cluster_pll() [caf:1510-1531] but writes nothing. */
+/*                                                               */
+/* CAF writes to these registers to reprogram the PLL:           */
+/*   PLL_MODE=0x0  PLL_L_VAL=0x20  PLL_USER_CTRL=0x01000008        */
+/*   PLL_CONFIG_CTL_LO=0x20004AA8  PLL_MODE=0x2 -> 0x6 -> 0x7     */
+/* We only READ to check whether the bootloader has already      */
+/* locked the PLL (PLL_STATUS bit 0 = LOCK) before deciding if    */
+/* we need to reproduce that sequence.                             */
+/* ------------------------------------------------------------------ */
+static void osm_probe_pll(struct osm_dev *p)
+{
+	static const struct { const char *name; u32 off; } pll_regs[] = {
+		{ "PLL_MODE          ", PLL_MODE          },
+		{ "PLL_L_VAL         ", PLL_L_VAL         },
+		{ "PLL_USER_CTRL     ", PLL_USER_CTRL     },
+		{ "PLL_CONFIG_CTL_LO ", PLL_CONFIG_CTL_LO },
+		{ "PLL_STATUS        ", PLL_STATUS        },
+	};
+	int i, j;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		if (!p->pll_base[i]) {
+			dev_info(p->dev, "PLL probe: cluster %d: resource not present\n",
+				 i);
+			continue;
+		}
+		dev_info(p->dev, "PLL probe: cluster %d (base=%pa):\n",
+			 i, p->pll_base[i]);
+		for (j = 0; j < (int)ARRAY_SIZE(pll_regs); j++) {
+			u32 val = readl_relaxed(p->pll_base[i] + pll_regs[j].off);
+			dev_info(p->dev, "  %s (0x%02x) = 0x%08x\n",
+				 pll_regs[j].name, pll_regs[j].off, val);
+		}
+	}
+}
+
 static int osm_enable_hw(struct osm_cluster *c)
 {
 	udelay(5);
@@ -994,6 +1053,26 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	if (IS_ERR(p->base))
 		return PTR_ERR(p->base);
 
+	/* Map PLL resources (READ ONLY -- we don't write them yet) */
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		static const char * const pll_res_name[R11T_NR_CLUSTERS] = {
+			"pwrcl_pll", "perfcl_pll"
+		};
+		struct resource *pll_res;
+
+		pll_res = platform_get_resource(pdev, IORESOURCE_MEM, i + 1);
+		if (!pll_res) {
+			dev_info(dev, "%s resource not found, PLL probe will skip\n",
+				 pll_res_name[i]);
+			continue;
+		}
+		p->pll_base[i] = devm_ioremap_resource(dev, pll_res);
+		if (IS_ERR(p->pll_base[i])) {
+			p->pll_base[i] = NULL;
+			dev_warn(dev, "ioremap %s failed\n", pll_res_name[i]);
+		}
+	}
+
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		struct osm_cluster *c = &p->cluster[i];
 
@@ -1057,6 +1136,9 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	}
 
 	osmdev = p;
+
+	if (pll_probe)
+		osm_probe_pll(p);
 
 	if (dryrun) {
 		dev_warn(dev,
