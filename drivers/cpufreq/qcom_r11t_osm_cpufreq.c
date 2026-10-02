@@ -127,6 +127,35 @@
 #define PLL_STATUS            0x2C  /* caf:121 */
 #define PLL_MODE_MAIN         0x07  /* caf:131 */
 #define PLL_WAIT_LOCK_TIME_US 5
+/* --------------------------------------------------------------- */
+/* Sequencer registers.  These are offsets into the OSM window     */
+/* (OSM_BASE), NOT into the PLL window -- caf:414-417 writes them   */
+/* through c->vbases[OSM_BASE].  SEQ_REG(n) = 0x300 + n * 4        */
+/* [caf:71].                                                         */
+/*                                                                   */
+/* The four SEQ_REG slots below are what CAF programs so the OSM    */
+/* state machine knows HOW to re-program the PLL.  Until they hold  */
+/* the right addresses, the OSM accepts a row number and then does   */
+/* nothing: measured 2026-10-03, DCVS_PERF_STATE_DESIRED tracked our */
+/* request while PLL_L_VAL stayed frozen at the bootloader value.   */
+/* ------------------------------------------------------------------ */
+#define SEQ_REG(n)			(0x300 + (n) * 4)
+
+/* CAF sequence slots [caf:2273-2285] */
+#define SEQ_SLOT_L_VAL_BASE		0	/* l_val_base            */
+#define SEQ_SLOT_CFG_RCGR		16	/* apcs_cfg_rcgr         */
+#define SEQ_SLOT_PLL_USER_CTL		18	/* apcs_pll_user_ctl     */
+#define SEQ_SLOT_POST_DIV2		19	/* PLL_POST_DIV2 = 0x11F */
+#define SEQ_SLOT_CMD_RCGR		33	/* apcs_cmd_rcgr         */
+#define SEQ_SLOT_RCG_UPDATE		34	/* RCG_UPDATE = 0x3      */
+#define SEQ_SLOT_POST_DIV1		29	/* PLL_POST_DIV1 = 0x1F  */
+#define SEQ_SLOT_MIN_LVAL		21	/* PLL_MIN_LVAL = 43     */
+
+/* PLLMain / GPLL mux selectors [caf:150-152] */
+#define PLL_MAIN_SEL			0x300
+#define GPLL_SEL			0x400
+#define PLL_EARLY_SEL			0x500
+
 
 
 #define R11T_NR_CLUSTERS		2
@@ -170,6 +199,14 @@ struct osm_dev {
 	struct device *dev;
 	void __iomem *base;
 	void __iomem *pll_base[R11T_NR_CLUSTERS];
+	/* Absolute register addresses CAF hands to the OSM sequencer
+	 * [caf:2273-2285].  Each entry is an address pair from DT, one
+	 * element per cluster.  READ ONLY for now -- nothing writes these.
+	 */
+	u32 l_val_base[R11T_NR_CLUSTERS];
+	u32 pll_user_ctl[R11T_NR_CLUSTERS];
+	u32 cfg_rcgr[R11T_NR_CLUSTERS];
+	u32 cmd_rcgr[R11T_NR_CLUSTERS];
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
 	bool per_policy_governor;
 };
@@ -395,6 +432,34 @@ static void osm_probe_pll(struct osm_dev *p)
 			dev_info(p->dev, "  %s (0x%02x) = 0x%08x\n",
 				 pll_regs[j].name, pll_regs[j].off, val);
 		}
+	}
+
+	/* Sequencer slots: what the OSM state machine has been told to do
+	 * when we hand it a row number.  All zero (or garbage) here is the
+	 * direct explanation for "row number accepted, PLL never moves".
+	 */
+	dev_info(p->dev, "SEQ slots (OSM window, expect CAF values):\n");
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		dev_info(p->dev,
+			 "  cluster%d: SEQ_REG(0)=0x%08x SEQ_REG(16)=0x%08x "
+			 "SEQ_REG(18)=0x%08x SEQ_REG(21)=0x%08x\n",
+			 i,
+			 readl_relaxed(p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE + SEQ_REG(SEQ_SLOT_L_VAL_BASE)),
+			 readl_relaxed(p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE + SEQ_REG(SEQ_SLOT_CFG_RCGR)),
+			 readl_relaxed(p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE + SEQ_REG(SEQ_SLOT_PLL_USER_CTL)),
+			 readl_relaxed(p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE + SEQ_REG(SEQ_SLOT_MIN_LVAL)));
+	}
+	dev_info(p->dev, "SEQ slots (part 2):\n");
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		void __iomem *b = p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE;
+		dev_info(p->dev,
+			 "  cluster%d: SEQ_REG(19)=0x%08x SEQ_REG(29)=0x%08x "
+			 "SEQ_REG(33)=0x%08x SEQ_REG(34)=0x%08x\n",
+			 i,
+			 readl_relaxed(b + SEQ_REG(SEQ_SLOT_POST_DIV2)),
+			 readl_relaxed(b + SEQ_REG(SEQ_SLOT_POST_DIV1)),
+			 readl_relaxed(b + SEQ_REG(SEQ_SLOT_CMD_RCGR)),
+			 readl_relaxed(b + SEQ_REG(SEQ_SLOT_RCG_UPDATE)));
 	}
 }
 
