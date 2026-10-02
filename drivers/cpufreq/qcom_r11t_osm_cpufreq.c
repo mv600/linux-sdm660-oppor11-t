@@ -274,9 +274,18 @@ static int osm_setup_hw_table(struct osm_cluster *c)
 
 /*
  * Ask the OSM to move to LUT row @index.  Port of the tail of
- * clk_osm_set_rate() [caf:676-717]: software only writes the row number, the
- * OSM FSMs (safe/droop/wfx/ps, all enabled in the R11 DT) and the PMIC perform
- * the voltage ramp.
+ * clk_osm_set_rate() [caf:676-717]: software only writes the row number and the
+ * OSM hardware plus the PMIC perform the voltage ramp.
+ *
+ * Do NOT read this as "the FSMs are already configured".  They are not: the
+ * stock DTB carries qcom,safe-fsm-en / boost-fsm-en / wfx-fsm-en /
+ * ps-fsm-en / droop-fsm-en / pc-fsm-en, but this driver neither reads those
+ * six properties nor programs the matching registers that CAF programs in
+ * clk_osm_init_fsm() [caf:2126-2245].  Until that is ported, only
+ * ENABLE_REG and the LUT are set, so row changes are performed by the OSM
+ * without the safe/boost/droop FSM ramp sequencing CAF relies on.  Expect
+ * this to work for stepping between rows the LUT already covers; treat
+ * anything involving a voltage excursion as unproven.
  *
  * CAF also pokes LLM_SW_OVERRIDE_REG (0x1038) around this write, but only when
  * qcom,llm-sw-overr exists in DT.  The R11 stock DTB does not carry that
@@ -303,6 +312,56 @@ static int osm_set_row(struct osm_cluster *c, unsigned int index)
 	dev_warn_ratelimited(c->dev, "%s: OSM did not accept row %u\n",
 			     c->name, index);
 	return -ETIMEDOUT;
+}
+
+/*
+ * Turn the OSM hardware on.  Port of clk_osm_enable() [caf:726-750]:
+ *
+ *	rc = clk_osm_acd_init(cpuclk);		// may legitimately fail/be absent
+ *	udelay(5);
+ *	clk_osm_write_reg(cpuclk, 1, ENABLE_REG);
+ *	clk_osm_mb(cpuclk, OSM_BASE);
+ *	udelay(5);
+ *
+ * Without the ENABLE_REG write the OSM FSMs never run: the 16 LUT rows are
+ * programmed and DCVS_PERF_STATE_DESIRED accepts a row number, but nothing
+ * executes it, so scaling_cur_freq reports what software asked for while the
+ * silicon stays wherever the bootloader left it.  Measured on R11T with
+ * dryrun=0: both clusters reported ENABLE_REG == 0 and the CPU kept running at
+ * one fixed frequency no matter what the governor picked.
+ *
+ * The ACD half is omitted on purpose.  clk_osm_acd_init() [caf:3041-3048]
+ * returns immediately unless acd_init is set, and acd_init is only set when the
+ * DT supplies a "pwrcl_acd" / "perfcl_acd" memory resource [caf:1378,1396].
+ * The stock R11T DTB declares reg-names
+ *	"osm\0pwrcl_pll\0perfcl_pll\0apcs_common\0pwrcl_efuse\0perfcl_efuse"
+ * with no ACD slot, and none of the six qcom,acd*-val tunables occur anywhere
+ * in it.  So on this board CAF skips ACD as well and the remaining three
+ * statements are the whole enable sequence.
+ */
+static int osm_enable_hw(struct osm_cluster *c)
+{
+	udelay(5);
+
+	osm_write(c, 1, OSM_ENABLE_REG);
+	osm_mb(c);
+
+	udelay(5);
+
+	/* Read back rather than trust the write: if this is still 0 the OSM
+	 * will silently ignore every row number we hand it, and that must be
+	 * visible in the log instead of showing up as "frequency does not
+	 * change" much later.
+	 */
+	if (osm_read(c, OSM_ENABLE_REG) != 1) {
+		dev_err(c->dev,
+			"ENABLE_REG (0x%x) did not take the write, OSM stays off\n",
+			OSM_ENABLE_REG);
+		return -EIO;
+	}
+
+	dev_info(c->dev, "OSM hardware enabled\n");
+	return 0;
 }
 
 static unsigned int osm_get_row(struct osm_cluster *c)
@@ -1001,7 +1060,7 @@ static int r11t_osm_probe(struct platform_device *pdev)
 
 	if (dryrun) {
 		dev_warn(dev,
-			 "dryrun=1: OSM table NOT written, frequency left as the bootloader set it. /sys/kernel/debug/qcom_r11t_osm/regs is all zero in this mode, so it CANNOT be compared against lut. To go live: rmmod qcom_r11t_osm_cpufreq; modprobe qcom_r11t_osm_cpufreq dryrun=0 -- then regs will hold the two per-cluster tables and CAN be compared. Reboot to clear the hardware table again.\n");
+			 "dryrun=1: OSM table NOT written, ENABLE_REG untouched, frequency left as the bootloader set it. /sys/kernel/debug/qcom_r11t_osm/regs is all zero in this mode, so it CANNOT be compared against lut. To go live: rmmod qcom_r11t_osm_cpufreq; modprobe qcom_r11t_osm_cpufreq dryrun=0 -- then regs will hold the two per-cluster tables and CAN be compared. Reboot to clear the hardware table again.\n");
 	} else {
 		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 			ret = osm_setup_hw_table(&p->cluster[i]);
@@ -1013,6 +1072,21 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			}
 			dev_info(dev, "%s: programmed %u OSM rows\n",
 				 p->cluster[i].name, p->cluster[i].num_entries);
+		}
+
+		/* Table first, then ENABLE_REG: CAF also enables from
+		 * clk_osm_enable() after clk_osm_setup_hw_table() has run, so
+		 * the FSMs never see a half-filled table.
+		 */
+		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+			ret = osm_enable_hw(&p->cluster[i]);
+			if (ret) {
+				dev_err(dev,
+					"%s: OSM enable failed (%d), refusing to continue\n",
+					p->cluster[i].name, ret);
+				osmdev = NULL;
+				return ret;
+			}
 		}
 	}
 
