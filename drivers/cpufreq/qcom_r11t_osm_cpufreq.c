@@ -463,6 +463,61 @@ static void osm_probe_pll(struct osm_dev *p)
 	}
 }
 
+/* --------------------------------------------------------------- */
+/* Write ONE OSM sequencer slot, then read it back.                */
+/*                                                                */
+/* The OSM state machine executes whatever absolute register        */
+/* addresses sit in these slots when we hand it a new row number.  */
+/* All eight read 0x00070000 on this board -- i.e. the bootloader   */
+/* filled them with PLL_MODE_MAIN rather than a pointer, so the     */
+/* state machine was busy "writing MODE=7" and never touched        */
+/* PLL_L_VAL.  Measured 2026-10-03 across three probes.            */
+/* ------------------------------------------------------------------ */
+static void osm_write_seq(struct osm_dev *p, unsigned int cluster,
+			  unsigned int slot, u32 val)
+{
+	void __iomem *b = p->base + (unsigned long)cluster * OSM_CORE_TABLE_SIZE;
+	u32 off = SEQ_REG(slot);
+	u32 rb;
+
+	writel_relaxed(val, b + off);
+	rmb();
+	rb = readl_relaxed(b + off);
+
+	dev_info(p->dev, "SEQ_REG(%u) cluster%u <- 0x%08x (readback 0x%08x)%s\n",
+		 slot, cluster, val, rb, rb == val ? "" : "  MISMATCH");
+}
+
+/*
+ * Minimal bring-up: teach the OSM where PLL_L_VAL lives, nothing else.
+ *
+ * Port of the first line of clk_osm_perform_cluster_setup() [caf:2273].
+ * l_val_base is the register the OSM writes the new divisor into on
+ * every row switch, so this is the one slot whose absence freezes the
+ * silicon frequency no matter what ENABLE_REG and the LUT say.
+ *
+ * The remaining slots (cfg_rcgr / pll_user_ctl / post-divs / cmd_rcgr)
+ * are deliberately NOT written yet -- one step at a time, so if this
+ * does not move PLL_L_VAL we know the gap is somewhere other than
+ * these eight values.
+ */
+static void osm_setup_l_val(struct osm_dev *p)
+{
+	int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		if (!p->l_val_base[i]) {
+			dev_err(p->dev,
+				"cluster%d: qcom,l-val-base missing, not programming SEQ_REG(%u)\n",
+				i, SEQ_SLOT_L_VAL_BASE);
+			continue;
+		}
+		dev_info(p->dev,
+			"cluster%d: PLL L_VAL base = 0x%08x\n", i, p->l_val_base[i]);
+		osm_write_seq(p, i, SEQ_SLOT_L_VAL_BASE, p->l_val_base[i]);
+	}
+}
+
 static int osm_enable_hw(struct osm_cluster *c)
 {
 	udelay(5);
@@ -1118,7 +1173,30 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	if (IS_ERR(p->base))
 		return PTR_ERR(p->base);
 
-	/* Map PLL resources (READ ONLY -- we don't write them yet) */
+	/* CAF absolute register addresses, one element per cluster.  Read
+	 * here, consumed by osm_setup_l_val() further down.
+	 */
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		static const char * const addr_props[4] = {
+			"qcom,l-val-base", "qcom,apcs-pll-user-ctl",
+			"qcom,apcs-cfg-rcgr", "qcom,apcs-cmd-rcgr",
+		};
+		u32 *slots[4] = {
+			&p->l_val_base[i], &p->pll_user_ctl[i],
+			&p->cfg_rcgr[i], &p->cmd_rcgr[i],
+		};
+		int k;
+
+		for (k = 0; k < 4; k++) {
+			u32 val = 0;
+
+			of_property_read_u32_index(dev->of_node, addr_props[k],
+						   i, &val);
+			*slots[k] = val;
+		}
+	}
+
+	/* Map PLL resources (READ ONLY -- we never write these) */
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		static const char * const pll_res_name[R11T_NR_CLUSTERS] = {
 			"pwrcl_pll", "perfcl_pll"
@@ -1204,6 +1282,13 @@ static int r11t_osm_probe(struct platform_device *pdev)
 
 	if (pll_probe)
 		osm_probe_pll(p);
+
+	/* Teach the OSM sequencer where PLL_L_VAL lives.  Gated on dryrun so
+	 * the default module behaviour stays byte for byte what it was before
+	 * this was added.
+	 */
+	if (!dryrun)
+		osm_setup_l_val(p);
 
 	if (dryrun) {
 		dev_warn(dev,
