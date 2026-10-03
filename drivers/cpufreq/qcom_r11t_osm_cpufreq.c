@@ -1482,6 +1482,15 @@ static int osm_regs_show(struct seq_file *m, void *v)
 			   osm_read(c, OSM_ENABLE_REG));
 		seq_printf(m, "  DCVS_PERF_STATE_DESIRED(0x1f10) = %u\n",
 			   osm_read(c, OSM_DCVS_PERF_STATE_DESIRED));
+		/* FSM / control region 0x1000-0x10E0 (partial) */
+		seq_printf(m, "  --- FSM (0x1000+) ---\n");
+		for (j = 0x1000; j < 0x10E0; j += 0x10) {
+			int k;
+			seq_printf(m, "  0x%04x:", j);
+			for (k = 0; k < 4; k++)
+				seq_printf(m, " %08x", osm_read(c, j + k * 4));
+			seq_puts(m, "\n");
+		}
 	}
 	return 0;
 }
