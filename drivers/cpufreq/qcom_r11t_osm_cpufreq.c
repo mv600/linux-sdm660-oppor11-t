@@ -466,7 +466,7 @@ static void osm_probe_pll(struct osm_dev *p)
 				 i);
 			continue;
 		}
-		dev_info(p->dev, "PLL probe: cluster %d (base=%pa):\n",
+		dev_info(p->dev, "PLL probe: cluster %d (base=%px):\n",
 			 i, p->pll_base[i]);
 		for (j = 0; j < (int)ARRAY_SIZE(pll_regs); j++) {
 			u32 val = readl_relaxed(p->pll_base[i] + pll_regs[j].off);
@@ -1426,7 +1426,7 @@ static void osm_dump_seq_one(struct seq_file *m, struct osm_dev *p, int cl)
 {
 	void __iomem *b = p->base + (unsigned long)cl * OSM_CORE_TABLE_SIZE;
 
-	seq_printf(m, "=== cluster %d (base %pa) ===\n", cl,
+	seq_printf(m, "=== cluster %d (base %px) ===\n", cl,
 		   (void *)b);
 	osm_dump_range(m, b, "BRANCH TABLE", R11T_SEQ_BR_OFF, R11T_SEQ_BR_N);
 	osm_dump_range(m, b, "SLOTS", R11T_SEQ_SLOT_OFF, R11T_SEQ_SLOT_N);
