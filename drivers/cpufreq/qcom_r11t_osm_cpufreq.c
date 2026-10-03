@@ -502,6 +502,22 @@ static void osm_probe_pll(struct osm_dev *p)
 			 readl_relaxed(b + SEQ_REG(SEQ_SLOT_CMD_RCGR)),
 			 readl_relaxed(b + SEQ_REG(SEQ_SLOT_RCG_UPDATE)));
 	}
+
+	/* FSM/control region 0x1000-0x10E0 (dryrun irrelevant, read-only) */
+	dev_info(p->dev, "FSM region (0x1000-0x10E0, raw):\n");
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		void __iomem *b = p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE;
+		unsigned int j;
+		dev_info(p->dev, "  cluster %d (base %px):\n", i, b);
+		for (j = 0x1000; j < 0x10E0; j += 0x10) {
+			u32 v[4];
+			int k;
+			for (k = 0; k < 4; k++)
+				v[k] = readl_relaxed(b + j + k * 4);
+			dev_info(p->dev, "    0x%04x: %08x %08x %08x %08x\n",
+				 j, v[0], v[1], v[2], v[3]);
+		}
+	}
 }
 
 /* --------------------------------------------------------------- */
