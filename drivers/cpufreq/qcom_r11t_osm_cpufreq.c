@@ -1343,6 +1343,44 @@ static const struct file_operations osm_regs_fops = {
 	.release = osm_lut_release,
 };
 
+static void osm_dump_seq_one(struct seq_file *m, struct osm_dev *p, int cl)
+{
+	void __iomem *b = p->base + (unsigned long)cl * OSM_CORE_TABLE_SIZE;
+	int n;
+
+	seq_printf(m, "=== cluster %d ===\n", cl);
+	for (n = 0; n < 96; n += 8) {
+		int i;
+		seq_printf(m, "  [%03d]  ", n);
+		for (i = 0; i < 8 && n + i < 96; i++) {
+			u32 v = readl_relaxed(b + SEQ_REG(n + i));
+			seq_printf(m, "%08x ", v);
+		}
+		seq_puts(m, "\n");
+	}
+}
+
+static int osm_seq_show(struct seq_file *m, void *v)
+{
+	if (!osmdev)
+		return -ENODEV;
+	osm_dump_seq_one(m, osmdev, 0);
+	osm_dump_seq_one(m, osmdev, 1);
+	return 0;
+}
+
+static int osm_seq_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, osm_seq_show, NULL);
+}
+
+static const struct file_operations osm_seq_fops = {
+	.open	= osm_seq_open,
+	.read	= seq_read,
+	.llseek	= seq_lseek,
+	.release = osm_lut_release,
+};
+
 static int osm_regs_show(struct seq_file *m, void *v)
 {
 	int i, j;
@@ -1375,6 +1413,7 @@ static int osm_regs_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+
 static int dryrun_get(void *data, u64 *val)
 {
 	*val = dryrun;
@@ -1395,6 +1434,7 @@ static void osm_debugfs_init(struct device *dev)
 	osm_dbg_dir = debugfs_create_dir("qcom_r11t_osm", NULL);
 	debugfs_create_file("lut", 0444, osm_dbg_dir, NULL, &osm_lut_fops);
 	debugfs_create_file("regs", 0444, osm_dbg_dir, NULL, &osm_regs_fops);
+	debugfs_create_file("seq", 0444, osm_dbg_dir, NULL, &osm_seq_fops);
 	debugfs_create_file("dryrun", 0644, osm_dbg_dir, NULL, &dryrun_fops);
 }
 
