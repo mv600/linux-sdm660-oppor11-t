@@ -518,6 +518,10 @@ static void osm_probe_pll(struct osm_dev *p)
 				 j, v[0], v[1], v[2], v[3]);
 		}
 	}
+	/* Known FSM registers for easier reference (from CAF) */
+	dev_info(p->dev, "  refs: 0x103C=VMIN_RED_EN 0x1040=VMIN_RED_TMR 0x1050=FSM_CTRL? 0x1070=PDN_FSM_CTRL 0x1074-0x109C=boost/ps timers 0x10A0/0x10BC=SYNC_DELAY 0x10C0=PLL_SW_OVR_EN\n");
+}
+	}
 }
 
 /* --------------------------------------------------------------- */
