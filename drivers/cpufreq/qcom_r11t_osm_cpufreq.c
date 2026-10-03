@@ -150,12 +150,18 @@
 #define SEQ_SLOT_RCG_UPDATE		34	/* RCG_UPDATE = 0x3      */
 #define SEQ_SLOT_POST_DIV1		29	/* PLL_POST_DIV1 = 0x1F  */
 #define SEQ_SLOT_MIN_LVAL		21	/* PLL_MIN_LVAL = 43     */
+#define SEQ_SLOT_GPLL_SEL		17	/* GPLL_SEL = 0x400      */
+#define SEQ_SLOT_PLL_EARLY_SEL		82	/* PLL_EARLY_SEL = 0x500 */
+#define SEQ_SLOT_PLL_MAIN_SEL		83	/* PLL_MAIN_SEL = 0x300  */
+#define SEQ_SLOT_RCG_UPD_OK		84	/* RCG_UPDATE_SUCCESS=0x2*/
+#define SEQ_SLOT_RCG_UPDATE2		85	/* RCG_UPDATE = 0x3      */
 
 /* PLLMain / GPLL mux selectors [caf:150-152] */
 #define PLL_MAIN_SEL			0x300
 #define GPLL_SEL			0x400
 #define PLL_EARLY_SEL			0x500
 #define RCG_UPDATE			0x3	/* caf:153 */
+#define RCG_UPDATE_SUCCESS		0x2	/* caf:154 */
 #define PLL_POST_DIV1			0x1F	/* caf:155 */
 #define PLL_POST_DIV2			0x11F	/* caf:156 */
 #define PLL_MIN_LVAL			43	/* caf:125 */
@@ -609,18 +615,28 @@ static void osm_setup_seq(struct osm_dev *p)
 		osm_write_seq(p, i, SEQ_SLOT_RCG_UPDATE, RCG_UPDATE,
 			      "RCG_UPDATE");
 
-		/* GFMUX: tell the hardware which clock tree to drive the cores
-		 * from [caf:2287-2289].  Read back to confirm the barrier
-		 * landed; unlike the seq slots this one is a plain register.
+		/*
+		 * GFMUX programming [caf:2287-2292].
+		 *
+		 * GPLL_SEL / PLL_EARLY_SEL / PLL_MAIN_SEL are VALUES the
+		 * sequencer compares against, stored in slots 17 / 82 / 83 --
+		 * they are NOT register offsets.  An earlier revision of this
+		 * driver wrongly writel_relaxed()'d them at OSM offsets
+		 * 0x300 / 0x400 / 0x500, which is worse than a no-op: 0x300 is
+		 * exactly SEQ_REG(0), i.e. the l_val_base slot, so that path
+		 * would have stamped 0x3 over the PLL address.  Slot numbers
+		 * come straight from caf:2287-2292.
 		 */
-		writel_relaxed(RCG_UPDATE, p->base +
-			       (unsigned long)i * OSM_CORE_TABLE_SIZE + GPLL_SEL);
-		dev_info(p->dev, "GFMUX cluster%d GPLL_SEL   = 0x%08x\n",
-			 i, RCG_UPDATE);
-		writel_relaxed(RCG_UPDATE, p->base +
-			       (unsigned long)i * OSM_CORE_TABLE_SIZE + PLL_EARLY_SEL);
-		writel_relaxed(RCG_UPDATE, p->base +
-			       (unsigned long)i * OSM_CORE_TABLE_SIZE + PLL_MAIN_SEL);
+		osm_write_seq(p, i, SEQ_SLOT_GPLL_SEL, GPLL_SEL,
+			      "GPLL_SEL");
+		osm_write_seq(p, i, SEQ_SLOT_PLL_EARLY_SEL, PLL_EARLY_SEL,
+			      "PLL_EARLY_SEL");
+		osm_write_seq(p, i, SEQ_SLOT_PLL_MAIN_SEL, PLL_MAIN_SEL,
+			      "PLL_MAIN_SEL");
+		osm_write_seq(p, i, SEQ_SLOT_RCG_UPD_OK, RCG_UPDATE_SUCCESS,
+			      "RCG_UPDATE_SUCCESS");
+		osm_write_seq(p, i, SEQ_SLOT_RCG_UPDATE2, RCG_UPDATE,
+			      "RCG_UPDATE(2)");
 	}
 }
 
