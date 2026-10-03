@@ -329,6 +329,27 @@
 		qcom,apcs-cfg-rcgr     = <0x17911054 0x17811054>;
 		qcom,apcs-cmd-rcgr     = <0x17911050 0x17811050>;
 
+		/*
+		 * The six OSM state machines.  CAF gates every branch of
+		 * clk_osm_init_fsm() on these [caf:2136-2245]; without them the
+		 * whole function compiles down to nothing and the OSM has no FSM
+		 * to drive the frequency / voltage transition -- it accepts a row
+		 * number (DCVS_PERF_STATE_DESIRED tracked our request) but the
+		 * silicon clock never follows.
+		 *
+		 * Stock R11T declares all six [stock-r11t.dts:4571-4576].  CAF's
+		 * own comment calls this the "additional OSM setup due to lack of
+		 * TZ" [caf:2266-2269]; on a stock boot these are handled by the
+		 * trustzone driver instead, so a mainline kernel has to carry them
+		 * in DT itself.
+		 */
+		qcom,boost-fsm-en;
+		qcom,safe-fsm-en;
+		qcom,ps-fsm-en;
+		qcom,droop-fsm-en;
+		qcom,wfx-fsm-en;
+		qcom,pc-fsm-en;
+
 		/* Logical CPU ids per cluster -- NOT the DT reg values.
 		 *
 		 * The DT blob lists big cores first (cpu@100..103 occupy blob
