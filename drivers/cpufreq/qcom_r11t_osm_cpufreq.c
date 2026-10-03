@@ -1390,21 +1390,47 @@ static const struct file_operations osm_regs_fops = {
 	.release = osm_lut_release,
 };
 
+/* Read-only dump of the three regions CAF's clk_osm_setup_sequencer()
+ * and clk_osm_do_additional_setup() touch.  Sizes are the real
+ * ARRAY_SIZE() of seq_instr[] / seq_br_instr[] in
+ * work/caf-ref/clk-cpu-osm-660.c (150 / 47).
+ *
+ * Note the branch table at SEQ_CFG_BR_ADDR 0x170 sits BELOW SEQ_REG(0)
+ * == 0x300, so it has no slot number -- that is why this walks raw
+ * offsets instead of slot indices.
+ */
+#define R11T_SEQ_BR_OFF	0x170
+#define R11T_SEQ_BR_N		47
+#define R11T_SEQ_SLOT_OFF	0x300
+#define R11T_SEQ_SLOT_N		96
+#define R11T_SEQ_MC_OFF		0x500
+#define R11T_SEQ_MC_N		150
+
+static void osm_dump_range(struct seq_file *m, void __iomem *b,
+			   const char *name, unsigned int off, unsigned int n)
+{
+	unsigned int i;
+
+	seq_printf(m, "  -- %s (off 0x%03x, %u entries) --\n", name, off, n);
+	for (i = 0; i < n; i += 4) {
+		int k;
+		seq_printf(m, "   0x%03x ", off + i * 4);
+		for (k = 0; k < 4 && i + k < n; k++)
+			seq_printf(m, " %08x", readl_relaxed(b + off + (i + k) * 4));
+		seq_puts(m, "\n");
+	}
+	seq_puts(m, "\n");
+}
+
 static void osm_dump_seq_one(struct seq_file *m, struct osm_dev *p, int cl)
 {
 	void __iomem *b = p->base + (unsigned long)cl * OSM_CORE_TABLE_SIZE;
-	int n;
 
-	seq_printf(m, "=== cluster %d ===\n", cl);
-	for (n = 0; n < 96; n += 8) {
-		int i;
-		seq_printf(m, "  [%03d]  ", n);
-		for (i = 0; i < 8 && n + i < 96; i++) {
-			u32 v = readl_relaxed(b + SEQ_REG(n + i));
-			seq_printf(m, "%08x ", v);
-		}
-		seq_puts(m, "\n");
-	}
+	seq_printf(m, "=== cluster %d (base %pa) ===\n", cl,
+		   (void *)b);
+	osm_dump_range(m, b, "BRANCH TABLE", R11T_SEQ_BR_OFF, R11T_SEQ_BR_N);
+	osm_dump_range(m, b, "SLOTS", R11T_SEQ_SLOT_OFF, R11T_SEQ_SLOT_N);
+	osm_dump_range(m, b, "MICROCODE", R11T_SEQ_MC_OFF, R11T_SEQ_MC_N);
 }
 
 static int osm_seq_show(struct seq_file *m, void *v)
