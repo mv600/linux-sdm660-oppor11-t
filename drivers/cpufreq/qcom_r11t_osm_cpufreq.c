@@ -243,6 +243,16 @@ module_param(pll_probe, bool, 0644);
 MODULE_PARM_DESC(pll_probe,
 		 "Probe-only: dump OSM + PLL registers to dmesg/debugfs without writing PLL.");
 
+static bool lval_test = false;
+module_param(lval_test, bool, 0644);
+MODULE_PARM_DESC(lval_test,
+		 "Test-only: write PLL_L_VAL directly to pwrcl=0x20, perfcl=0x80 (does NOT follow CAF full sequence unless lval_force_full). Safe default=false.");
+
+static bool lval_force_full = false;
+module_param(lval_force_full, bool, 0644);
+MODULE_PARM_DESC(lval_force_full,
+		 "When lval_test=true, also run CAF's full MODE sequence (riskier).");
+
 static inline void osm_write(struct osm_cluster *c, u32 val, u32 offset)
 {
 	writel_relaxed(val, c->base + offset);
@@ -637,6 +647,160 @@ static int osm_enable_hw(struct osm_cluster *c)
 
 	dev_info(c->dev, "OSM hardware enabled\n");
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* PLL_L_VAL direct write — EXPERIMENT (lval_test)                     */
+/*                                                                   */
+/* Why this is safe to try at all:                                   */
+/*   f_cpu = PLL_L_VAL x XO(19.2 MHz) is confirmed for all 14 LUT rows */
+/*   (see the table in MODULE description / HANDOFF).  The bootloader */
+/*   left pwrcl L_VAL=0x48 (72 -> 1382.4 MHz) and perfcl L_VAL=0x20    */
+/*   (32 -> 614.4 MHz), which is exactly what the PC measured.  So    */
+/*   L_VAL is the only register standing between us and the right     */
+/*   frequency; the OSM state machine simply never writes it.          */
+/*                                                                   */
+/* This writes L_VAL DIRECTLY, bypassing the OSM FSM.  It is a        */
+/* diagnostic, not a shipping feature: the frequency is then FIXED     */
+/* (the OSM will keep accepting row numbers that no longer do          */
+/* anything).  A reboot restores the bootloader state.                */
+/* ------------------------------------------------------------------ */
+
+#define R11T_XO_HZ	19200000UL
+
+/* CAF's clk_osm_setup_cluster_pll() literals, [caf:1510-1531] */
+#define PLL_USER_CTRL_VAL	0x01000008
+#define PLL_CONFIG_CTL_LO_VAL	0x20004AA8
+#define PLL_MODE_OFF		0x0
+#define PLL_MODE_MUX		0x2
+#define PLL_MODE_RESET		0x6
+
+static void osm_lval_dump(struct osm_dev *p, int cl, const char *tag)
+{
+	void __iomem *b = p->pll_base[cl];
+	u32 mode, lval;
+
+	if (!b) {
+		dev_info(p->dev, "%s: L_VAL test: %s PLL resource missing, skipped\n",
+			 tag, p->cluster[cl].name);
+		return;
+	}
+
+	mode = readl_relaxed(b + PLL_MODE);
+	lval = readl_relaxed(b + PLL_L_VAL);
+
+	dev_info(p->dev,
+		 "%s: %s PLL: MODE=0x%08x L_VAL=0x%02x (%u) -> %lu.%03lu MHz  USER_CTRL=0x%08x CFG_CTL_LO=0x%08x STATUS=0x%08x\n",
+		 tag, p->cluster[cl].name, mode, lval, lval,
+		 (unsigned long)((u64)lval * R11T_XO_HZ / 1000000),
+		 (unsigned long)((u64)lval * R11T_XO_HZ / 1000 % 1000),
+		 readl_relaxed(b + PLL_USER_CTRL),
+		 readl_relaxed(b + PLL_CONFIG_CTL_LO),
+		 readl_relaxed(b + PLL_STATUS));
+}
+
+/* Write L_VAL (and optionally run CAF's full MODE sequence) for one cluster. */
+static void osm_lval_set(struct osm_dev *p, int cl, u32 new_lval)
+{
+	void __iomem *b = p->pll_base[cl];
+	u32 old_lval;
+
+	if (!b)
+		return;
+
+	old_lval = readl_relaxed(b + PLL_L_VAL);
+	if (old_lval == new_lval) {
+		dev_info(p->dev,
+			 "%s PLL L_VAL already 0x%02x, nothing to do\n",
+			 p->cluster[cl].name, new_lval);
+		return;
+	}
+
+	/*
+	 * SAFEST FIRST: only L_VAL, no MODE change.  On Qualcomm PLLs L_VAL
+	 * takes effect on the next main->main update without dropping the
+	 * clock for a single cycle, so this cannot hang the cluster.  If the
+	 * read-back shows the new value and the cores change speed, the OSM
+	 * FSM (and only the FSM) was the missing piece.
+	 */
+	writel_relaxed(new_lval, b + PLL_L_VAL);
+	readl_relaxed(b + PLL_MODE);	/* barrier, same as osm_mb() */
+
+	udelay(5);
+
+	if (!lval_force_full) {
+		dev_info(p->dev,
+			 "%s PLL: wrote L_VAL 0x%02x -> 0x%02x (no MODE change, safe mode)\n",
+			 p->cluster[cl].name, old_lval, new_lval);
+		osm_lval_dump(p, cl, "after");
+		return;
+	}
+
+	/*
+	 * FULL CAF SEQUENCE — only when lval_force_full=1.  This takes the
+	 * PLL off line (MODE 0x0), so a CPU executing on this cluster WILL
+	 * stall until it comes back.  That is what CAF does at init; doing
+	 * it here with CPUs live can hang the box.  Use only after the safe
+	 * path above has been measured.
+	 */
+	writel_relaxed(PLL_MODE_OFF, b + PLL_MODE);
+	writel_relaxed(new_lval, b + PLL_L_VAL);
+	writel_relaxed(PLL_USER_CTRL_VAL, b + PLL_USER_CTRL);
+	writel_relaxed(PLL_CONFIG_CTL_LO_VAL, b + PLL_CONFIG_CTL_LO);
+	writel_relaxed(PLL_MODE_MUX, b + PLL_MODE);
+
+	readl_relaxed(b + PLL_MODE);	/* barrier */
+	udelay(PLL_WAIT_LOCK_TIME_US);
+
+	writel_relaxed(PLL_MODE_RESET, b + PLL_MODE);
+	readl_relaxed(b + PLL_MODE);	/* barrier */
+	usleep_range(50, 75);
+
+	writel_relaxed(PLL_MODE_MAIN, b + PLL_MODE);
+
+	osm_lval_dump(p, cl, "after-full-caf");
+}
+
+/*
+ * The two test values deliberately move the clusters in OPPOSITE
+ * directions so the md5 result cannot be misread:
+ *
+ *   pwrcl  (A53, cpus 0,5,6,7): 0x48 = 72  = 1382.4 MHz  ->  0x20 = 32  =  614.4 MHz   (2.25x SLOWER)
+ *   perfcl (A73, cpus 1,2,3,4): 0x20 = 32  =  614.4 MHz  ->  0x80 = 128 = 2457.6 MHz   (4.00x FASTER)
+ *
+ * Both targets are inside the speed-bin range the vendor LUT itself
+ * declares for that cluster, so neither is an overclock.
+ */
+#define LVAL_TEST_PWRCL		0x20
+#define LVAL_TEST_PERFCL	0x80
+
+static void osm_lval_experiment(struct osm_dev *p)
+{
+	static const u32 test_lval[R11T_NR_CLUSTERS] = {
+		[R11T_CLUSTER_PWRCL]  = LVAL_TEST_PWRCL,
+		[R11T_CLUSTER_PERFCL] = LVAL_TEST_PERFCL,
+	};
+	int i;
+
+	dev_warn(p->dev,
+		 "=== PLL_L_VAL EXPERIMENT (lval_test=1) ===\n");
+	dev_warn(p->dev,
+		 "expect: pwrcl(A53) SLOWER, perfcl(A73) FASTER.\n");
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++)
+		osm_lval_dump(p, i, "before");
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++)
+		osm_lval_set(p, i, test_lval[i]);
+
+	/* Let the scheduler settle, then show the hardware we ended up with. */
+	usleep_range(20000, 25000);
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++)
+		osm_lval_dump(p, i, "settled");
+
+	dev_warn(p->dev,
+		 "=== L_VAL EXPERIMENT DONE — now run the md5 benchmark ===\n");
 }
 
 static unsigned int osm_get_row(struct osm_cluster *c)
@@ -1434,6 +1598,15 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			}
 		}
 	}
+
+	/* PLL_L_VAL experiment.  Deliberately independent of dryrun: the whole
+	 * point is to write the PLL ourselves instead of trusting the OSM FSM,
+	 * so it must be runnable even with the OSM table left alone.  It runs
+	 * AFTER the table is programmed and ENABLE_REG is set, i.e. on the same
+	 * steady state we have been measuring, so the only variable is L_VAL.
+	 */
+	if (lval_test)
+		osm_lval_experiment(p);
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		int cap = i == R11T_CLUSTER_PWRCL ? pwrcl_max_row :
