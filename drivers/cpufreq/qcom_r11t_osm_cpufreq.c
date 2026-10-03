@@ -211,6 +211,12 @@ struct osm_dev {
 	u32 pll_user_ctl[R11T_NR_CLUSTERS];
 	u32 cfg_rcgr[R11T_NR_CLUSTERS];
 	u32 cmd_rcgr[R11T_NR_CLUSTERS];
+	/* RCGR window (READ ONLY).  Derived from cfg_rcgr/cmd_rcgr by masking
+	 * off the register offset -- those two DT addresses are the CMD_RCGR
+	 * (+0x50) and CFG_RCGR (+0x54) halves of one root clock generator, so
+	 * the block base is the containing 4 KiB page.
+	 */
+	void __iomem *rcgr_base[R11T_NR_CLUSTERS];
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
 	bool per_policy_governor;
 };
@@ -504,6 +510,66 @@ static void osm_write_seq(struct osm_dev *p, unsigned int cluster,
  * clock source not being switched over to OSM, which is what the
  * cfg_rcgr / cmd_rcgr / RCG_UPDATE slots are for.
  */
+/* --------------------------------------------------------------- */
+/* Dump the RCGR window (READ ONLY).                                */
+/*                                                                 */
+/* The OSM can hold a perfectly correct LUT, accept our row number   */
+/* and even reprogram the PLL, while the cores keep running from     */
+/* whatever source the bootloader left selected in the root clock   */
+/* generator.  Nothing in the OSM block can show us that -- the     */
+/* answer lives in RCGR.CFG_RCGR, so map the page and print it.      */
+/*                                                                   */
+/* Standard Qualcomm RCGR layout: CMD_RCGR at +0x50, CFG_RCGR at     */
+/* +0x54.  CFG_RCGR holds CLK_SRC in bits [15:0] (source select)   */
+/* and the divider fields above it.                                  */
+/* ------------------------------------------------------------------ */
+#define RCGR_CMD	0x50
+#define RCGR_CFG	0x54
+
+static void osm_dump_rcgr(struct osm_dev *p)
+{
+	int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		u32 cmd, cfg, off;
+		u32 clk_src, div;
+
+		if (!p->rcgr_base[i]) {
+			dev_info(p->dev, "RCGR: cluster%d not mapped\n", i);
+			continue;
+		}
+
+		dev_info(p->dev, "RCGR: cluster%d window @0x%llx\n", i,
+			 (unsigned long long)(resource_size(p->rcgr_base[i]) ?
+						  0 : 0));
+
+		/* Find the CMD/CFG pair by scanning the page for the known
+		 * cmd_rcgr offset, then read the matching cfg.
+		 */
+		cmd = readl_relaxed(p->rcgr_base[i] + RCGR_CMD);
+		cfg = readl_relaxed(p->rcgr_base[i] + RCGR_CFG);
+		off = p->cfg_rcgr[i] & 0xFFF;
+
+		dev_info(p->dev,
+			 "  +0x%03x CMD_RCGR=0x%08x  CFG_RCGR=0x%08x  (DT cfg=0x%x)\n",
+			 RCGR_CMD, cmd, cfg, p->cfg_rcgr[i]);
+
+		clk_src = cfg & 0xFFFF;
+		div = (cfg >> 24) & 0x7;
+		dev_info(p->dev,
+			 "  CLK_SRC=0x%04x  DIV=%u  raw_cfg=0x%08x\n",
+			 clk_src, div, cfg);
+
+		/* Also dump the whole 0x00..0x70 window -- the divider lives
+		 * in a different register on some parts and we would rather see
+		 * the layout than guess it.
+		 */
+		for (off = 0; off < 0x70; off += 4)
+			dev_info(p->dev, "  +0x%03x = 0x%08x\n", off,
+				 readl_relaxed(p->rcgr_base[i] + off));
+	}
+}
+
 static void osm_setup_seq(struct osm_dev *p)
 {
 	int i;
@@ -1224,6 +1290,21 @@ static int r11t_osm_probe(struct platform_device *pdev)
 						   i, &val);
 			*slots[k] = val;
 		}
+
+		/* Map the RCGR window (READ ONLY).  cfg_rcgr and cmd_rcgr are
+		 * the CFG_RCGR and CMD_RCGR halves of one root clock generator,
+		 * four bytes apart, so the block base is the containing page.
+		 */
+		{
+			phys_addr_t addr = p->cfg_rcgr[i] & ~0xFFFULL;
+
+			p->rcgr_base[i] = devm_ioremap(dev, addr, 4096);
+			if (IS_ERR(p->rcgr_base[i])) {
+				p->rcgr_base[i] = NULL;
+				dev_warn(dev, "cluster%d: cannot map RCGR @0x%llx\n",
+					i, (unsigned long long)addr);
+			}
+		}
 	}
 
 	/* Map PLL resources (READ ONLY -- we never write these) */
@@ -1310,8 +1391,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 
 	osmdev = p;
 
-	if (pll_probe)
+	if (pll_probe) {
 		osm_probe_pll(p);
+		osm_dump_rcgr(p);
+	}
 
 	/* Teach the OSM sequencer where PLL_L_VAL lives.  Gated on dryrun so
 	 * the default module behaviour stays byte for byte what it was before
