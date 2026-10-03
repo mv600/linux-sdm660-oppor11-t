@@ -155,6 +155,10 @@
 #define PLL_MAIN_SEL			0x300
 #define GPLL_SEL			0x400
 #define PLL_EARLY_SEL			0x500
+#define RCG_UPDATE			0x3	/* caf:153 */
+#define PLL_POST_DIV1			0x1F	/* caf:155 */
+#define PLL_POST_DIV2			0x11F	/* caf:156 */
+#define PLL_MIN_LVAL			43	/* caf:125 */
 
 
 
@@ -464,57 +468,83 @@ static void osm_probe_pll(struct osm_dev *p)
 }
 
 /* --------------------------------------------------------------- */
-/* Write ONE OSM sequencer slot, then read it back.                */
-/*                                                                */
-/* The OSM state machine executes whatever absolute register        */
-/* addresses sit in these slots when we hand it a new row number.  */
-/* All eight read 0x00070000 on this board -- i.e. the bootloader   */
-/* filled them with PLL_MODE_MAIN rather than a pointer, so the     */
-/* state machine was busy "writing MODE=7" and never touched        */
-/* PLL_L_VAL.  Measured 2026-10-03 across three probes.            */
+/* --------------------------------------------------------------- */
+/* Write ONE OSM sequencer slot.                                     */
+/*                                                                   */
+/* Do NOT judge success by reading the slot back: these registers are  */
+/* write-then-consumed.  Measured 2026-10-03, the same slot read      */
+/* 0x00070000 on one boot and 0x00000000 on the next, and a write of  */
+/* 0x17916004 read back as 0x00000000 immediately afterwards -- the   */
+/* hardware had already consumed it.  A readback check here only ever  */
+/* produced false MISMATCH reports.                                    */
 /* ------------------------------------------------------------------ */
 static void osm_write_seq(struct osm_dev *p, unsigned int cluster,
-			  unsigned int slot, u32 val)
+			  unsigned int slot, u32 val, const char *what)
 {
 	void __iomem *b = p->base + (unsigned long)cluster * OSM_CORE_TABLE_SIZE;
-	u32 off = SEQ_REG(slot);
-	u32 rb;
 
-	writel_relaxed(val, b + off);
-	rmb();
-	rb = readl_relaxed(b + off);
+	writel_relaxed(val, b + SEQ_REG(slot));
 
-	dev_info(p->dev, "SEQ_REG(%u) cluster%u <- 0x%08x (readback 0x%08x)%s\n",
-		 slot, cluster, val, rb, rb == val ? "" : "  MISMATCH");
+	dev_info(p->dev, "SEQ_REG(%2u) cluster%d = 0x%08x  %s\n",
+		 slot, cluster, val, what);
 }
 
 /*
- * Minimal bring-up: teach the OSM where PLL_L_VAL lives, nothing else.
+ * Teach the OSM state machine how to re-program the PLL.  Port of
+ * clk_osm_perform_cluster_setup() [caf:2271-2285], which CAF only runs
+ * when secure_init is set [caf:2264] -- i.e. when a trustzone-resident
+ * driver performs the sequence instead.  With no TZ here we do it from
+ * the kernel ourselves.
  *
- * Port of the first line of clk_osm_perform_cluster_setup() [caf:2273].
- * l_val_base is the register the OSM writes the new divisor into on
- * every row switch, so this is the one slot whose absence freezes the
- * silicon frequency no matter what ENABLE_REG and the LUT say.
- *
- * The remaining slots (cfg_rcgr / pll_user_ctl / post-divs / cmd_rcgr)
- * are deliberately NOT written yet -- one step at a time, so if this
- * does not move PLL_L_VAL we know the gap is somewhere other than
- * these eight values.
+ * Why all eight and not just l_val_base: writing SEQ_REG(0) alone did
+ * move nothing.  perfcl kept PLL_L_VAL = 0x20 across three probes while
+ * pwrcl sat at 0x48, and the A73s then measured ~1.6x SLOWER than the
+ * A53s.  L_VAL is the PLL divider, so the A73s already had the smaller
+ * divider (higher frequency) and still lost -- that points at the RCGR
+ * clock source not being switched over to OSM, which is what the
+ * cfg_rcgr / cmd_rcgr / RCG_UPDATE slots are for.
  */
-static void osm_setup_l_val(struct osm_dev *p)
+static void osm_setup_seq(struct osm_dev *p)
 {
 	int i;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		if (!p->l_val_base[i]) {
 			dev_err(p->dev,
-				"cluster%d: qcom,l-val-base missing, not programming SEQ_REG(%u)\n",
-				i, SEQ_SLOT_L_VAL_BASE);
+				"cluster%d: qcom,l-val-base missing, skipping seq setup\n",
+				i);
 			continue;
 		}
-		dev_info(p->dev,
-			"cluster%d: PLL L_VAL base = 0x%08x\n", i, p->l_val_base[i]);
-		osm_write_seq(p, i, SEQ_SLOT_L_VAL_BASE, p->l_val_base[i]);
+
+		osm_write_seq(p, i, SEQ_SLOT_L_VAL_BASE, p->l_val_base[i],
+			      "l_val_base");
+		osm_write_seq(p, i, SEQ_SLOT_CFG_RCGR, p->cfg_rcgr[i],
+			      "apcs_cfg_rcgr");
+		osm_write_seq(p, i, SEQ_SLOT_PLL_USER_CTL, p->pll_user_ctl[i],
+			      "apcs_pll_user_ctl");
+		osm_write_seq(p, i, SEQ_SLOT_POST_DIV2, PLL_POST_DIV2,
+			      "PLL_POST_DIV2");
+		osm_write_seq(p, i, SEQ_SLOT_MIN_LVAL, PLL_MIN_LVAL,
+			      "PLL_MIN_LVAL");
+		osm_write_seq(p, i, SEQ_SLOT_POST_DIV1, PLL_POST_DIV1,
+			      "PLL_POST_DIV1");
+		osm_write_seq(p, i, SEQ_SLOT_CMD_RCGR, p->cmd_rcgr[i],
+			      "apcs_cmd_rcgr");
+		osm_write_seq(p, i, SEQ_SLOT_RCG_UPDATE, RCG_UPDATE,
+			      "RCG_UPDATE");
+
+		/* GFMUX: tell the hardware which clock tree to drive the cores
+		 * from [caf:2287-2289].  Read back to confirm the barrier
+		 * landed; unlike the seq slots this one is a plain register.
+		 */
+		writel_relaxed(RCG_UPDATE, p->base +
+			       (unsigned long)i * OSM_CORE_TABLE_SIZE + GPLL_SEL);
+		dev_info(p->dev, "GFMUX cluster%d GPLL_SEL   = 0x%08x\n",
+			 i, RCG_UPDATE);
+		writel_relaxed(RCG_UPDATE, p->base +
+			       (unsigned long)i * OSM_CORE_TABLE_SIZE + PLL_EARLY_SEL);
+		writel_relaxed(RCG_UPDATE, p->base +
+			       (unsigned long)i * OSM_CORE_TABLE_SIZE + PLL_MAIN_SEL);
 	}
 }
 
@@ -1288,7 +1318,7 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	 * this was added.
 	 */
 	if (!dryrun)
-		osm_setup_l_val(p);
+		osm_setup_seq(p);
 
 	if (dryrun) {
 		dev_warn(dev,
