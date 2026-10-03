@@ -252,7 +252,22 @@ MODULE_PARM_DESC(pll_probe,
 static bool lval_test = false;
 module_param(lval_test, bool, 0644);
 MODULE_PARM_DESC(lval_test,
-		 "Test-only: write PLL_L_VAL directly to pwrcl=0x20, perfcl=0x80 (does NOT follow CAF full sequence unless lval_force_full). Safe default=false.");
+		 "Test-only: write PLL_L_VAL directly on the clusters named by lval_cl. Default false (no PLL write at all).");
+
+static unsigned int lval_cl = 0;
+module_param(lval_cl, uint, 0444);
+MODULE_PARM_DESC(lval_cl,
+		 "Bitmask of clusters to touch when lval_test=1. bit0 = pwrcl (A53), bit1 = perfcl (A73). 1 = pwrcl only, 2 = perfcl only, 3 = both.");
+
+static int lval_pwrcl = -1;
+module_param(lval_pwrcl, int, 0444);
+MODULE_PARM_DESC(lval_pwrcl,
+		 "PLL_L_VAL to write into pwrcl when lval_test=1 and bit0 of lval_cl is set. -1 = leave pwrcl alone. f = value * 19.2 MHz.");
+
+static int lval_perfcl = -1;
+module_param(lval_perfcl, int, 0444);
+MODULE_PARM_DESC(lval_perfcl,
+		 "PLL_L_VAL to write into perfcl when lval_test=1 and bit1 of lval_cl is set. -1 = leave perfcl alone. f = value * 19.2 MHz.");
 
 static bool lval_force_full = false;
 module_param(lval_force_full, bool, 0644);
@@ -787,27 +802,43 @@ static void osm_lval_set(struct osm_dev *p, int cl, u32 new_lval)
  * Both targets are inside the speed-bin range the vendor LUT itself
  * declares for that cluster, so neither is an overclock.
  */
-#define LVAL_TEST_PWRCL		0x20
-#define LVAL_TEST_PERFCL	0x80
 
 static void osm_lval_experiment(struct osm_dev *p)
 {
-	static const u32 test_lval[R11T_NR_CLUSTERS] = {
-		[R11T_CLUSTER_PWRCL]  = LVAL_TEST_PWRCL,
-		[R11T_CLUSTER_PERFCL] = LVAL_TEST_PERFCL,
-	};
+	const int want[R11T_NR_CLUSTERS] = { lval_pwrcl, lval_perfcl };
 	int i;
 
 	dev_warn(p->dev,
-		 "=== PLL_L_VAL EXPERIMENT (lval_test=1) ===\n");
+		 "=== PLL_L_VAL EXPERIMENT (lval_test=1, lval_cl=%#x) ===\n",
+		 lval_cl);
 	dev_warn(p->dev,
-		 "expect: pwrcl(A53) SLOWER, perfcl(A73) FASTER.\n");
+		 "target: pwrcl L_VAL=%d (%s), perfcl L_VAL=%d (%s)\n",
+		 want[R11T_CLUSTER_PWRCL],
+		 (lval_cl & 0x1) ? "will write" : "UNTOUCHED",
+		 want[R11T_CLUSTER_PERFCL],
+		 (lval_cl & 0x2) ? "will write" : "UNTOUCHED");
+	dev_warn(p->dev,
+		 "full CAF MODE sequence: %s\n",
+		 lval_force_full ? "YES (risky, may hang)" : "no (safe)");
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++)
 		osm_lval_dump(p, i, "before");
 
-	for (i = 0; i < R11T_NR_CLUSTERS; i++)
-		osm_lval_set(p, i, test_lval[i]);
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		if (!(lval_cl & (1u << i))) {
+			dev_info(p->dev,
+				 "%s: not selected by lval_cl, left alone\n",
+				 p->cluster[i].name);
+			continue;
+		}
+		if (want[i] < 0) {
+			dev_info(p->dev,
+				 "%s: selected but lval value is %d, skipped\n",
+				 p->cluster[i].name, want[i]);
+			continue;
+		}
+		osm_lval_set(p, i, (u32)want[i]);
+	}
 
 	/* Let the scheduler settle, then show the hardware we ended up with. */
 	usleep_range(20000, 25000);
