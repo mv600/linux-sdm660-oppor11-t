@@ -78,6 +78,9 @@
 #define OSM_SPARE_REG			0x1164	/* [caf:95] */
 #define OSM_REG_SIZE			32	/* [caf:97] */
 #define OSM_TABLE_SIZE			40	/* [caf:41] */
+
+#define BM(msb, lsb)		((((u32)-1) << (31 - (msb))) >> (31 - (msb) + (lsb))) << (lsb)
+#define BVAL(msb, lsb, val)	(((val) << (lsb)) & BM(msb, lsb))
 #define OSM_DCVS_PERF_STATE_DESIRED	0x1F10	/* [caf:98] */
 
 /*
@@ -166,6 +169,51 @@
 #define PLL_POST_DIV2			0x11F	/* caf:156 */
 #define PLL_MIN_LVAL			43	/* caf:125 */
 
+/* ------------------------------------------------------------------ */
+/* FSM register offsets.  Ported from work/caf-ref/clk-cpu-osm-660.c */
+/* :150-191.  These are OSM-window offsets (OSM_BASE), not PLL.        */
+/* ------------------------------------------------------------------ */
+#define FSM_VMIN_REDUC_ENABLE		0x103C	/* caf:161 */
+#define FSM_VMIN_REDUC_TIMER		0x1040	/* caf:162 */
+#define FSM_PDN_CTRL			0x1070	/* PDN_FSM_CTRL_REG caf:163 */
+#define FSM_CC_BOOST_TIMER0		0x1074	/* caf:164 */
+#define FSM_CC_BOOST_TIMER1		0x1078	/* caf:165 */
+#define FSM_CC_BOOST_TIMER2		0x107C	/* caf:166 */
+#define FSM_DCVS_BOOST_TIMER0		0x1084	/* caf:180 */
+#define FSM_DCVS_BOOST_TIMER1		0x1088	/* caf:181 */
+#define FSM_DCVS_BOOST_TIMER2		0x108C	/* caf:182 */
+#define FSM_PS_BOOST_TIMER0		0x1094	/* caf:183 */
+#define FSM_PS_BOOST_TIMER1		0x1098	/* caf:184 */
+#define FSM_PS_BOOST_TIMER2		0x109C	/* caf:185 */
+#define FSM_BOOST_SYNC_DELAY		0x10A0	/* caf:186 */
+#define FSM_DROOP_CTRL			0x10A4	/* caf:187 */
+#define FSM_DROOP_RELEASE_TIMER		0x10A8	/* caf:188 */
+#define FSM_DROOP_UNSTALL_TIMER		0x10AC	/* caf:189 */
+#define FSM_DROOP_WAIT_REL_TIMER0	0x10B0	/* caf:190 */
+#define FSM_DROOP_WAIT_REL_TIMER1	0x10B4	/* caf:191 */
+#define FSM_DROOP_PROG_SYNC_DELAY	0x10BC	/* caf:192 */
+#define FSM_DCVS_DROOP_TIMER		0x10B8	/* caf:194 */
+#define FSM_PLL_SW_OVERRIDE_EN		0x10C0	/* caf:193 */
+
+/* FSM enable bits in FSM_PDN_CTRL [caf:167-172] */
+#define FSM_CC_BOOST_EN			BIT(0)
+#define FSM_PS_BOOST_EN			BIT(1)
+#define FSM_DCVS_BOOST_EN			BIT(2)
+#define FSM_PC_RET_DROOP_EN		BIT(3)
+#define FSM_WFX_DROOP_EN			BIT(4)
+#define FSM_DCVS_DROOP_EN			BIT(5)
+
+#define FSM_PLL_SW_OVERRIDE_DROOP	BIT(0)	/* caf:195 */
+
+/* Timing constants from CAF [caf:175-177] */
+#define FSM_PLL_WAIT_LOCK_NS		5000
+#define FSM_SAFE_FREQ_WAIT_NS		5000
+#define FSM_DEXT_DECREMENT_NS		1000
+#define FSM_UNSTALL_NS			500
+#define FSM_WAIT_RELEASE_NS		250
+#define FSM_DROOP_RELEASE_NS		5
+#define FSM_DCVS_DROOP_NS			500
+
 
 
 #define R11T_NR_CLUSTERS		2
@@ -203,6 +251,15 @@ struct osm_cluster {
 
 	struct cpufreq_frequency_table *freq_table;
 	unsigned int num_freqs;
+
+	/* FSM enables, parsed from DT [caf:2124-2260] */
+	bool red_fsm_en;
+	bool boost_fsm_en;
+	bool safe_fsm_en;
+	bool ps_fsm_en;
+	bool droop_fsm_en;
+	bool wfx_fsm_en;
+	bool pc_fsm_en;
 };
 
 struct osm_dev {
@@ -225,6 +282,8 @@ struct osm_dev {
 	void __iomem *rcgr_base[R11T_NR_CLUSTERS];
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
 	bool per_policy_governor;
+	u32 osm_clk_rate;
+	u32 xo_clk_rate;
 };
 
 static struct osm_dev *osmdev;
@@ -606,6 +665,138 @@ static void osm_dump_rcgr(struct osm_dev *p)
 		for (off = 0; off < 0x70; off += 4)
 			dev_info(p->dev, "  +0x%03x = 0x%08x\n", off,
 				 readl_relaxed(p->rcgr_base[i] + off));
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* FSM timer setup.  Port of clk_osm_setup_fsms() from                 */
+/* work/caf-ref/clk-cpu-osm-660.c:2124-2260.                           */
+/*                                                                       */
+/* Measured on 2026-10-04: all FSM timer registers (0x1074-0x10C0) read  */
+/* 0x00000000 on both clusters, while FSM_PDN_CTRL (0x1070) is already   */
+/* programmed.  CAF's setup_fsms() writes BOTH; we only implement the    */
+/* timer half.  FSM enable bits at 0x1070 are left untouched (TZ/BL owns */
+/* them).  Timing is applied only when dryrun=0.                         */
+/* ------------------------------------------------------------------ */
+static u32 osm_count_ns(struct osm_dev *p, u32 nsec)
+{
+	/* caf:589-597: count_ns = osm_clk_rate * nsec / 1e9 */
+	return div_u64((u64)p->osm_clk_rate * nsec, 1000000000ULL);
+}
+
+static void osm_write_orm(struct osm_cluster *c, u32 val, u32 offset)
+{
+	u32 tmp = osm_read(c, offset);
+
+	tmp |= val;
+	osm_write(c, tmp, offset);
+}
+
+static void osm_setup_fsms(struct osm_dev *p)
+{
+	struct osm_cluster *c;
+	u32 val;
+
+	for (c = p->cluster; c < &p->cluster[R11T_NR_CLUSTERS]; c++) {
+		if (!c->red_fsm_en && !c->boost_fsm_en && !c->safe_fsm_en &&
+		    !c->ps_fsm_en && !c->droop_fsm_en && !c->wfx_fsm_en &&
+		    !c->pc_fsm_en)
+			continue;
+
+		dev_info(c->dev, "FSM: red=%d boost=%d safe=%d ps=%d droop=%d wfx=%d pc=%d\n",
+			 c->red_fsm_en, c->boost_fsm_en, c->safe_fsm_en,
+			 c->ps_fsm_en, c->droop_fsm_en, c->wfx_fsm_en,
+			 c->pc_fsm_en);
+
+		/* VMIN reduction FSM [caf:2129-2135] */
+		if (c->red_fsm_en) {
+			osm_write_orm(c, BIT(0), FSM_VMIN_REDUC_ENABLE);
+			osm_write(c, osm_count_ns(p, 10000),
+				  FSM_VMIN_REDUC_TIMER);
+		}
+
+		/* Boost FSM [caf:2137-2155] */
+		if (c->boost_fsm_en) {
+			osm_write_orm(c, FSM_CC_BOOST_EN, FSM_PDN_CTRL);
+			val = osm_read(c, FSM_CC_BOOST_TIMER0);
+			val |= BVAL(15, 0,
+				    osm_count_ns(p, FSM_PLL_WAIT_LOCK_NS));
+			val |= BVAL(31, 16,
+				    osm_count_ns(p, FSM_SAFE_FREQ_WAIT_NS));
+			osm_write(c, val, FSM_CC_BOOST_TIMER0);
+			val = osm_read(c, FSM_CC_BOOST_TIMER1);
+			val |= BVAL(15, 0,
+				    osm_count_ns(p, FSM_PLL_WAIT_LOCK_NS));
+			val |= BVAL(31, 16,
+				    osm_count_ns(p, FSM_PLL_WAIT_LOCK_NS));
+			osm_write(c, val, FSM_CC_BOOST_TIMER1);
+			val = osm_read(c, FSM_CC_BOOST_TIMER2);
+			val |= BVAL(15, 0,
+				    osm_count_ns(p, FSM_DEXT_DECREMENT_NS));
+			osm_write(c, val, FSM_CC_BOOST_TIMER2);
+		}
+
+		/* Safe frequency FSM [caf:2157-2182] */
+		if (c->safe_fsm_en) {
+			osm_write_orm(c, FSM_DCVS_BOOST_EN, FSM_PDN_CTRL);
+			val = osm_read(c, FSM_DCVS_BOOST_TIMER0);
+			val |= BVAL(15, 0,
+				    osm_count_ns(p, FSM_PLL_WAIT_LOCK_NS));
+			val |= BVAL(31, 16,
+				    osm_count_ns(p, FSM_SAFE_FREQ_WAIT_NS));
+			osm_write(c, val, FSM_DCVS_BOOST_TIMER0);
+			val = osm_read(c, FSM_DCVS_BOOST_TIMER1);
+			val |= BVAL(15, 0,
+				    osm_count_ns(p, FSM_PLL_WAIT_LOCK_NS));
+			val |= BVAL(31, 16,
+				    osm_count_ns(p, FSM_PLL_WAIT_LOCK_NS));
+			osm_write(c, val, FSM_DCVS_BOOST_TIMER1);
+			val = osm_read(c, FSM_DCVS_BOOST_TIMER2);
+			val |= BVAL(15, 0,
+				    osm_count_ns(p, FSM_DEXT_DECREMENT_NS));
+			osm_write(c, val, FSM_DCVS_BOOST_TIMER2);
+		}
+
+		/* Power-save boost FSM [caf:2184-2200] */
+		if (c->ps_fsm_en) {
+			osm_write_orm(c, FSM_PS_BOOST_EN, FSM_PDN_CTRL);
+			val = osm_read(c, FSM_PS_BOOST_TIMER0);
+			val |= BVAL(15, 0,
+				    osm_count_ns(p, FSM_PLL_WAIT_LOCK_NS));
+			val |= BVAL(31, 16,
+				    osm_count_ns(p, FSM_SAFE_FREQ_WAIT_NS));
+			osm_write(c, val, FSM_PS_BOOST_TIMER0);
+			val = osm_read(c, FSM_PS_BOOST_TIMER1);
+			val |= BVAL(15, 0,
+				    osm_count_ns(p, FSM_PLL_WAIT_LOCK_NS));
+			val |= BVAL(31, 16,
+				    osm_count_ns(p, FSM_PLL_WAIT_LOCK_NS));
+			osm_write(c, val, FSM_PS_BOOST_TIMER1);
+			val = osm_read(c, FSM_PS_BOOST_TIMER2);
+			val |= BVAL(15, 0,
+				    osm_count_ns(p, FSM_DEXT_DECREMENT_NS));
+			osm_write(c, val, FSM_PS_BOOST_TIMER2);
+		}
+
+		/* PLL signal timing control [caf:2202-2204] */
+		if (c->boost_fsm_en || c->safe_fsm_en || c->ps_fsm_en)
+			osm_write(c, 0x5, FSM_BOOST_SYNC_DELAY);
+
+		/* Droop FSM timers [caf:2206-2231] */
+		if (c->wfx_fsm_en || c->pc_fsm_en) {
+			val = osm_read(c, FSM_DROOP_UNSTALL_TIMER);
+			val |= BVAL(31, 16, osm_count_ns(p, FSM_UNSTALL_NS));
+			osm_write(c, val, FSM_DROOP_UNSTALL_TIMER);
+			val = osm_read(c, FSM_DROOP_WAIT_REL_TIMER0);
+			val |= BVAL(31, 16,
+				    osm_count_ns(p, FSM_WAIT_RELEASE_NS));
+			osm_write(c, val, FSM_DROOP_WAIT_REL_TIMER0);
+		}
+
+		/* PLL droop override [caf:2255-2260] */
+		if (c->boost_fsm_en || c->safe_fsm_en || c->ps_fsm_en)
+			osm_write_orm(c, FSM_PLL_SW_OVERRIDE_DROOP,
+				      FSM_PLL_SW_OVERRIDE_EN);
 	}
 }
 
@@ -1660,6 +1851,40 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	p->per_policy_governor =
 		of_property_read_bool(dev->of_node, "qcom,governor-per-policy");
 
+	/* Read clock rates for FSM timer calculation [caf:589-597] */
+	of_property_read_u32(dev->of_node, "qcom,osm-clk-rate",
+			    &p->osm_clk_rate);
+	of_property_read_u32(dev->of_node, "qcom,xo-clk-rate",
+			    &p->xo_clk_rate);
+	if (!p->osm_clk_rate)
+		p->osm_clk_rate = 200000000; /* 200 MHz */
+	if (!p->xo_clk_rate)
+		p->xo_clk_rate = 19200000;  /* 19.2 MHz */
+
+	/* Parse FSM enable flags from DT [caf:2124-2135] */
+	{
+		struct device_node *np = dev->of_node;
+		struct osm_cluster *cl;
+
+		cl = &p->cluster[R11T_CLUSTER_PWRCL];
+		cl->red_fsm_en = of_property_read_bool(np, "qcom,red-fsm-en");
+		cl->boost_fsm_en = of_property_read_bool(np, "qcom,boost-fsm-en");
+		cl->safe_fsm_en  = of_property_read_bool(np, "qcom,safe-fsm-en");
+		cl->ps_fsm_en    = of_property_read_bool(np, "qcom,ps-fsm-en");
+		cl->droop_fsm_en = of_property_read_bool(np, "qcom,droop-fsm-en");
+		cl->wfx_fsm_en   = of_property_read_bool(np, "qcom,wfx-fsm-en");
+		cl->pc_fsm_en    = of_property_read_bool(np, "qcom,pc-fsm-en");
+
+		cl = &p->cluster[R11T_CLUSTER_PERFCL];
+		cl->red_fsm_en = of_property_read_bool(np, "qcom,red-fsm-en");
+		cl->boost_fsm_en = of_property_read_bool(np, "qcom,boost-fsm-en");
+		cl->safe_fsm_en  = of_property_read_bool(np, "qcom,safe-fsm-en");
+		cl->ps_fsm_en    = of_property_read_bool(np, "qcom,ps-fsm-en");
+		cl->droop_fsm_en = of_property_read_bool(np, "qcom,droop-fsm-en");
+		cl->wfx_fsm_en   = of_property_read_bool(np, "qcom,wfx-fsm-en");
+		cl->pc_fsm_en    = of_property_read_bool(np, "qcom,pc-fsm-en");
+	}
+
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		ret = osm_parse_lut(dev, &p->cluster[i]);
 		if (ret)
@@ -1689,6 +1914,13 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		osm_probe_pll(p);
 		osm_dump_rcgr(p);
 	}
+
+	/* Program FSM timers (timing tables).  Do NOT touch FSM enable
+	 * bits at 0x1070/0x1050 -- TZ/BL already set them.  Gated by dryrun
+	 * so default behaviour remains unchanged.
+	 */
+	if (!dryrun)
+		osm_setup_fsms(p);
 
 	/* Teach the OSM sequencer where PLL_L_VAL lives.  Gated on dryrun so
 	 * the default module behaviour stays byte for byte what it was before
