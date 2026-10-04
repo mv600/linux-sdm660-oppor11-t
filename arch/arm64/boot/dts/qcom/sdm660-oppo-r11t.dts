@@ -330,6 +330,23 @@
 		qcom,apcs-cmd-rcgr     = <0x17911050 0x17811050>;
 
 		/*
+		 * ITM domain handover + APM register addresses.  Needed because
+		 * CAF only programs them from clk_osm_do_additional_setup(),
+		 * which early-returns unless qcom,osm-no-tz is set [caf:2264]
+		 * -- on a stock boot the trustzone driver does it.  There is no
+		 * TZ on this mainline setup, so without these the sequencer
+		 * program (which we now load at SEQ_MEM_ADDR 0x500) would read
+		 * slot 37 as an ITM_PRESENT address of 0 and write to address 0
+		 * during the cluster handover.
+		 *
+		 * Values verbatim from the stock R11T DTB
+		 * [stock-r11t.dts:4564-4565].
+		 */
+		qcom,apcs-itm-present  = <0x179d143c 0x179d143c>;
+		qcom,apm-mode-ctl     = <0x179d0004 0x179d0010>;
+		qcom,apm-ctrl-status  = <0x179d000c 0x179d0018>;
+
+		/*
 		 * The six OSM state machines.  CAF gates every branch of
 		 * clk_osm_init_fsm() on these [caf:2136-2245]; without them the
 		 * whole function compiles down to nothing and the OSM has no FSM
