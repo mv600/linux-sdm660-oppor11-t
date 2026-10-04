@@ -521,20 +521,8 @@ static void osm_probe_pll(struct osm_dev *p)
 	/* Known FSM registers for easier reference (from CAF) */
 	dev_info(p->dev, "  refs: 0x103C=VMIN_RED_EN 0x1040=VMIN_RED_TMR 0x1050=FSM_CTRL? 0x1070=PDN_FSM_CTRL 0x1074-0x109C=boost/ps timers 0x10A0/0x10BC=SYNC_DELAY 0x10C0=PLL_SW_OVR_EN\n");
 }
-	}
-}
 
-/* --------------------------------------------------------------- */
-/* --------------------------------------------------------------- */
-/* Write ONE OSM sequencer slot.                                     */
-/*                                                                   */
-/* Do NOT judge success by reading the slot back: these registers are  */
-/* write-then-consumed.  Measured 2026-10-03, the same slot read      */
-/* 0x00070000 on one boot and 0x00000000 on the next, and a write of  */
-/* 0x17916004 read back as 0x00000000 immediately afterwards -- the   */
-/* hardware had already consumed it.  A readback check here only ever  */
-/* produced false MISMATCH reports.                                    */
-/* ------------------------------------------------------------------ */
+
 static void osm_write_seq(struct osm_dev *p, unsigned int cluster,
 			  unsigned int slot, u32 val, const char *what)
 {
