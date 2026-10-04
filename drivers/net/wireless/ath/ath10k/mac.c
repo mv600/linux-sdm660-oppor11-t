@@ -4903,6 +4903,50 @@ static struct ieee80211_sta_vht_cap ath10k_create_vht_cap(struct ath10k *ar)
 	vht_cap.vht_supported = 1;
 	vht_cap.cap = ar->vht_cap_info;
 
+	/*
+	 * WCN3990 is a 2x2 802.11ac Wave 2 radio whose hardware bandwidth
+	 * limit is 80 MHz.  Do not advertise 160 MHz / 80+80 MHz support.
+	 *
+	 * Supp Channel Width and Ext NSS BW in the firmware's vht_cap_info use
+	 * a firmware-private compressed layout (see
+	 * include/linux/ieee80211-vht.h -- note this is *not* the upstream
+	 * bit layout).  Both fields being non-zero makes mac80211's
+	 * ieee80211_chandef_vht_oper() conclude support_160 == true:
+	 *
+	 *   vht_cap = hw->wiphy->bands[band]->vht_cap.cap;
+	 *   support_160 = (vht_cap & (IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_MASK |
+	 *                             IEEE80211_VHT_CAP_EXT_NSS_BW_MASK));
+	 *
+	 * An 80 MHz BSS whose VHT Operation element happens to advertise a
+	 * center segment offset of 8 channels then hits the 802.11ac interop
+	 * workaround and gets upgraded to NL80211_CHAN_WIDTH_160:
+	 *
+	 *   case IEEE80211_VHT_CHANWIDTH_80MHZ:
+	 *         new.width = NL80211_CHAN_WIDTH_80;
+	 *         new.center_freq1 = cf0;
+	 *         if (ccf1) {
+	 *                 diff = abs(ccf1 - ccf0);
+	 *                 if ((diff == 8) && support_160) {
+	 *                         new.width = NL80211_CHAN_WIDTH_160;
+	 *
+	 * which ath10k_mac_vdev_start() then hands to the firmware via
+	 * chan_to_phymode() as MODE_11AC_VHT160.  The radio cannot be tuned
+	 * for 160 MHz, so 5 GHz TX goes silently dead: association always
+	 * times out with no auth response and no status code, while scan
+	 * (which uses WMI_SCAN_CHAN_LIST and never goes through
+	 * chan_to_phymode()) keeps working fine.
+	 *
+	 * Clearing both fields keeps the advertised capability honest (this
+	 * radio does everything up to 80 MHz) and leaves every other VHT
+	 * capability (LDPC / STBC / beamforming / MCS) intact.
+	 *
+	 * Both masks must be cleared together: this radio's vht_cap_info is
+	 * 0x739139ba, whose bits 31:30 are also non-zero, so clearing only
+	 * SUPP_CHAN_WIDTH_MASK would leave support_160 true.
+	 */
+	vht_cap.cap &= ~(IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_MASK |
+			 IEEE80211_VHT_CAP_EXT_NSS_BW_MASK);
+
 	if (ar->vht_cap_info & (IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
 				IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE)) {
 		val = ath10k_mac_get_vht_cap_bf_sts(ar);
