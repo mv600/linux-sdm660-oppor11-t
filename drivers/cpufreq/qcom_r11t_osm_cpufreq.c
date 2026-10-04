@@ -376,6 +376,34 @@ module_param(lval_force_full, bool, 0644);
 MODULE_PARM_DESC(lval_force_full,
 		 "When lval_test=true, also run CAF's full MODE sequence (riskier).");
 
+/*
+ * apm: gate the Array Power Mux programming.  DEFAULT OFF, deliberately.
+ *
+ * osm_setup_apm() below is only half of what CAF does.  CAF always runs
+ * clk_osm_program_apm_regs() [caf:2282] immediately followed by
+ * clk_osm_apm_vc_setup() [caf:3300-3301]; the first tells the sequencer
+ * WHERE the APM control/status registers live, the second tells it WHEN
+ * to switch the CPU supply between VDD_MX and VDD_APCC.
+ *
+ * The "when" half lands in slots 1 / 8 / 15 / 31 / 72 / 73 / 76 and CAF
+ * derives every one of them from regulator_count_voltages() and
+ * regulator_list_corner_voltage() on the CPRh vdd-pwrcl / vdd-perfcl
+ * rails [caf:1600-1665].  Mainline registers no CPRh regulator for those
+ * two rails, so those numbers cannot be produced here.  Left at zero they
+ * read as "virtual corner 0 is already past the switch threshold", i.e.
+ * run the full MX<->APC mux sequence around EVERY frequency change, with
+ * no rail state to make that safe.  That is a brownout-grade experiment
+ * on a 2.4 GHz CPU, so it stays off until the corners are computed from
+ * real data.
+ *
+ * apm=1 is only meaningful once apm_threshold_vc / apm_crossover_vc are
+ * filled in; today it is a knob to test with, not a supported mode.
+ */
+static bool apm = false;
+module_param(apm, bool, 0644);
+MODULE_PARM_DESC(apm,
+		 "Default false: do not program the Array Power Mux slots. Slots 1/8/15/31/72/73/76 (the switch thresholds) need CPRh virtual-corner voltages that only exist under CAF's regulator, so enabling APM without them makes the sequencer switch the CPU power mux on every DVFS step. ITM handover is NOT gated by this and runs regardless.");
+
 static inline void osm_write(struct osm_cluster *c, u32 val, u32 offset)
 {
 	writel_relaxed(val, c->base + offset);
@@ -961,6 +989,10 @@ static void osm_setup_itm(struct osm_dev *p)
  * pwrcl entry), so the corners cannot be computed.  CAF also routes
  * them through scm_io_write() on pbases[OSM_BASE] + SEQ_REG(n), which
  * is a secure-world path we do not have.
+ *
+ * Because of that this function is gated behind the apm= module
+ * parameter and defaults OFF -- see its MODULE_PARM_DESC for why
+ * calling it on its own is worse than not calling it at all.
  */
 static void osm_setup_apm(struct osm_dev *p)
 {
@@ -1883,19 +1915,29 @@ static const struct file_operations osm_seq_fops = {
 
 static int osm_regs_show(struct seq_file *m, void *v)
 {
-	int i, j;
+	unsigned int i, j;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		struct osm_cluster *c = &osmdev->cluster[i];
 
 		seq_printf(m, "=== %s ===\n", c->name);
 		seq_printf(m, "  cpus %*pbl\n", cpumask_pr_args(c->cpus));
-		for (j = 0; j < 8; j++)
+		/*
+		 * num_entries rows, not a fixed 8.  pwrcl has 8 LUT rows and
+		 * perfcl has 7, so a hardcoded 8 printed a row7 on perfcl that
+		 * does not exist in the table.  It is not a phantom frequency --
+		 * osm_setup_hw_table() fills rows num_entries..39 with a copy
+		 * of the last valid row (CAF has no else branch there either,
+		 * see the comment above that function) and osm_set_row() rejects
+		 * any index >= num_entries, so that row can never be selected.
+		 * Printing it anyway just reads like an extra speed bin.
+		 */
+		for (j = 0; j < c->num_entries; j++)
 			seq_printf(m, "  0x%04x: %#010x\n",
 				   OSM_INDEX_REG + j * OSM_REG_SIZE,
 				   osm_read(c, OSM_INDEX_REG + j * OSM_REG_SIZE));
 		seq_printf(m, "  --  --\n");
-		for (j = 0; j < 8; j++) {
+		for (j = 0; j < c->num_entries; j++) {
 			seq_printf(m,
 				   "  row%-2d idx=%#x freq=%#x volt=%#x ovr=%#x spare=%#x\n",
 				   j,
@@ -2183,7 +2225,12 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		}
 
 		osm_setup_itm(p);
-		osm_setup_apm(p);
+		if (apm) {
+			osm_setup_apm(p);
+		} else if (p->apm_mode_ctl[0] && p->apm_ctrl_status[0]) {
+			dev_warn(dev,
+				 "qcom,apm-mode-ctl / qcom,apm-ctrl-status present in DT but apm=0, leaving the Array Power Mux alone. CAF also fills slots 1/8/15/31/72/73/76 with CPRh virtual-corner voltages that mainline cannot produce; without them the sequencer would switch the CPU power mux on every DVFS step. Enable with modprobe ... apm=1 only once those corners are known good.\n");
+		}
 		osm_setup_sequencer(p);
 	}
 
