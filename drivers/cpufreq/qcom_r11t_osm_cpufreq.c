@@ -159,6 +159,20 @@
 #define SEQ_SLOT_RCG_UPD_OK		84	/* RCG_UPDATE_SUCCESS=0x2*/
 #define SEQ_SLOT_RCG_UPDATE2		85	/* RCG_UPDATE = 0x3      */
 
+/* ITM handoff slots [caf:1799-1813] */
+#define SEQ_SLOT_ITM_PRESENT		37	/* apcs_itm_present addr  */
+#define SEQ_SLOT_ITM_SPARE		38	/* always 0[caf:1801]     */
+#define SEQ_SLOT_ITM_DATA			39	/* domain handover data  */
+
+/* APM (Array Power Mux) slots [caf:1972-1993] */
+#define SEQ_SLOT_APM_MODE_CTL		2	/* apm_mode_ctl addr      */
+#define SEQ_SLOT_APM_CTRL_STATUS		3	/* apm_ctrl_status addr   */
+#define SEQ_SLOT_APM_MX_MODE		77	/* APM_MX_MODE = 0        */
+#define SEQ_SLOT_APM_MX_MODE_VAL	78	/* APM_MX_MODE_VAL = 0    */
+#define SEQ_SLOT_APM_SWITCH_MASK	79	/* caf:146                */
+#define SEQ_SLOT_APM_APC_MODE		80	/* APM_APC_MODE = BIT(1)  */
+#define SEQ_SLOT_APM_APC_MODE_VAL	81	/* APM_APC_MODE_VAL = 0x3 */
+
 /* PLLMain / GPLL mux selectors [caf:150-152] */
 #define PLL_MAIN_SEL			0x300
 #define GPLL_SEL			0x400
@@ -168,6 +182,29 @@
 #define PLL_POST_DIV1			0x1F	/* caf:155 */
 #define PLL_POST_DIV2			0x11F	/* caf:156 */
 #define PLL_MIN_LVAL			43	/* caf:125 */
+
+/* SPM / APM constants [caf:130, 144-148] */
+#define SPM_CC_CTRL			0x1028	/* caf:130 */
+#define APM_MX_MODE			0	/* caf:144 */
+#define APM_APC_MODE			BIT(1)	/* caf:145 */
+#define APM_MODE_SWITCH_MASK		(BVAL(4, 2, 7) | BVAL(1, 0, 3)) /* caf:146 */
+#define APM_MX_MODE_VAL			0	/* caf:147 */
+#define APM_APC_MODE_VAL			0x3	/* caf:148 */
+
+/* ITM handover payloads [caf:141-142].  Two clusters hand the domain
+ * over to each other: pwrcl disables CL0 / enables CL1, perfcl does the
+ * reverse.  Stock R11T declares qcom,apcs-itm-present with the SAME
+ * address for both clusters [stock-r11t.dts:4564].
+ */
+#define ITM_CL0_DISABLE_CL1_ENABLED	0x2	/* caf:141 */
+#define ITM_CL0_ENABLED_CL1_DISABLE	0x1	/* caf:142 */
+
+/* Sequencer program memory [caf:192-193].  SEQ_MEM_ADDR holds the
+ * instruction stream, SEQ_CFG_BR_ADDR the branch table that sits
+ * BELOW SEQ_REG(0) == 0x300, which is why it has no slot number.
+ */
+#define SEQ_MEM_ADDR			0x500	/* caf:192 */
+#define SEQ_CFG_BR_ADDR			0x170	/* caf:193 */
 
 /* ------------------------------------------------------------------ */
 /* FSM register offsets.  Ported from work/caf-ref/clk-cpu-osm-660.c */
@@ -274,6 +311,12 @@ struct osm_dev {
 	u32 pll_user_ctl[R11T_NR_CLUSTERS];
 	u32 cfg_rcgr[R11T_NR_CLUSTERS];
 	u32 cmd_rcgr[R11T_NR_CLUSTERS];
+	/* ITM handover + APM register addresses, per cluster [caf:1005-1014,
+	 * caf:1050-1069].  Stock R11T declares all three.
+	 */
+	u32 itm_present[R11T_NR_CLUSTERS];
+	u32 apm_mode_ctl[R11T_NR_CLUSTERS];
+	u32 apm_ctrl_status[R11T_NR_CLUSTERS];
 	/* RCGR window (READ ONLY).  Derived from cfg_rcgr/cmd_rcgr by masking
 	 * off the register offset -- those two DT addresses are the CMD_RCGR
 	 * (+0x50) and CFG_RCGR (+0x54) halves of one root clock generator, so
@@ -582,6 +625,55 @@ static void osm_probe_pll(struct osm_dev *p)
 }
 
 
+/* r11t_seq_instr: 150 entries, copied verbatim from CAF [caf:263-294] /
+ * [caf:296-315].  This is the OSM sequencer's instruction stream and
+ * branch table; without it the state machine accepts a row number and
+ * then does nothing.
+ */
+static const u32 r11t_seq_instr[150] = {
+	0xc2005000, 0x2c9e3b21, 0xc0ab2cdc, 0xc2882525, 0x359dc491, 0x700a500b,
+	0x5001aefc, 0xaefd7000, 0x390938c8, 0xcb44c833, 0xce56cd54, 0x341336e0,
+	0xa4baadba, 0xb480a493, 0x10004000, 0x70005001, 0x1000500c, 0xc792c5a1,
+	0x501625e1, 0x3da335a2, 0x50170006, 0x50150006, 0x1000c633, 0x1000acb3,
+	0xc422acb4, 0xaefc1000, 0x700a500b, 0x70005001, 0x5010aefd, 0x5012700b,
+	0xad41700c, 0x84e5adb9, 0xb3808566, 0x239b0003, 0x856484e3, 0xb9800007,
+	0x2bad0003, 0xac3aa20b, 0x0003181b, 0x0003bb40, 0xa30d239b, 0x500c181b,
+	0x5011500f, 0x181b3413, 0x853984b9, 0x0003bd80, 0xa0012ba4, 0x72050803,
+	0x500e1000, 0x500c1000, 0x1c011c0a, 0x3b181c06, 0x1c073b43, 0x1c061000,
+	0x1c073983, 0x1c02500c, 0x10001c0a, 0x70015002, 0x81031000, 0x70025003,
+	0x70035004, 0x3b441000, 0x81553985, 0x70025003, 0x50054003, 0xa1467009,
+	0x0003b1c0, 0x4005238b, 0x835a1000, 0x855c84db, 0x1000a51f, 0x84de835d,
+	0xa52c855c, 0x50061000, 0x39cd3a4c, 0x3ad03a8f, 0x10004006, 0x70065007,
+	0xa00f2c12, 0x08034007, 0xaefc7205, 0xaefd700d, 0xa9641000, 0x40071c1a,
+	0x700daefc, 0x1000aefd, 0x70065007, 0x50101c16, 0x40075012, 0x700daefc,
+	0x2411aefd, 0xa8211000, 0x0803a00f, 0x500c7005, 0x1c1591e0, 0x500f5014,
+	0x10005011, 0x500c2bd4, 0x0803a00f, 0x10007205, 0xa00fa9d1, 0x0803a821,
+	0xa9d07005, 0x91e0500c, 0x500f1c15, 0x10005011, 0x1c162bce, 0x50125010,
+	0xa022a82a, 0x70050803, 0x1c1591df, 0x5011500f, 0x5014500c, 0x0803a00f,
+	0x10007205, 0x501391a4, 0x22172217, 0x70075008, 0xa9634008, 0x1c1a0006,
+	0x70085009, 0x10004009, 0x00008ed9, 0x3e05c8dd, 0x1c033604, 0xabaf1000,
+	0x856284e1, 0x0003bb80, 0x1000239f, 0x0803a037, 0x10007205, 0x8dc61000,
+	0x38a71c2a, 0x1c2a8dc4, 0x100038a6, 0x1c2a8dc5, 0x8dc73867, 0x38681c2a,
+	0x8c491000, 0x8d4b8cca, 0x10001c00, 0x8ccd8c4c, 0x1c008d4e, 0x8c4f1000,
+	0x8d518cd0, 0x10001c00, 0xa759a79a, 0x1000a718, 0xbf80af9b, 0x00001000,
+};
+
+/* r11t_seq_br_instr: 47 entries, copied verbatim from CAF [caf:263-294] /
+ * [caf:296-315].  This is the OSM sequencer's instruction stream and
+ * branch table; without it the state machine accepts a row number and
+ * then does nothing.
+ */
+static const u32 r11t_seq_br_instr[47] = {
+	0x248, 0x20e, 0x21c, 0xf6, 0x112, 0x11c,
+	0xe4, 0xea, 0xc6, 0xd6, 0x126, 0x108,
+	0x184, 0x1a8, 0x1b0, 0x134, 0x158, 0x16e,
+	0x14a, 0xc2, 0x190, 0x1d2, 0x1cc, 0x1d4,
+	0x1e8, 0x0, 0x1f6, 0x32, 0x66, 0xb0,
+	0xa6, 0x1fc, 0x3c, 0x44, 0x5c, 0x60,
+	0x204, 0x30, 0x22a, 0x234, 0x23e, 0x0,
+	0x250, 0x0, 0x0, 0x9a, 0x20c,
+};
+
 static void osm_write_seq(struct osm_dev *p, unsigned int cluster,
 			  unsigned int slot, u32 val, const char *what)
 {
@@ -591,6 +683,20 @@ static void osm_write_seq(struct osm_dev *p, unsigned int cluster,
 
 	dev_info(p->dev, "SEQ_REG(%2u) cluster%d = 0x%08x  %s\n",
 		 slot, cluster, val, what);
+}
+
+/* Same as osm_write_seq() but for raw OSM-window offsets that are not
+ * SEQ_REG slots: the microcode stream at SEQ_MEM_ADDR and the branch
+ * table at SEQ_CFG_BR_ADDR.  Those two are logged once per cluster
+ * instead of per word -- 150 + 47 dev_info lines per probe would bury
+ * everything else.
+ */
+static void osm_write_seq_raw(struct osm_dev *p, unsigned int cluster,
+			      unsigned int off, u32 val)
+{
+	void __iomem *b = p->base + (unsigned long)cluster * OSM_CORE_TABLE_SIZE;
+
+	writel_relaxed(val, b + off);
 }
 
 /*
@@ -797,6 +903,128 @@ static void osm_setup_fsms(struct osm_dev *p)
 		if (c->boost_fsm_en || c->safe_fsm_en || c->ps_fsm_en)
 			osm_write_orm(c, FSM_PLL_SW_OVERRIDE_DROOP,
 				      FSM_PLL_SW_OVERRIDE_EN);
+	}
+}
+
+/*
+ * ITM -> OSM domain handover [caf:1796-1814].
+ *
+ * ITM (Idle-Triggered Module) is the APCS hardware handshake used when
+ * clock-domain ownership moves between clusters.  The two clusters hand
+ * the domain over to each other in opposite directions: pwrcl writes
+ * "disable CL0 / enable CL1", perfcl writes the reverse.
+ *
+ * slot 37 carries the ADDRESS of ITM_PRESENT, so the sequencer can
+ * write the payload in slot 39 to the peer domain.  Leaving it at 0
+ * would have the microcode write to address 0, so these three must be
+ * programmed together with the microcode, never on their own.
+ *
+ * qcom,apcs-itm-present comes from stock R11T [stock-r11t.dts:4564]:
+ * the SAME address for both clusters.
+ */
+static void osm_setup_itm(struct osm_dev *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		u32 payload = (i == 0) ? ITM_CL0_DISABLE_CL1_ENABLED :
+					  ITM_CL0_ENABLED_CL1_DISABLE;
+
+		if (!p->itm_present[i]) {
+			dev_err(p->dev,
+				"cluster%u: qcom,apcs-itm-present missing, skipping ITM handoff\n",
+				i);
+			continue;
+		}
+
+		osm_write_seq(p, i, SEQ_SLOT_ITM_PRESENT,
+			      p->itm_present[i], "apcs_itm_present");
+		osm_write_seq(p, i, SEQ_SLOT_ITM_SPARE, 0, "itm_spare");
+		osm_write_seq(p, i, SEQ_SLOT_ITM_DATA, payload,
+			      "itm_handover");
+	}
+}
+
+/*
+ * APM (Array Power Mux) register programming [caf:1966-1994].
+ *
+ * Tells the sequencer where the APM control/status registers live and
+ * how to recognise which supply (VDD_MX vs VDD_APCC) is currently
+ * active.  Pure addresses plus five compile-time constants, so this is
+ * safe to program without a CPU voltage regulator.
+ *
+ * What we deliberately do NOT port: clk_osm_apm_vc_setup() [caf:2303],
+ * which fills the virtual-corner threshold slots (1/8/15/31/72/73/76).
+ * Those values come from regulator_count_voltages() on vdd-perfcl
+ * [caf:1620-1625] and mainline has no CPRh regulator registered for
+ * the CPU rails (regulator_summary on the phone has no cpu/perfcl/
+ * pwrcl entry), so the corners cannot be computed.  CAF also routes
+ * them through scm_io_write() on pbases[OSM_BASE] + SEQ_REG(n), which
+ * is a secure-world path we do not have.
+ */
+static void osm_setup_apm(struct osm_dev *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		if (!p->apm_mode_ctl[i] || !p->apm_ctrl_status[i]) {
+			dev_err(p->dev,
+				"cluster%u: qcom,apm-mode-ctl / qcom,apm-ctrl-status missing, skipping APM setup\n",
+				i);
+			continue;
+		}
+
+		osm_write_seq(p, i, SEQ_SLOT_APM_MODE_CTL,
+			      p->apm_mode_ctl[i], "apm_mode_ctl");
+		osm_write_seq(p, i, SEQ_SLOT_APM_CTRL_STATUS,
+			      p->apm_ctrl_status[i], "apm_ctrl_status");
+		osm_write_seq(p, i, SEQ_SLOT_APM_MX_MODE, APM_MX_MODE,
+			      "APM_MX_MODE");
+		osm_write_seq(p, i, SEQ_SLOT_APM_MX_MODE_VAL, APM_MX_MODE_VAL,
+			      "APM_MX_MODE_VAL");
+		osm_write_seq(p, i, SEQ_SLOT_APM_SWITCH_MASK,
+			      APM_MODE_SWITCH_MASK, "APM_MODE_SWITCH_MASK");
+		osm_write_seq(p, i, SEQ_SLOT_APM_APC_MODE, APM_APC_MODE,
+			      "APM_APC_MODE");
+		osm_write_seq(p, i, SEQ_SLOT_APM_APC_MODE_VAL,
+			      APM_APC_MODE_VAL, "APM_APC_MODE_VAL");
+	}
+}
+
+/*
+ * Sequencer program + branch table [caf:2087-2103, 2296-2299].
+ *
+ * CAF writes these from clk_osm_do_additional_setup(), which returns
+ * immediately unless qcom,osm-no-tz is present [caf:2264] -- on a stock
+ * boot the trustzone driver does it instead.  With no TZ there is
+ * nobody, so the kernel has to do it or the OSM state machine runs an
+ * empty program.
+ *
+ * Measured before this existed: the whole 0x170-0x758 window read back
+ * as all zero while DCVS_PERF_STATE_DESIRED still tracked our request
+ * and 0x300 was overwritten with the row number.  The OSM was alive
+ * with no instruction stream.
+ *
+ * Called LAST, after every slot is programmed -- the program reads
+ * those slots as operands, exactly as CAF orders it.
+ */
+static void osm_setup_sequencer(struct osm_dev *p)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		for (j = 0; j < ARRAY_SIZE(r11t_seq_instr); j++)
+			osm_write_seq_raw(p, i, SEQ_MEM_ADDR + j * 4,
+					  r11t_seq_instr[j]);
+
+		for (j = 0; j < ARRAY_SIZE(r11t_seq_br_instr); j++)
+			osm_write_seq_raw(p, i, SEQ_CFG_BR_ADDR + j * 4,
+					  r11t_seq_br_instr[j]);
+
+		dev_info(p->dev,
+			 "cluster%u: sequencer program loaded (%zu instr @ 0x%03x, %zu branch @ 0x%03x)\n",
+			 i, ARRAY_SIZE(r11t_seq_instr), SEQ_MEM_ADDR,
+			 ARRAY_SIZE(r11t_seq_br_instr), SEQ_CFG_BR_ADDR);
 	}
 }
 
@@ -1758,17 +1986,21 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	 * here, consumed by osm_setup_l_val() further down.
 	 */
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
-		static const char * const addr_props[4] = {
+		static const char * const addr_props[7] = {
 			"qcom,l-val-base", "qcom,apcs-pll-user-ctl",
 			"qcom,apcs-cfg-rcgr", "qcom,apcs-cmd-rcgr",
+			"qcom,apcs-itm-present", "qcom,apm-mode-ctl",
+			"qcom,apm-ctrl-status",
 		};
-		u32 *slots[4] = {
+		u32 *slots[7] = {
 			&p->l_val_base[i], &p->pll_user_ctl[i],
 			&p->cfg_rcgr[i], &p->cmd_rcgr[i],
+			&p->itm_present[i], &p->apm_mode_ctl[i],
+			&p->apm_ctrl_status[i],
 		};
 		int k;
 
-		for (k = 0; k < 4; k++) {
+		for (k = 0; k < 7; k++) {
 			u32 val = 0;
 
 			of_property_read_u32_index(dev->of_node, addr_props[k],
@@ -1928,6 +2160,32 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	 */
 	if (!dryrun)
 		osm_setup_seq(p);
+
+	/*
+	 * Rest of clk_osm_do_additional_setup(), in CAF's order.  CAF runs
+	 * all of this from one function that early-returns unless
+	 * qcom,osm-no-tz is set [caf:2264], because on a stock boot the
+	 * trustzone driver does it instead.  There is no TZ here, so nothing
+	 * else will: without these the OSM has operand slots but no
+	 * instruction stream, and it accepts a row number and then does
+	 * nothing.
+	 *
+	 * CAF's own order inside do_additional_setup() is SPM_CC_CTRL, the
+	 * PLL/GFMUX slots, the ITM handover, then the microcode and branch
+	 * table LAST -- the program reads the slots as operands, so it goes
+	 * in once every slot has its final value.
+	 */
+	if (!dryrun) {
+		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+			struct osm_cluster *c = &p->cluster[i];
+
+			osm_write(c, BVAL(23, 16, 0xF), SPM_CC_CTRL);
+		}
+
+		osm_setup_itm(p);
+		osm_setup_apm(p);
+		osm_setup_sequencer(p);
+	}
 
 	if (dryrun) {
 		dev_warn(dev,
