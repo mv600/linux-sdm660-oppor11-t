@@ -173,6 +173,75 @@
 #define SEQ_SLOT_APM_APC_MODE		80	/* APM_APC_MODE = BIT(1)  */
 #define SEQ_SLOT_APM_APC_MODE_VAL	81	/* APM_APC_MODE_VAL = 0x3 */
 
+/*
+ * APM crossover / threshold slots [caf:2303-2325].
+ *
+ * clk_osm_program_apm_regs() [caf:1966-1994] only tells the sequencer
+ * WHERE the APM control/status registers live.  The other half is
+ * clk_osm_apm_vc_setup() [caf:2303-2325], which CAF calls immediately
+ * afterwards from clk_osm_probe() [caf:3300-3301], telling it WHEN to
+ * switch the CPU supply between VDD_MX and VDD_APCC.
+ *
+ * CAF computes those numbers at runtime with
+ * clk_osm_resolve_crossover_corners() [caf:1595-1665]:
+ *
+ *   count = regulator_count_voltages(vdd-pwrcl / vdd-perfcl)
+ *   apm_crossover_vc = count - 1        (count - 2 if mem-acc is used)
+ *   apm_threshold_vc = first row whose regulator corner voltage
+ *                      >= qcom,apm-threshold-voltage
+ *   apm_threshold_pre_vc = apm_threshold_vc - 1
+ *
+ * Mainline registers no CPRh regulator for these two rails, so the
+ * numbers are computed here at build time instead, from the stock
+ * R11T DTB.  Every input is a verbatim copy; the walk is the same as
+ * CAF's, so the result is not a guess:
+ *
+ *   qcom,apm-threshold-voltage = 0xd4e40 = 872000 uV
+ *     [stock-r11t.dts:4570]
+ *
+ *   pwrcl  qcom,cpr-voltage-ceiling (8 functional corners)
+ *     [stock-r11t.dts:7813]
+ *       vc1..vc8 = 723232 723232 723232 787488 867744 1068000 1068000 1068000
+ *     regulator-min/max-microvolt = 1 / 8  -> 8 functional corners
+ *     first corner >= 872000 is vc6 (1068000 uV); vc5 is 867744 uV,
+ *     just under.  That 4256 uV margin is what proves the ceiling
+ *     array is the right one: against qcom,cpr-voltage-floor (which is
+ *     what qcom,pwrcl-open-loop-mv holds) NO corner reaches 872000,
+ *     and CAF's fallback [caf:1658-1664] would kick in and claim
+ *     apm_threshold_vc = MAX_VIRTUAL_CORNER = 39, i.e. "never switch".
+ *     -> apm_threshold_vc = 5, apm_threshold_pre_vc = 4
+ *     count = 8 + 1 = 9 -> apm_crossover_vc = 8
+ *
+ *   perfcl qcom,cpr-voltage-ceiling (7 functional corners)
+ *     [stock-r11t.dts:7878]
+ *       vc1..vc7 = 723232 723232 787488 867744 988000 988000 1068000
+ *     regulator-min/max-microvolt = 1 / 7  -> 7 functional corners
+ *     first corner >= 872000 is vc5 (988000 uV)
+ *     -> apm_threshold_vc = 4, apm_threshold_pre_vc = 3
+ *     count = 7 + 1 = 8 -> apm_crossover_vc = 7
+ *
+ * mem-acc is not subtracted from count because the stock OSM node has
+ * no qcom,pwrcl-apcs-mem-acc-cfg / qcom,perfcl-apcs-mem-acc-cfg (0
+ * occurrences in the stock DTB), so CAF's mem_acc_threshold is 0 and it
+ * takes the plain count - 1 branch [caf:1635-1637].
+ *
+ * Sanity: apm_threshold_vc < apm_crossover_vc holds for both clusters
+ * (5 < 8, 4 < 7), which it must, since the crossover corner sits above
+ * every functional corner.
+ */
+#define SEQ_SLOT_APM_THRESHOLD_VC	1	/* apm_threshold_vc        */
+#define SEQ_SLOT_APM_THRESHOLD_ADDR	8	/* OSM window + SEQ_REG(1)  */
+#define SEQ_SLOT_APM_THRESHOLD2		15	/* apm_threshold_vc again  */
+#define SEQ_SLOT_APM_THRESHOLD_PRE	31	/* apm_threshold_pre_vc    */
+#define SEQ_SLOT_APM_CROSSOVER_VC	72	/* apm_crossover_vc        */
+#define SEQ_SLOT_APM_THRESHOLD_MODE	73	/* 0x3b | thr << 6          */
+#define SEQ_SLOT_APM_CROSSOVER_MODE	76	/* 0x39 | thr << 6          */
+
+/* Per cluster, index = R11T_CLUSTER_*.  See the derivation above. */
+static const u8 r11t_apm_threshold_vc[R11T_NR_CLUSTERS]   = { 5, 4 };
+static const u8 r11t_apm_threshold_pre[R11T_NR_CLUSTERS]  = { 4, 3 };
+static const u8 r11t_apm_crossover_vc[R11T_NR_CLUSTERS]   = { 8, 7 };
+
 /* PLLMain / GPLL mux selectors [caf:150-152] */
 #define PLL_MAIN_SEL			0x300
 #define GPLL_SEL			0x400
@@ -1020,6 +1089,39 @@ static void osm_setup_apm(struct osm_dev *p)
 			      "APM_APC_MODE");
 		osm_write_seq(p, i, SEQ_SLOT_APM_APC_MODE_VAL,
 			      APM_APC_MODE_VAL, "APM_APC_MODE_VAL");
+	}
+}
+
+/*
+ * APM crossover / threshold slots -- the missing half of osm_setup_apm().
+ * Port of clk_osm_apm_vc_setup() [caf:2303-2325].
+ */
+static void osm_setup_apm_vc(struct osm_dev *p)
+{
+	unsigned long osm_base;
+	unsigned int i;
+
+	osm_base = (unsigned long)p->base;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		u32 thr = r11t_apm_threshold_vc[i];
+		u32 pre = r11t_apm_threshold_pre[i];
+
+		osm_write_seq(p, i, SEQ_SLOT_APM_THRESHOLD_VC, thr,
+			      "apm_threshold_vc");
+		osm_write_seq(p, i, SEQ_SLOT_APM_CROSSOVER_VC,
+			      r11t_apm_crossover_vc[i], "apm_crossover_vc");
+		osm_write_seq(p, i, SEQ_SLOT_APM_THRESHOLD_ADDR,
+			      (u32)(osm_base + SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC)),
+			      "apm_threshold_vc_addr");
+		osm_write_seq(p, i, SEQ_SLOT_APM_THRESHOLD2, thr,
+			      "apm_threshold_vc(2)");
+		osm_write_seq(p, i, SEQ_SLOT_APM_THRESHOLD_PRE, pre,
+			      "apm_threshold_pre_vc");
+		osm_write_seq(p, i, SEQ_SLOT_APM_THRESHOLD_MODE,
+			      0x3b | (thr << 6), "apm_threshold_mode");
+		osm_write_seq(p, i, SEQ_SLOT_APM_CROSSOVER_MODE,
+			      0x39 | (thr << 6), "apm_crossover_mode");
 	}
 }
 
@@ -2227,6 +2329,7 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		osm_setup_itm(p);
 		if (apm) {
 			osm_setup_apm(p);
+			osm_setup_apm_vc(p);
 		} else if (p->apm_mode_ctl[0] && p->apm_ctrl_status[0]) {
 			dev_warn(dev,
 				 "qcom,apm-mode-ctl / qcom,apm-ctrl-status present in DT but apm=0, leaving the Array Power Mux alone. CAF also fills slots 1/8/15/31/72/73/76 with CPRh virtual-corner voltages that mainline cannot produce; without them the sequencer would switch the CPU power mux on every DVFS step. Enable with modprobe ... apm=1 only once those corners are known good.\n");
