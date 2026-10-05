@@ -237,11 +237,6 @@
 #define SEQ_SLOT_APM_THRESHOLD_MODE	73	/* 0x3b | thr << 6          */
 #define SEQ_SLOT_APM_CROSSOVER_MODE	76	/* 0x39 | thr << 6          */
 
-/* Per cluster, index = R11T_CLUSTER_*.  See the derivation above. */
-static const u8 r11t_apm_threshold_vc[R11T_NR_CLUSTERS]   = { 5, 4 };
-static const u8 r11t_apm_threshold_pre[R11T_NR_CLUSTERS]  = { 4, 3 };
-static const u8 r11t_apm_crossover_vc[R11T_NR_CLUSTERS]   = { 8, 7 };
-
 /* PLLMain / GPLL mux selectors [caf:150-152] */
 #define PLL_MAIN_SEL			0x300
 #define GPLL_SEL			0x400
@@ -325,6 +320,11 @@ static const u8 r11t_apm_crossover_vc[R11T_NR_CLUSTERS]   = { 8, 7 };
 #define R11T_NR_CLUSTERS		2
 #define R11T_CLUSTER_PWRCL		0
 #define R11T_CLUSTER_PERFCL		1
+
+/* Per cluster, index = R11T_CLUSTER_*.  See the derivation above. */
+static const u8 r11t_apm_threshold_vc[R11T_NR_CLUSTERS]   = { 5, 4 };
+static const u8 r11t_apm_threshold_pre[R11T_NR_CLUSTERS]  = { 4, 3 };
+static const u8 r11t_apm_crossover_vc[R11T_NR_CLUSTERS]   = { 8, 7 };
 
 /* enum clk_osm_lut_data order, [caf:50-57] */
 enum osm_lut_field {
