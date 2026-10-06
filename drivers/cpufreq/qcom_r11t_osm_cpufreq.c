@@ -448,30 +448,23 @@ MODULE_PARM_DESC(lval_force_full,
 /*
  * apm: gate the Array Power Mux programming.  DEFAULT OFF, deliberately.
  *
- * osm_setup_apm() below is only half of what CAF does.  CAF always runs
- * clk_osm_program_apm_regs() [caf:2282] immediately followed by
+ * CAF runs clk_osm_program_apm_regs() [caf:2282] immediately followed by
  * clk_osm_apm_vc_setup() [caf:3300-3301]; the first tells the sequencer
  * WHERE the APM control/status registers live, the second tells it WHEN
  * to switch the CPU supply between VDD_MX and VDD_APCC.
  *
- * The "when" half lands in slots 1 / 8 / 15 / 31 / 72 / 73 / 76 and CAF
- * derives every one of them from regulator_count_voltages() and
- * regulator_list_corner_voltage() on the CPRh vdd-pwrcl / vdd-perfcl
- * rails [caf:1600-1665].  Mainline registers no CPRh regulator for those
- * two rails, so those numbers cannot be produced here.  Left at zero they
- * read as "virtual corner 0 is already past the switch threshold", i.e.
- * run the full MX<->APC mux sequence around EVERY frequency change, with
- * no rail state to make that safe.  That is a brownout-grade experiment
- * on a 2.4 GHz CPU, so it stays off until the corners are computed from
- * real data.
- *
- * apm=1 is only meaningful once apm_threshold_vc / apm_crossover_vc are
- * filled in; today it is a knob to test with, not a supported mode.
+ * The "when" values are resolved from the stock R11T DTB corner tables and
+ * kept in r11t_apm_* below, so they do not depend on a CPRh regulator
+ * being registered by mainline.  The remaining risk is the write path:
+ * CAF hands those slots to the secure world with scm_io_write() when
+ * secure_init is false, while this driver has no TZ and must use a normal
+ * MMIO write.  apm=2 previews every value without writing; apm=1 is the
+ * opt-in live experiment.
  */
-static bool apm = false;
-module_param(apm, bool, 0644);
+static int apm;
+module_param(apm, int, 0644);
 MODULE_PARM_DESC(apm,
-		 "Default false: do not program the Array Power Mux slots. Slots 1/8/15/31/72/73/76 (the switch thresholds) need CPRh virtual-corner voltages that only exist under CAF's regulator, so enabling APM without them makes the sequencer switch the CPU power mux on every DVFS step. ITM handover is NOT gated by this and runs regardless.");
+		 "0 (default) = do not touch the Array Power Mux slots. 1 = program them for real. 2 = read-only preview: print every value mode 1 would write, next to a current sequencer-slot readback, and write nothing. The readback can be zero or stale, so use preview to validate targets before opting into apm=1; it is not a safety proof.");
 
 static inline void osm_write(struct osm_cluster *c, u32 val, u32 offset)
 {
@@ -875,11 +868,10 @@ static void osm_dump_rcgr(struct osm_dev *p)
 /* FSM timer setup.  Port of clk_osm_setup_fsms() from                 */
 /* work/caf-ref/clk-cpu-osm-660.c:2124-2260.                           */
 /*                                                                       */
-/* Measured on 2026-10-04: all FSM timer registers (0x1074-0x10C0) read  */
-/* 0x00000000 on both clusters, while FSM_PDN_CTRL (0x1070) is already   */
-/* programmed.  CAF's setup_fsms() writes BOTH; we only implement the    */
-/* timer half.  FSM enable bits at 0x1070 are left untouched (TZ/BL owns */
-/* them).  Timing is applied only when dryrun=0.                         */
+/* Measured on 2026-10-04: the timer region starts clear on both clusters */
+/* while FSM_PDN_CTRL (0x1070) is already programmed.  CAF's setup_fsms() */
+/* writes both the timers and the enable bits, so this port follows that  */
+/* order.  Timing and enable changes are applied only when dryrun=0.      */
 /* ------------------------------------------------------------------ */
 static u32 osm_count_ns(struct osm_dev *p, u32 nsec)
 {
@@ -985,8 +977,9 @@ static void osm_setup_fsms(struct osm_dev *p)
 		if (c->boost_fsm_en || c->safe_fsm_en || c->ps_fsm_en)
 			osm_write(c, 0x5, FSM_BOOST_SYNC_DELAY);
 
-		/* Droop FSM timers [caf:2206-2231] */
-		if (c->wfx_fsm_en || c->pc_fsm_en) {
+		/* WFx FSM [caf:2203-2217] */
+		if (c->wfx_fsm_en) {
+			osm_write_orm(c, FSM_WFX_DROOP_EN, FSM_PDN_CTRL);
 			val = osm_read(c, FSM_DROOP_UNSTALL_TIMER);
 			val |= BVAL(31, 16, osm_count_ns(p, FSM_UNSTALL_NS));
 			osm_write(c, val, FSM_DROOP_UNSTALL_TIMER);
@@ -996,10 +989,36 @@ static void osm_setup_fsms(struct osm_dev *p)
 			osm_write(c, val, FSM_DROOP_WAIT_REL_TIMER0);
 		}
 
-		/* PLL droop override [caf:2255-2260] */
-		if (c->boost_fsm_en || c->safe_fsm_en || c->ps_fsm_en)
-			osm_write_orm(c, FSM_PLL_SW_OVERRIDE_DROOP,
-				      FSM_PLL_SW_OVERRIDE_EN);
+		/* PC/RET FSM [caf:2219-2234] */
+		if (c->pc_fsm_en) {
+			osm_write_orm(c, FSM_PC_RET_DROOP_EN, FSM_PDN_CTRL);
+			val = osm_read(c, FSM_DROOP_UNSTALL_TIMER);
+			val |= BVAL(15, 0, osm_count_ns(p, FSM_UNSTALL_NS));
+			osm_write(c, val, FSM_DROOP_UNSTALL_TIMER);
+			val = osm_read(c, FSM_DROOP_WAIT_REL_TIMER0);
+			val |= BVAL(15, 0,
+				    osm_count_ns(p, FSM_WAIT_RELEASE_NS));
+			osm_write(c, val, FSM_DROOP_WAIT_REL_TIMER0);
+		}
+
+		/* DCVS droop FSM [caf:2236-2253] */
+		if (c->droop_fsm_en)
+			osm_write_orm(c, FSM_DCVS_DROOP_EN, FSM_PDN_CTRL);
+
+		if (c->wfx_fsm_en || c->ps_fsm_en || c->droop_fsm_en) {
+			osm_write(c, 0x1, FSM_DROOP_PROG_SYNC_DELAY);
+			osm_write(c, osm_count_ns(p, FSM_DROOP_RELEASE_NS),
+				  FSM_DROOP_RELEASE_TIMER);
+			osm_write(c, osm_count_ns(p, FSM_DCVS_DROOP_NS),
+				  FSM_DCVS_DROOP_TIMER);
+			val = osm_read(c, FSM_DROOP_CTRL);
+			val |= BIT(31) | BVAL(22, 16, 0x2) | BVAL(6, 0, 0x8);
+			osm_write(c, val, FSM_DROOP_CTRL);
+		}
+
+		/* PLL droop override [caf:2255-2258] */
+		osm_write_orm(c, FSM_PLL_SW_OVERRIDE_DROOP,
+			      FSM_PLL_SW_OVERRIDE_EN);
 	}
 }
 
@@ -1043,6 +1062,30 @@ static void osm_setup_itm(struct osm_dev *p)
 }
 
 /*
+ * apm=2: read-only preview of everything apm=1 would write.
+ *
+ * The corner numbers are no longer guesses -- they were resolved from
+ * the stock DTB the same way CAF resolves them at runtime
+ * [caf:1595-1665], see the block comment above the constants.  What is
+ * still unproven is the WRITE ITSELF: on a stock boot CAF never runs
+ * clk_osm_do_additional_setup() (qcom,osm-no-tz is absent from the
+ * R11T DTB, so secure_init is false and the function returns at
+ * [caf:2264]) and the trustzone driver does that work instead.  For
+ * these particular slots CAF does not even use writel_relaxed -- on
+ * the secure_init == false path it hands them to the secure world via
+ * scm_io_write() [caf:2326-2337].  We have no secure world, so mode 1
+ * writes with writel_relaxed() and that substitution is an assumption,
+ * not a port.
+ *
+ * Mode 2 makes the intended write inspectable without committing to it:
+ * it prints the value we would write next to the sequencer slot's current
+ * readback.  The readback is only a snapshot: these slots can read zero,
+ * stale, or be cleared by hardware while the sequencer is inactive, so
+ * 'have' cannot prove that TZ did or did not program a value.  Use it to
+ * validate our computed targets and addresses, not as a safety verdict;
+ * apm=1 remains a separate opt-in experiment.
+ */
+/*
  * APM (Array Power Mux) register programming [caf:1966-1994].
  *
  * Tells the sequencer where the APM control/status registers live and
@@ -1050,19 +1093,133 @@ static void osm_setup_itm(struct osm_dev *p)
  * active.  Pure addresses plus five compile-time constants, so this is
  * safe to program without a CPU voltage regulator.
  *
- * What we deliberately do NOT port: clk_osm_apm_vc_setup() [caf:2303],
- * which fills the virtual-corner threshold slots (1/8/15/31/72/73/76).
- * Those values come from regulator_count_voltages() on vdd-perfcl
- * [caf:1620-1625] and mainline has no CPRh regulator registered for
- * the CPU rails (regulator_summary on the phone has no cpu/perfcl/
- * pwrcl entry), so the corners cannot be computed.  CAF also routes
- * them through scm_io_write() on pbases[OSM_BASE] + SEQ_REG(n), which
- * is a secure-world path we do not have.
- *
- * Because of that this function is gated behind the apm= module
- * parameter and defaults OFF -- see its MODULE_PARM_DESC for why
- * calling it on its own is worse than not calling it at all.
+ * The "when" half lives in osm_setup_apm_vc() below.  It used to be
+ * deliberately unported on the grounds that the CPRh virtual corners
+ * cannot be computed without a regulator; that is no longer true --
+ * they are resolved from the stock DTB and documented at the top of
+ * this file.  Both halves are still gated behind the apm= module
+ * parameter and default OFF, but now for a narrower reason: the write
+ * PATH differs from CAF's (see the apm=2 comment above), not the
+ * values.  Start at apm=2.
  */
+struct apm_preview {
+	unsigned int slot;
+	const char *what;
+	int per_cluster;   /* 1 = index r11t_apm_* tables, 0 = use common */
+	u32 common;
+};
+
+static const struct apm_preview r11t_apm_preview[] = {
+	/* osm_setup_apm(): "where" -- pure DT addresses and constants */
+	{ SEQ_SLOT_APM_MODE_CTL,       "apm_mode_ctl",        1, 0 },
+	{ SEQ_SLOT_APM_CTRL_STATUS,    "apm_ctrl_status",     1, 0 },
+	{ SEQ_SLOT_APM_MX_MODE,        "APM_MX_MODE",         0, APM_MX_MODE },
+	{ SEQ_SLOT_APM_MX_MODE_VAL,    "APM_MX_MODE_VAL",     0, APM_MX_MODE_VAL },
+	{ SEQ_SLOT_APM_SWITCH_MASK,    "APM_MODE_SWITCH_MASK",0, APM_MODE_SWITCH_MASK },
+	{ SEQ_SLOT_APM_APC_MODE,       "APM_APC_MODE",        0, APM_APC_MODE },
+	{ SEQ_SLOT_APM_APC_MODE_VAL,   "APM_APC_MODE_VAL",    0, APM_APC_MODE_VAL },
+	/* osm_setup_apm_vc(): "when" -- the CPRh corners */
+	{ SEQ_SLOT_APM_THRESHOLD_VC,   "apm_threshold_vc",    1, 0 },
+	{ SEQ_SLOT_APM_CROSSOVER_VC,   "apm_crossover_vc",    1, 0 },
+	{ SEQ_SLOT_APM_THRESHOLD2,      "apm_threshold_vc(2)", 1, 0 },
+	{ SEQ_SLOT_APM_THRESHOLD_PRE,   "apm_threshold_pre_vc",1, 0 },
+	{ SEQ_SLOT_APM_THRESHOLD_MODE,  "apm_threshold_mode",  1, 0 },
+	{ SEQ_SLOT_APM_CROSSOVER_MODE,  "apm_crossover_mode",  1, 0 },
+};
+
+static void osm_preview_apm(struct osm_dev *p)
+{
+	unsigned long osm_base = (unsigned long)p->base;
+	unsigned int i, k;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		void __iomem *b = p->base +
+			(unsigned long)i * OSM_CORE_TABLE_SIZE;
+		u32 thr = r11t_apm_threshold_vc[i];
+		u32 want8, have8;
+
+		dev_info(p->dev, "--- apm=2 preview cluster%u ---\n", i);
+
+		if (!p->apm_mode_ctl[i] || !p->apm_ctrl_status[i]) {
+			dev_err(p->dev,
+				 "cluster%u: DT lacks qcom,apm-mode-ctl/qcom,apm-ctrl-status, apm=1 would SKIP this cluster\n",
+				 i);
+		} else {
+			dev_info(p->dev,
+				 "  DT: apm_mode_ctl=0x%08x apm_ctrl_status=0x%08x\n",
+				 p->apm_mode_ctl[i], p->apm_ctrl_status[i]);
+		}
+
+		for (k = 0; k < ARRAY_SIZE(r11t_apm_preview); k++) {
+			const struct apm_preview *e = &r11t_apm_preview[k];
+			u32 want, have;
+
+			if (!e->per_cluster) {
+				want = e->common;
+			} else {
+				switch (e->slot) {
+				case SEQ_SLOT_APM_MODE_CTL:
+					want = p->apm_mode_ctl[i];
+					break;
+				case SEQ_SLOT_APM_CTRL_STATUS:
+					want = p->apm_ctrl_status[i];
+					break;
+				case SEQ_SLOT_APM_THRESHOLD_VC:
+				case SEQ_SLOT_APM_THRESHOLD2:
+					want = thr;
+					break;
+				case SEQ_SLOT_APM_THRESHOLD_PRE:
+					want = r11t_apm_threshold_pre[i];
+					break;
+				case SEQ_SLOT_APM_CROSSOVER_VC:
+					want = r11t_apm_crossover_vc[i];
+					break;
+				case SEQ_SLOT_APM_THRESHOLD_MODE:
+					want = 0x3b | (thr << 6);
+					break;
+				case SEQ_SLOT_APM_CROSSOVER_MODE:
+					want = 0x39 | (thr << 6);
+					break;
+				default:
+					want = 0;
+					break;
+				}
+			}
+
+			have = readl_relaxed(b + SEQ_REG(e->slot));
+
+			dev_info(p->dev,
+				 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s\n",
+				 e->slot, want, have,
+				 want == have ? "same" : "DIFFERS",
+				 e->what);
+		}
+
+		/* Slot 8 sits outside the table above because its value is an
+		 * OSM-window address, printed here so the full set CAF writes
+		 * appears in one place.
+		 */
+		want8 = (u32)(osm_base + (unsigned long)i * OSM_CORE_TABLE_SIZE +
+			      SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC));
+		have8 = readl_relaxed(b + SEQ_REG(SEQ_SLOT_APM_THRESHOLD_ADDR));
+		dev_info(p->dev,
+			 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s\n",
+			 SEQ_SLOT_APM_THRESHOLD_ADDR, want8, have8,
+			 want8 == have8 ? "same" : "DIFFERS",
+			 "apm_threshold_vc_addr");
+
+		/* SPM_CC_CTRL is not a slot; apm=1 writes it unconditionally
+		 * and so does every other mode, but show it anyway since it is
+		 * the one register where a wrong value would bite hardest.
+		 */
+		dev_info(p->dev,
+			 "  SPM_CC_CTRL(0x%04x) have 0x%08x (mode 1 writes 0x%08x)\n",
+			 SPM_CC_CTRL,
+			 readl_relaxed(b + SPM_CC_CTRL),
+			 BVAL(23, 16, 0xF));
+	}
+}
+
 static void osm_setup_apm(struct osm_dev *p)
 {
 	unsigned int i;
@@ -1112,7 +1269,8 @@ static void osm_setup_apm_vc(struct osm_dev *p)
 		osm_write_seq(p, i, SEQ_SLOT_APM_CROSSOVER_VC,
 			      r11t_apm_crossover_vc[i], "apm_crossover_vc");
 		osm_write_seq(p, i, SEQ_SLOT_APM_THRESHOLD_ADDR,
-			      (u32)(osm_base + SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC)),
+			      (u32)(osm_base + (unsigned long)i * OSM_CORE_TABLE_SIZE +
+				    SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC)),
 			      "apm_threshold_vc_addr");
 		osm_write_seq(p, i, SEQ_SLOT_APM_THRESHOLD2, thr,
 			      "apm_threshold_vc(2)");
@@ -2291,20 +2449,6 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		osm_dump_rcgr(p);
 	}
 
-	/* Program FSM timers (timing tables).  Do NOT touch FSM enable
-	 * bits at 0x1070/0x1050 -- TZ/BL already set them.  Gated by dryrun
-	 * so default behaviour remains unchanged.
-	 */
-	if (!dryrun)
-		osm_setup_fsms(p);
-
-	/* Teach the OSM sequencer where PLL_L_VAL lives.  Gated on dryrun so
-	 * the default module behaviour stays byte for byte what it was before
-	 * this was added.
-	 */
-	if (!dryrun)
-		osm_setup_seq(p);
-
 	/*
 	 * Rest of clk_osm_do_additional_setup(), in CAF's order.  CAF runs
 	 * all of this from one function that early-returns unless
@@ -2319,28 +2463,18 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	 * table LAST -- the program reads the slots as operands, so it goes
 	 * in once every slot has its final value.
 	 */
-	if (!dryrun) {
-		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
-			struct osm_cluster *c = &p->cluster[i];
-
-			osm_write(c, BVAL(23, 16, 0xF), SPM_CC_CTRL);
-		}
-
-		osm_setup_itm(p);
-		if (apm) {
-			osm_setup_apm(p);
-			osm_setup_apm_vc(p);
-		} else if (p->apm_mode_ctl[0] && p->apm_ctrl_status[0]) {
-			dev_warn(dev,
-				 "qcom,apm-mode-ctl / qcom,apm-ctrl-status present in DT but apm=0, leaving the Array Power Mux alone. CAF also fills slots 1/8/15/31/72/73/76 with CPRh virtual-corner voltages that mainline cannot produce; without them the sequencer would switch the CPU power mux on every DVFS step. Enable with modprobe ... apm=1 only once those corners are known good.\n");
-		}
-		osm_setup_sequencer(p);
+	/* apm=2 is a read-only preview and is deliberately NOT inside the
+	 * dryrun gate: its whole point is to inspect the corner numbers
+	 * before committing to a write, which is exactly the situation
+	 * dryrun=1 describes.
+	 */
+	if (apm == 2) {
+		osm_preview_apm(p);
+		dev_warn(dev,
+			 "apm=2: preview only, no APM register was written. Compare 'want' against 'have', then decide whether apm=1 is safe to try live.\n");
 	}
 
-	if (dryrun) {
-		dev_warn(dev,
-			 "dryrun=1: OSM table NOT written, ENABLE_REG untouched, frequency left as the bootloader set it. /sys/kernel/debug/qcom_r11t_osm/regs is all zero in this mode, so it CANNOT be compared against lut. To go live: rmmod qcom_r11t_osm_cpufreq; modprobe qcom_r11t_osm_cpufreq dryrun=0 -- then regs will hold the two per-cluster tables and CAN be compared. Reboot to clear the hardware table again.\n");
-	} else {
+	if (!dryrun) {
 		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 			ret = osm_setup_hw_table(&p->cluster[i]);
 			if (ret) {
@@ -2352,6 +2486,27 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			dev_info(dev, "%s: programmed %u OSM rows\n",
 				 p->cluster[i].name, p->cluster[i].num_entries);
 		}
+
+		osm_setup_fsms(p);
+
+		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+			struct osm_cluster *c = &p->cluster[i];
+
+			osm_write(c, BVAL(23, 16, 0xF), SPM_CC_CTRL);
+		}
+
+		osm_setup_seq(p);
+		if (apm == 1) {
+			osm_setup_apm(p);
+			osm_setup_apm_vc(p);
+			for (i = 0; i < R11T_NR_CLUSTERS; i++)
+				osm_mb(&p->cluster[i]);
+		} else if (!apm && p->apm_mode_ctl[0] && p->apm_ctrl_status[0]) {
+			dev_warn(dev,
+				 "qcom,apm-mode-ctl / qcom,apm-ctrl-status present in DT but apm=0, leaving the Array Power Mux alone. CAF also fills slots 1/8/15/31/72/73/76 with CPRh virtual-corner voltages that mainline cannot produce; without them the sequencer would switch the CPU power mux on every DVFS step. Enable with modprobe ... apm=1 only once those corners are known good.\n");
+		}
+		osm_setup_itm(p);
+		osm_setup_sequencer(p);
 
 		/* Table first, then ENABLE_REG: CAF also enables from
 		 * clk_osm_enable() after clk_osm_setup_hw_table() has run, so
@@ -2365,8 +2520,11 @@ static int r11t_osm_probe(struct platform_device *pdev)
 					p->cluster[i].name, ret);
 				osmdev = NULL;
 				return ret;
-			}
+				}
 		}
+	} else {
+		dev_warn(dev,
+			 "dryrun=1: OSM table NOT written, ENABLE_REG untouched, frequency left as the bootloader set it. /sys/kernel/debug/qcom_r11t_osm/regs is all zero in this mode, so it CANNOT be compared against lut. To go live: rmmod qcom_r11t_osm_cpufreq; modprobe qcom_r11t_osm_cpufreq dryrun=0 -- then regs will hold the two per-cluster tables and CAN be compared. Reboot to clear the hardware table again.\n");
 	}
 
 	/* PLL_L_VAL experiment.  Deliberately independent of dryrun: the whole
