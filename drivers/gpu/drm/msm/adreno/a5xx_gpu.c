@@ -1345,8 +1345,15 @@ static const u32 a5xx_registers[] = {
 
 static void a5xx_dump(struct msm_gpu *gpu)
 {
-	DRM_DEV_INFO(gpu->dev->dev, "status:   %08x\n",
-		gpu_read(gpu, REG_A5XX_RBBM_STATUS));
+	bool stalled = !!(gpu_read(gpu, REG_A5XX_RBBM_STATUS3) & BIT(24));
+	u32 status = gpu_read(gpu, REG_A5XX_RBBM_STATUS);
+
+	DRM_DEV_INFO(gpu->dev->dev, "status:   %08x (stalled=%d)\n",
+		status, stalled);
+
+	if (stalled)
+		return;
+
 	adreno_dump(gpu);
 }
 
