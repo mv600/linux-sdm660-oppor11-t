@@ -371,6 +371,7 @@ struct osm_cluster {
 struct osm_dev {
 	struct device *dev;
 	void __iomem *base;
+	phys_addr_t base_phys;
 	void __iomem *pll_base[R11T_NR_CLUSTERS];
 	/* Absolute register addresses CAF hands to the OSM sequencer
 	 * [caf:2273-2285].  Each entry is an address pair from DT, one
@@ -1129,7 +1130,7 @@ static const struct apm_preview r11t_apm_preview[] = {
 
 static void osm_preview_apm(struct osm_dev *p)
 {
-	unsigned long osm_base = (unsigned long)p->base;
+	unsigned long osm_base = p->base_phys;
 	unsigned int i, k;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
@@ -1258,7 +1259,7 @@ static void osm_setup_apm_vc(struct osm_dev *p)
 	unsigned long osm_base;
 	unsigned int i;
 
-	osm_base = (unsigned long)p->base;
+	osm_base = p->base_phys;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		u32 thr = r11t_apm_threshold_vc[i];
@@ -2280,6 +2281,7 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	p->dev = dev;
+	p->base_phys = res->start;
 	p->base = devm_ioremap_resource(dev, res);
 	if (IS_ERR(p->base))
 		return PTR_ERR(p->base);
