@@ -8,6 +8,7 @@
 #include <linux/module.h>
 #include <linux/qrtr.h>
 #include <linux/workqueue.h>
+#include <linux/delay.h>
 #include <net/sock.h>
 
 #include "qrtr.h"
@@ -129,6 +130,35 @@ static int server_match(const struct qrtr_server *srv,
 	return (srv->instance & ifilter) == f->instance;
 }
 
+
+#define QRTR_NS_SEND_RETRIES	5
+
+/*
+ * QRTR control messages are datagrams.  A local peer whose receive queue is
+ * momentarily full (or under receive-buffer memory pressure) reports
+ * -ENOSPC/-ENOBUFS from qrtr_local_enqueue().  Those are transient for
+ * well-behaved services which drain their sockets asynchronously, so retry a
+ * few times with a short sleep instead of dropping the notification and
+ * leaving stale DEL_CLIENT state behind on the surviving services.
+ *
+ * This runs only from the ordered qrtr_ns workqueue (process context).
+ */
+static int qrtr_ns_sendmsg(struct msghdr *msg, struct kvec *iv, size_t len)
+{
+	int ret;
+	int i;
+
+	for (i = 0; i < QRTR_NS_SEND_RETRIES; i++) {
+		ret = kernel_sendmsg(qrtr_ns.sock, msg, iv, 1, len);
+		if (ret != -ENOSPC && ret != -ENOMEM && ret != -ENOBUFS)
+			return ret;
+		if (i + 1 < QRTR_NS_SEND_RETRIES)
+			msleep(1);
+	}
+
+	return ret;
+}
+
 static int service_announce_new(struct sockaddr_qrtr *dest,
 				struct qrtr_server *srv)
 {
@@ -152,7 +182,7 @@ static int service_announce_new(struct sockaddr_qrtr *dest,
 	msg.msg_name = (struct sockaddr *)dest;
 	msg.msg_namelen = sizeof(*dest);
 
-	return kernel_sendmsg(qrtr_ns.sock, &msg, &iv, 1, sizeof(pkt));
+	return qrtr_ns_sendmsg(&msg, &iv, sizeof(pkt));
 }
 
 static void service_announce_del(struct sockaddr_qrtr *dest,
@@ -179,9 +209,9 @@ static void service_announce_del(struct sockaddr_qrtr *dest,
 	msg.msg_name = (struct sockaddr *)dest;
 	msg.msg_namelen = sizeof(*dest);
 
-	ret = kernel_sendmsg(qrtr_ns.sock, &msg, &iv, 1, sizeof(pkt));
-	if (ret < 0 && ret != -ENODEV)
-		pr_err("failed to announce del service\n");
+	ret = qrtr_ns_sendmsg(&msg, &iv, sizeof(pkt));
+	if (ret < 0 && ret != -ENODEV && ret != -ENOSPC)
+		pr_err_ratelimited("failed to announce del service: %d\n", ret);
 
 	return;
 }
@@ -210,9 +240,9 @@ static void lookup_notify(struct sockaddr_qrtr *to, struct qrtr_server *srv,
 	msg.msg_name = (struct sockaddr *)to;
 	msg.msg_namelen = sizeof(*to);
 
-	ret = kernel_sendmsg(qrtr_ns.sock, &msg, &iv, 1, sizeof(pkt));
-	if (ret < 0 && ret != -ENODEV)
-		pr_err("failed to send lookup notification\n");
+	ret = qrtr_ns_sendmsg(&msg, &iv, sizeof(pkt));
+	if (ret < 0 && ret != -ENODEV && ret != -ENOSPC)
+		pr_err_ratelimited("failed to send lookup notification: %d\n", ret);
 }
 
 static int announce_servers(struct sockaddr_qrtr *sq)
@@ -435,8 +465,8 @@ static int ctrl_cmd_bye(struct sockaddr_qrtr *from)
 		msg.msg_name = (struct sockaddr *)&sq;
 		msg.msg_namelen = sizeof(sq);
 
-		ret = kernel_sendmsg(qrtr_ns.sock, &msg, &iv, 1, sizeof(pkt));
-		if (ret < 0 && ret != -ENODEV) {
+		ret = qrtr_ns_sendmsg(&msg, &iv, sizeof(pkt));
+		if (ret < 0 && ret != -ENODEV && ret != -ENOSPC) {
 			pr_err("failed to send bye cmd\n");
 			goto delete_node;
 		}
@@ -519,10 +549,14 @@ static int ctrl_cmd_del_client(struct sockaddr_qrtr *from,
 		msg.msg_name = (struct sockaddr *)&sq;
 		msg.msg_namelen = sizeof(sq);
 
-		ret = kernel_sendmsg(qrtr_ns.sock, &msg, &iv, 1, sizeof(pkt));
-		if (ret < 0 && ret != -ENODEV) {
-			pr_err("failed to send del client cmd\n");
-			return ret;
+		ret = qrtr_ns_sendmsg(&msg, &iv, sizeof(pkt));
+		if (ret < 0) {
+			if (ret == -ENODEV || ret == -ENOSPC) {
+				continue;
+			}
+			pr_err_ratelimited("failed to send del client cmd: %d to %u:%u\n",
+					   ret, srv->node, srv->port);
+			continue;
 		}
 	}
 	return 0;
