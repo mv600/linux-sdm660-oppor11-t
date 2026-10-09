@@ -483,7 +483,7 @@ MODULE_PARM_DESC(apm,
 static int memacc;
 module_param(memacc, int, 0644);
 MODULE_PARM_DESC(memacc,
-		 "0 (default) = do not inspect MEM-ACC. 1 = read-only preview: print the CAF MEM-ACC level map and thresholds, the SEQ_REG(32) L_VAL target, the TZ-owned slot 49 address, and a readback of every MEM-ACC slot (32/49/51-59 and the secure-only 12-14/60-68 set); no MEM-ACC register is written. 2 = preview first, then program SEQ_REG(55-58) and SEQ_REG(32) with the CAF-derived values and verify by readback; slots 49, 88, 51-54, 59, 12-14 and 60-68 are never touched.");
+		 "0 (default) = do not inspect MEM-ACC. 1 = read-only preview: print the CAF-derived LEVEL MAP, THRESHOLD corners, the SEQ_REG(32) L_VAL target, the SEQ_REG(28) address (slot 49) and the constants/mask a no-TZ CAF path would write; nothing is written. 2 = program the no-TZ writable MEM-ACC set: SEQ_REG(55-58)=thresholds, SEQ_REG(32)=L_VAL, SEQ_REG(49)=SEQ_REG(28) phys addr, SEQ_REG(51-54)=1..4, SEQ_REG(59)=0xff.  The sequencer slot window is WRITE-ONLY, so no readback verify exists; 88/12-14/60-68 stay 0 because the stock DTS has no crossover and no qcom,*-apcs-mem-acc-{cfg,val}.  Experimental, not stock-TZ-equivalent.");
 
 static inline void osm_write(struct osm_cluster *c, u32 val, u32 offset)
 {
@@ -1327,16 +1327,24 @@ static void osm_preview_memacc(struct osm_dev *p)
 {
 	unsigned int i, j;
 	bool secure_no_tz = of_find_property(p->dev->of_node, "qcom,osm-no-tz", NULL);
+	bool has_mem_acc_threshold_prop =
+		of_find_property(p->dev->of_node,
+				 "qcom,perfcl-apcs-mem-acc-threshold-voltage", NULL);
+	bool has_cfg_val =
+		of_find_property(p->dev->of_node, "qcom,pwrcl-apcs-mem-acc-cfg", NULL) ||
+		of_find_property(p->dev->of_node, "qcom,perfcl-apcs-mem-acc-cfg", NULL) ||
+		of_find_property(p->dev->of_node, "qcom,pwrcl-apcs-mem-acc-val", NULL) ||
+		of_find_property(p->dev->of_node, "qcom,perfcl-apcs-mem-acc-val", NULL);
+	phys_addr_t seq28_addr;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		struct osm_cluster *c = &p->cluster[i];
-		void __iomem *b = p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE;
 		struct osm_memacc_cfg cfg;
 		int rc;
-		u32 want, have;
-		bool has_mem_acc_threshold_prop = false;
 
 		rc = osm_memacc_derive(c, &cfg);
+		seq28_addr = p->base_phys + (unsigned long)i * OSM_CORE_TABLE_SIZE +
+			     SEQ_REG(28);
 
 		/* cluster0 is pwrcl (LITTLE, A53, cpus 0,5,6,7) and
 		 * cluster1 is perfcl (big, A73, cpus 1,2,3,4); print the
@@ -1355,136 +1363,80 @@ static void osm_preview_memacc(struct osm_dev *p)
 					 c->lut[j].spare_data);
 		}
 		dev_info(p->dev,
-			 " level_map={%d,%d,%d} threshold_vc={%d,%d,%d,%d} derive_rc=%d\n",
-			 cfg.level_map[0], cfg.level_map[1],
-			 cfg.level_map[2], cfg.threshold_vc[0], cfg.threshold_vc[1],
-			 cfg.threshold_vc[2], cfg.threshold_vc[3], rc);
-
-		want = cfg.target_row >= 0 ? cfg.lval : 0;
-		have = readl_relaxed(b + SEQ_REG(32));
+			 " level_map={%d,%d,%d} threshold_vc={%d,%d,%d,%d} "
+			 "derive_rc=%d lval=0x%08x target_row=%d\n",
+			 cfg.level_map[0], cfg.level_map[1], cfg.level_map[2],
+			 cfg.threshold_vc[0], cfg.threshold_vc[1],
+			 cfg.threshold_vc[2], cfg.threshold_vc[3], rc,
+			 cfg.target_row >= 0 ? cfg.lval : 0, cfg.target_row);
 		dev_info(p->dev,
-			 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s target_row=%d\n",
-			 32, want, have, cfg.target_row >= 0 &&
-			 want == have ? "same" : "DIFFERS",
-			 "memacc_lval", cfg.target_row);
-
-		want = (u32)(p->base_phys + (unsigned long)i * OSM_CORE_TABLE_SIZE +
-			       SEQ_REG(28));
-		have = readl_relaxed(b + SEQ_REG(49));
-		dev_info(p->dev,
-			 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s (TZ-owned; non-secure CAF does not write it)\n",
-			 49, want, have, want == have ? "same" : "DIFFERS",
-			 "memacc_seq28_addr");
-
-		for (j = 0; j < 4; j++) {
-			want = cfg.threshold_vc[j];
-			have = readl_relaxed(b + SEQ_REG(55 + j));
-			dev_info(p->dev,
-				 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s\n",
-				 55 + j, want, have,
-				 want == have ? "same" : "DIFFERS",
-				 "memacc_threshold");
-		}
-
-		want = MEM_ACC_APM_READ_MASK;
-		have = readl_relaxed(b + SEQ_REG(59));
-		dev_info(p->dev,
-			 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s (secure-only path)\n",
-			 59, want, have, want == have ? "same" : "DIFFERS",
-			 "memacc_apm_mask");
-
-		if (i == 1)
-			has_mem_acc_threshold_prop = of_find_property(p->dev->of_node,
-				 "qcom,perfcl-apcs-mem-acc-threshold-voltage", NULL);
-		if (!has_mem_acc_threshold_prop) {
-			want = 0;
-			have = readl_relaxed(b + SEQ_REG(88));
-			dev_info(p->dev,
-				 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s (property absent, no crossover write)\n",
-				 88, want, have, want == have ? "same" : "DIFFERS",
-				 "memacc_crossover");
-		} else {
-			dev_info(p->dev,
-				 "  SEQ_REG(%2u) have 0x%08x (threshold-voltage property present; crossover needs regulator-count resolution)\n",
-				 88, readl_relaxed(b + SEQ_REG(88)));
-		}
-
-		/*
-		 * Secure-only path (CAF's secure_init == qcom,osm-no-tz).
-		 * The stock R11T DTS does not declare qcom,osm-no-tz, so
-		 * these are the slots our non-secure boot never programs.
-		 * Print their live values anyway: the readback alone tells us
-		 * whether the bootloader/TZ left them in a sane state, and it
-		 * costs nothing because the preview is read-only.
-		 */
-		for (j = 0; j < 4; j++) {
-			have = readl_relaxed(b + SEQ_REG(51 + j));
-			dev_info(p->dev,
-				 "  SEQ_REG(%2u) have 0x%08x (secure-only const %u)\n",
-				 51 + j, have, j + 1);
-		}
-		for (j = 0; j < MAX_MEM_ACC_VAL_PER_LEVEL; j++) {
-			have = readl_relaxed(b + MEM_ACC_SEQ_REG_CFG_START(j));
-			dev_info(p->dev,
-				 "  SEQ_REG(%2u) have 0x%08x (secure-only cfg[%u])\n",
-				 12 + j, have, j);
-		}
-		for (j = 0; j < MAX_MEM_ACC_VALUES; j++) {
-			have = readl_relaxed(b + MEM_ACC_SEQ_REG_VAL_START(j));
-			dev_info(p->dev,
-				 "  SEQ_REG(%2u) have 0x%08x (secure-only val[%u])\n",
-				 60 + j, have, j);
-		}
-
-		dev_info(p->dev,
-			 "  secure-only path applicable=%d (qcom,osm-no-tz + DT cfg/val); slots 51-54/59/12-14/60-68\n",
-			 secure_no_tz ? 1 : 0);
+			 "  would-write SEQ_REG(55-58)=%d,%d,%d,%d "
+			 "SEQ_REG(32)=0x%08x SEQ_REG(49)=0x%08x "
+			 "SEQ_REG(51-54)=1,2,3,4 SEQ_REG(59)=0x%02x\n",
+			 cfg.threshold_vc[0], cfg.threshold_vc[1],
+			 cfg.threshold_vc[2], cfg.threshold_vc[3],
+			 cfg.target_row >= 0 ? cfg.lval : 0, (u32)seq28_addr,
+			 MEM_ACC_APM_READ_MASK);
 	}
+	dev_info(p->dev,
+		 "memacc=%d preview: derived values come from the LUT (trusted); "
+		 "the sequencer slot window is WRITE-ONLY -- reads return a "
+		 "constant -- so no slot readback is possible and none is "
+		 "attempted.  crossover-prop=%d cfg/val-dt=%d\n",
+		 memacc, has_mem_acc_threshold_prop ? 1 : 0,
+		 has_cfg_val ? 1 : 0);
 	if (memacc == 1)
-		dev_info(p->dev, "memacc=1: preview only, no MEM-ACC register was written.\n");
+		dev_info(p->dev,
+			 "memacc=1: preview only, no MEM-ACC register was written.\n");
 	else
 		dev_info(p->dev,
-			 "memacc=2: preview shows the PRE-write state; SEQ_REG(55-58)/32 are programmed after the sequencer is loaded.\n");
+			 "memacc=2: preview shows what will be programmed after the sequencer is loaded.\n");
 }
 
 /*
  * memacc=2: program the MEM-ACC slots CAF programs on a boot with no
- * trustzone.
+ * trustzone, as far as a no-trustzone port can.
  *
  * CAF's clk_osm_program_mem_acc_regs() [caf:1996-2086] has two paths:
  *
  *   secure_init (DT declares qcom,osm-no-tz)
- *       plain clk_osm_write_reg() for 51-54, 59, 55-58, 49, plus the
- *       cfg/val arrays that only exist as qcom,*-apcs-mem-acc-{cfg,val};
+ *       plain clk_osm_write_reg() for 51-54, 59, 55-58, 49, plus cfg/val
+ *       arrays that only exist as qcom,*-apcs-mem-acc-{cfg,val};
  *
- *   otherwise
- *       scm_io_write() for 88 (crossover, and only when the DT asks for
- *       one) and for 55-58, then 32.  Slot 49 is left to TZ [caf:2059].
+ *   otherwise (TZ owns the OSM)
+ *       scm_io_write() for 88 (crossover, only when the DT resolved one)
+ *       and for 55-58, then 32.  Slot 49 is left to TZ [caf:2059].
  *
- * This platform boots mainline with no trustzone, so there is no SCM
- * endpoint and the scm_io_write() path cannot run at all.  Direct MMIO is
- * what the secure_init branch does and it is the only option here -- it is
- * also the same primitive already used, and read back successfully, for
- * the LUT rows, the sequencer program and the APM slots.
+ * This platform boots mainline with no trustzone and no SCM endpoint, so
+ * the scm_io_write() path cannot run at all.  Direct MMIO is exactly what
+ * the secure_init branch does and it is the only option here.
  *
- * Deliberately written -- values CAF writes on every stock boot and that
- * need no DT data we lack:
+ * Deliberately WRITTEN (values CAF writes on a stock boot and that need
+ * no DT data we lack):
  *   SEQ_REG(55..58)  threshold corners, derived from the LUT
  *   SEQ_REG(32)      L_VAL of the first MEM-ACC level-3 corner
+ *   SEQ_REG(49)      PHYSICAL ADDRESS of SEQ_REG(28).  CAF's non-secure
+ *                    path leaves it to TZ [caf:2059], but with no TZ the
+ *                    slot would stay 0 and the MEM-ACC microcode would
+ *                    dereference address 0 as soon as the thresholds are
+ *                    live, so the no-TZ port must write it itself.
+ *   SEQ_REG(51..54)  MEM-ACC constants 1..4 [caf:73]
+ *   SEQ_REG(59)      MEM-ACC APM read mask 0xff [caf:201]
  *
- * Deliberately NOT written:
- *   SEQ_REG(49)      an ADDRESS (slot 28's physical address), not a
- *                    corner.  CAF's non-secure path leaves it to TZ
- *                    [caf:2059]; writing it would be our own policy and
- *                    is tracked separately.
- *   SEQ_REG(88)      crossover: stock R11T has no
- *                    qcom,perfcl-apcs-mem-acc-threshold-voltage, so CAF
- *                    would not write it either.
- *   SEQ_REG(51..54), 59
- *                    constants CAF only writes on the secure path.
+ * Deliberately NOT WRITTEN:
+ *   SEQ_REG(88)      crossover: needs qcom,*-apcs-mem-acc-threshold-
+ *                    voltage plus regulator-count resolution; the stock
+ *                    R11T DTB has none, so CAF would not write it either.
  *   SEQ_REG(12..14), 60..68
- *                    need qcom,*-apcs-mem-acc-{cfg,val}, absent from the
- *                    stock R11T DTB, so there is nothing to write.
+ *                    cfg/val arrays from qcom,*-apcs-mem-acc-{cfg,val};
+ *                    absent from the stock R11T DTB (the values live in
+ *                    the vendor TZ firmware), so there is nothing to
+ *                    write.  This makes memacc=2 an experimental subset,
+ *                    NOT the stock-TZ-equivalent configuration.
+ *
+ * The sequencer slot window is write-only: reads return a constant, so
+ * there is no readback verification.  Verification must be by behaviour
+ * (DVFS still scales, no crash, no hang across the MEM-ACC threshold).
  *
  * CAF calls this right after clk_osm_do_additional_setup() and before
  * clk_osm_apm_vc_setup() [caf:3296-3301]; it lands here after
@@ -1497,47 +1449,41 @@ static void osm_setup_memacc(struct osm_dev *p)
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		struct osm_cluster *c = &p->cluster[i];
-		void __iomem *b = p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE;
 		struct osm_memacc_cfg cfg;
-		int mismatches = 0;
+		phys_addr_t seq28_addr;
 		int rc = osm_memacc_derive(c, &cfg);
-		u32 want, have;
 
 		if (rc) {
 			dev_err(p->dev,
-				 "%s: MEM-ACC thresholds not derivable (%d); refusing to write SEQ_REG(55-58)/32\n",
+				 "%s: MEM-ACC thresholds not derivable (%d); refusing to program MEM-ACC slots\n",
 				 c->name, rc);
 			continue;
 		}
 
+		seq28_addr = p->base_phys + (unsigned long)i * OSM_CORE_TABLE_SIZE;
 		for (j = 0; j < 4; j++)
 			osm_write_seq(p, i, 55 + j, (u32)cfg.threshold_vc[j],
 				      "memacc_threshold_vc");
 		osm_write_seq(p, i, 32, cfg.lval, "memacc_lval");
+		osm_write_seq(p, i, 49, (u32)(seq28_addr + SEQ_REG(28)),
+			      "memacc_seq28_addr");
+		for (j = 0; j < 4; j++)
+			osm_write_seq(p, i, 51 + j, (u32)(j + 1),
+				      "memacc_seq_const");
+		osm_write_seq(p, i, 59, MEM_ACC_APM_READ_MASK,
+			      "memacc_apm_mask");
 		osm_mb(c);
 
-		for (j = 0; j < 4; j++) {
-			want = (u32)cfg.threshold_vc[j];
-			have = readl_relaxed(b + SEQ_REG(55 + j));
-			if (have != want)
-				mismatches++;
-			dev_info(p->dev,
-				 "  memacc verify cluster%u SEQ_REG(%u) want 0x%08x have 0x%08x %s\n",
-				 i, 55 + j, want, have,
-				 have == want ? "OK" : "MISMATCH");
-		}
-
-		want = cfg.lval;
-		have = readl_relaxed(b + SEQ_REG(32));
-		if (have != want)
-			mismatches++;
+		/* Slot window is write-only so nothing is read back; the
+		 * write log above plus the behavioural check are the only
+		 * verification that exists.
+		 */
 		dev_info(p->dev,
-			 "  memacc verify cluster%u SEQ_REG(%u) want 0x%08x have 0x%08x %s\n",
-			 i, 32, want, have, have == want ? "OK" : "MISMATCH");
-
-		dev_info(p->dev,
-			 "memacc=2 cluster%u (%s): wrote SEQ_REG(55-58) and SEQ_REG(32) only; 49/88/51-54/59/12-14/60-68 untouched; %d mismatch\n",
-			 i, c->name, mismatches);
+			 "memacc=2 cluster%u (%s): programmed SEQ_REG(55-58,32,49,51-54,59). "
+			 "88/12-14/60-68 left 0: stock DTS has no crossover and no "
+			 "qcom,*-apcs-mem-acc-{cfg,val}.  Experimental, not "
+			 "stock-TZ-equivalent; slot window is write-only, no readback.\n",
+			 i, c->name);
 	}
 }
 
@@ -2800,10 +2746,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		osm_preview_memacc(p);
 		if (memacc == 1)
 			dev_warn(dev,
-				 "memacc=1: preview only, no MEM-ACC register was written. Compare the CAF-derived values before considering any secure/SCM write path.\n");
+				 "memacc=1: preview only, no MEM-ACC register was written. Compare the CAF-derived values before deciding whether memacc=2 is worth trying live.\n");
 		else
 			dev_warn(dev,
-				 "memacc=2: preview above is the PRE-write state. SEQ_REG(55-58) and SEQ_REG(32) are written later, after the sequencer is loaded, and then verified by readback.\n");
+				 "memacc=2: the values above will be programmed after the sequencer is loaded.  The slot window is write-only, so there is no readback verify; watch the behavioural checks (DVFS scaling, no crash).\n");
 	}
 
 	if (!dryrun) {
