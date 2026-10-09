@@ -483,7 +483,7 @@ MODULE_PARM_DESC(apm,
 static int memacc;
 module_param(memacc, int, 0644);
 MODULE_PARM_DESC(memacc,
-		 "0 (default) = do not inspect MEM-ACC. 1 = read-only preview: print the CAF MEM-ACC level map and thresholds, the SEQ_REG(32) L_VAL target, the TZ-owned slot 49 address, and a readback of every MEM-ACC slot (32/49/51-59 and the secure-only 12-14/60-68 set); no MEM-ACC register is written.");
+		 "0 (default) = do not inspect MEM-ACC. 1 = read-only preview: print the CAF MEM-ACC level map and thresholds, the SEQ_REG(32) L_VAL target, the TZ-owned slot 49 address, and a readback of every MEM-ACC slot (32/49/51-59 and the secure-only 12-14/60-68 set); no MEM-ACC register is written. 2 = preview first, then program SEQ_REG(55-58) and SEQ_REG(32) with the CAF-derived values and verify by readback; slots 49, 88, 51-54, 59, 12-14 and 60-68 are never touched.");
 
 static inline void osm_write(struct osm_cluster *c, u32 val, u32 offset)
 {
@@ -1239,6 +1239,90 @@ static void osm_preview_apm(struct osm_dev *p)
 	}
 }
 
+/*
+ * MEM-ACC operands the sequencer program reads: a per-corner level map,
+ * the four threshold corners, and the L_VAL that belongs to the first
+ * MEM-ACC level-3 corner.
+ *
+ * Derived exactly as CAF's clk_osm_program_mem_acc_regs() [caf:1996-2086].
+ * osm_parse_lut() has already turned the DT's 1-based VIRTUAL_CORNER into
+ * a 0-based one [caf:941-942], and the level map subtracts a second time
+ * [caf:2010].  That second subtraction is NOT an off-by-one: it stores the
+ * corner immediately BEFORE each transition, and threshold_vc[1]/[3] add
+ * it back [caf:2015-2018].  The proof is the L_VAL loop at caf:2082 --
+ * with a single subtraction threshold_vc[3] becomes 8 (pwrcl) / 7 (perfcl),
+ * both outside the 0-based table, and SEQ_REG(32) would never be written.
+ */
+struct osm_memacc_cfg {
+	int level_map[MAX_MEM_ACC_LEVELS];
+	int threshold_vc[4];
+	int target_row;
+	u32 lval;
+	int transitions;
+};
+
+static int osm_memacc_derive(struct osm_cluster *c, struct osm_memacc_cfg *cfg)
+{
+	int curr_level, map_idx = 0, j;
+
+	cfg->target_row = -1;
+	cfg->lval = 0;
+	cfg->transitions = 0;
+	for (j = 0; j < MAX_MEM_ACC_LEVELS; j++)
+		cfg->level_map[j] = 0;
+	for (j = 0; j < 4; j++)
+		cfg->threshold_vc[j] = 0;
+
+	if (!c->num_entries)
+		return -ENODEV;
+
+	curr_level = c->lut[0].spare_data;
+	for (j = 0; j < c->num_entries; j++) {
+		if (curr_level == MAX_MEM_ACC_LEVELS)
+			break;
+
+		if (c->lut[j].spare_data != curr_level) {
+			if (map_idx < MAX_MEM_ACC_LEVELS) {
+				/* Match CAF exactly: osm_parse_lut() stored a
+				 * 0-based corner, then CAF subtracts one here.
+				 */
+				cfg->level_map[map_idx] =
+					(int)c->lut[j].virtual_corner - 1;
+				map_idx++;
+			}
+			curr_level = c->lut[j].spare_data;
+		}
+	}
+	cfg->transitions = map_idx;
+
+	cfg->threshold_vc[0] = cfg->level_map[0];
+	cfg->threshold_vc[1] = cfg->level_map[0] + 1;
+	cfg->threshold_vc[2] = cfg->level_map[1];
+	cfg->threshold_vc[3] = cfg->level_map[1] + 1;
+
+	/* CAF writes SEQ_REG(32) once per matching row without breaking, so
+	 * the last match is what actually lands in the slot.  Keep the same
+	 * semantics in case a future table repeats the threshold corner.
+	 */
+	for (j = 0; j < c->num_entries; j++)
+		if (cfg->threshold_vc[3] == (int)c->lut[j].virtual_corner)
+			cfg->target_row = j;
+
+	if (cfg->target_row >= 0)
+		cfg->lval = R11T_L_VAL(c->lut[cfg->target_row].freq_data);
+
+	/*
+	 * A table that never reaches MEM-ACC level 3 leaves level_map at
+	 * {0,0,0}: threshold_vc then degenerates to {0,1,0,1} and corner 1
+	 * would be picked as the level-3 boundary.  memacc=1 still prints
+	 * whatever was derived; only the write path treats this as fatal.
+	 */
+	if (map_idx < 2 || cfg->target_row < 0)
+		return -ENODATA;
+
+	return 0;
+}
+
 static void osm_preview_memacc(struct osm_dev *p)
 {
 	unsigned int i, j;
@@ -1247,42 +1331,20 @@ static void osm_preview_memacc(struct osm_dev *p)
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		struct osm_cluster *c = &p->cluster[i];
 		void __iomem *b = p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE;
-		int mem_acc_level_map[MAX_MEM_ACC_LEVELS] = { 0, 0, 0 };
-		int threshold_vc[4];
-		int curr_level, map_idx = 0;
-		int target_row = -1;
+		struct osm_memacc_cfg cfg;
+		int rc;
 		u32 want, have;
 		bool has_mem_acc_threshold_prop = false;
 
-		curr_level = c->num_entries ? c->lut[0].spare_data : 0;
-		for (j = 0; j < c->num_entries; j++) {
-			if (curr_level == MAX_MEM_ACC_LEVELS)
-				break;
-
-			if (c->lut[j].spare_data != curr_level) {
-				if (map_idx < MAX_MEM_ACC_LEVELS) {
-					/* Match CAF exactly: osm_parse_lut() stored a
-					 * 0-based corner, then CAF subtracts one here.
-					 */
-					mem_acc_level_map[map_idx++] =
-						(int)c->lut[j].virtual_corner - 1;
-				}
-				curr_level = c->lut[j].spare_data;
-			}
-		}
-
-		threshold_vc[0] = mem_acc_level_map[0];
-		threshold_vc[1] = mem_acc_level_map[0] + 1;
-		threshold_vc[2] = mem_acc_level_map[1];
-		threshold_vc[3] = mem_acc_level_map[1] + 1;
+		rc = osm_memacc_derive(c, &cfg);
 
 		/* cluster0 is pwrcl (LITTLE, A53, cpus 0,5,6,7) and
 		 * cluster1 is perfcl (big, A73, cpus 1,2,3,4); print the
 		 * name and the DT cpu mask so the dmesg cannot be misread.
 		 */
 		dev_info(p->dev,
-			 "--- memacc=1 preview cluster%u (%s, cpus %*pbl) ---\n",
-			 i, c->name, cpumask_pr_args(c->cpus));
+			 "--- memacc=%d preview cluster%u (%s, cpus %*pbl) ---\n",
+			 memacc, i, c->name, cpumask_pr_args(c->cpus));
 		dev_info(p->dev,
 			 "  secure_no_tz=%d spare_transitions:",
 			 secure_no_tz ? 1 : 0);
@@ -1293,32 +1355,21 @@ static void osm_preview_memacc(struct osm_dev *p)
 					 c->lut[j].spare_data);
 		}
 		dev_info(p->dev,
-			 " level_map={%d,%d,%d} threshold_vc={%d,%d,%d,%d}\n",
-			 mem_acc_level_map[0], mem_acc_level_map[1],
-			 mem_acc_level_map[2], threshold_vc[0], threshold_vc[1],
-			 threshold_vc[2], threshold_vc[3]);
+			 " level_map={%d,%d,%d} threshold_vc={%d,%d,%d,%d} derive_rc=%d\n",
+			 cfg.level_map[0], cfg.level_map[1],
+			 cfg.level_map[2], cfg.threshold_vc[0], cfg.threshold_vc[1],
+			 cfg.threshold_vc[2], cfg.threshold_vc[3], rc);
 
-		/* CAF writes SEQ_REG(32) once per matching row without
-		 * breaking, so the last match is what actually lands in the
-		 * slot.  Keep the same semantics here in case a future table
-		 * ever repeats the threshold corner.
-		 */
-		for (j = 0; j < c->num_entries; j++) {
-			if (threshold_vc[3] == (int)c->lut[j].virtual_corner)
-				target_row = j;
-		}
-
-		want = target_row >= 0 ?
-			R11T_L_VAL(c->lut[target_row].freq_data) : 0;
+		want = cfg.target_row >= 0 ? cfg.lval : 0;
 		have = readl_relaxed(b + SEQ_REG(32));
 		dev_info(p->dev,
 			 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s target_row=%d\n",
-			 32, want, have, target_row >= 0 &&
+			 32, want, have, cfg.target_row >= 0 &&
 			 want == have ? "same" : "DIFFERS",
-			 "memacc_lval", target_row);
+			 "memacc_lval", cfg.target_row);
 
 		want = (u32)(p->base_phys + (unsigned long)i * OSM_CORE_TABLE_SIZE +
-			      SEQ_REG(28));
+			       SEQ_REG(28));
 		have = readl_relaxed(b + SEQ_REG(49));
 		dev_info(p->dev,
 			 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s (TZ-owned; non-secure CAF does not write it)\n",
@@ -1326,7 +1377,7 @@ static void osm_preview_memacc(struct osm_dev *p)
 			 "memacc_seq28_addr");
 
 		for (j = 0; j < 4; j++) {
-			want = threshold_vc[j];
+			want = cfg.threshold_vc[j];
 			have = readl_relaxed(b + SEQ_REG(55 + j));
 			dev_info(p->dev,
 				 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s\n",
@@ -1344,7 +1395,7 @@ static void osm_preview_memacc(struct osm_dev *p)
 
 		if (i == 1)
 			has_mem_acc_threshold_prop = of_find_property(p->dev->of_node,
-				"qcom,perfcl-apcs-mem-acc-threshold-voltage", NULL);
+				 "qcom,perfcl-apcs-mem-acc-threshold-voltage", NULL);
 		if (!has_mem_acc_threshold_prop) {
 			want = 0;
 			have = readl_relaxed(b + SEQ_REG(88));
@@ -1389,7 +1440,105 @@ static void osm_preview_memacc(struct osm_dev *p)
 			 "  secure-only path applicable=%d (qcom,osm-no-tz + DT cfg/val); slots 51-54/59/12-14/60-68\n",
 			 secure_no_tz ? 1 : 0);
 	}
-	dev_info(p->dev, "memacc=1: preview only, no MEM-ACC register was written.\n");
+	if (memacc == 1)
+		dev_info(p->dev, "memacc=1: preview only, no MEM-ACC register was written.\n");
+	else
+		dev_info(p->dev,
+			 "memacc=2: preview shows the PRE-write state; SEQ_REG(55-58)/32 are programmed after the sequencer is loaded.\n");
+}
+
+/*
+ * memacc=2: program the MEM-ACC slots CAF programs on a boot with no
+ * trustzone.
+ *
+ * CAF's clk_osm_program_mem_acc_regs() [caf:1996-2086] has two paths:
+ *
+ *   secure_init (DT declares qcom,osm-no-tz)
+ *       plain clk_osm_write_reg() for 51-54, 59, 55-58, 49, plus the
+ *       cfg/val arrays that only exist as qcom,*-apcs-mem-acc-{cfg,val};
+ *
+ *   otherwise
+ *       scm_io_write() for 88 (crossover, and only when the DT asks for
+ *       one) and for 55-58, then 32.  Slot 49 is left to TZ [caf:2059].
+ *
+ * This platform boots mainline with no trustzone, so there is no SCM
+ * endpoint and the scm_io_write() path cannot run at all.  Direct MMIO is
+ * what the secure_init branch does and it is the only option here -- it is
+ * also the same primitive already used, and read back successfully, for
+ * the LUT rows, the sequencer program and the APM slots.
+ *
+ * Deliberately written -- values CAF writes on every stock boot and that
+ * need no DT data we lack:
+ *   SEQ_REG(55..58)  threshold corners, derived from the LUT
+ *   SEQ_REG(32)      L_VAL of the first MEM-ACC level-3 corner
+ *
+ * Deliberately NOT written:
+ *   SEQ_REG(49)      an ADDRESS (slot 28's physical address), not a
+ *                    corner.  CAF's non-secure path leaves it to TZ
+ *                    [caf:2059]; writing it would be our own policy and
+ *                    is tracked separately.
+ *   SEQ_REG(88)      crossover: stock R11T has no
+ *                    qcom,perfcl-apcs-mem-acc-threshold-voltage, so CAF
+ *                    would not write it either.
+ *   SEQ_REG(51..54), 59
+ *                    constants CAF only writes on the secure path.
+ *   SEQ_REG(12..14), 60..68
+ *                    need qcom,*-apcs-mem-acc-{cfg,val}, absent from the
+ *                    stock R11T DTB, so there is nothing to write.
+ *
+ * CAF calls this right after clk_osm_do_additional_setup() and before
+ * clk_osm_apm_vc_setup() [caf:3296-3301]; it lands here after
+ * osm_setup_sequencer() and before osm_enable_hw().  APM VC and MEM-ACC
+ * touch disjoint slots, so the local ordering does not matter.
+ */
+static void osm_setup_memacc(struct osm_dev *p)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		void __iomem *b = p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE;
+		struct osm_memacc_cfg cfg;
+		int mismatches = 0;
+		int rc = osm_memacc_derive(c, &cfg);
+		u32 want, have;
+
+		if (rc) {
+			dev_err(p->dev,
+				 "%s: MEM-ACC thresholds not derivable (%d); refusing to write SEQ_REG(55-58)/32\n",
+				 c->name, rc);
+			continue;
+		}
+
+		for (j = 0; j < 4; j++)
+			osm_write_seq(p, i, 55 + j, (u32)cfg.threshold_vc[j],
+				      "memacc_threshold_vc");
+		osm_write_seq(p, i, 32, cfg.lval, "memacc_lval");
+		osm_mb(c);
+
+		for (j = 0; j < 4; j++) {
+			want = (u32)cfg.threshold_vc[j];
+			have = readl_relaxed(b + SEQ_REG(55 + j));
+			if (have != want)
+				mismatches++;
+			dev_info(p->dev,
+				 "  memacc verify cluster%u SEQ_REG(%u) want 0x%08x have 0x%08x %s\n",
+				 i, 55 + j, want, have,
+				 have == want ? "OK" : "MISMATCH");
+		}
+
+		want = cfg.lval;
+		have = readl_relaxed(b + SEQ_REG(32));
+		if (have != want)
+			mismatches++;
+		dev_info(p->dev,
+			 "  memacc verify cluster%u SEQ_REG(%u) want 0x%08x have 0x%08x %s\n",
+			 i, 32, want, have, have == want ? "OK" : "MISMATCH");
+
+		dev_info(p->dev,
+			 "memacc=2 cluster%u (%s): wrote SEQ_REG(55-58) and SEQ_REG(32) only; 49/88/51-54/59/12-14/60-68 untouched; %d mismatch\n",
+			 i, c->name, mismatches);
+	}
 }
 
 static void osm_setup_apm(struct osm_dev *p)
@@ -2647,10 +2796,14 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			 "apm=2: preview only, no APM register was written. Compare 'want' against 'have', then decide whether apm=1 is safe to try live.\n");
 	}
 
-	if (memacc == 1) {
+	if (memacc == 1 || memacc == 2) {
 		osm_preview_memacc(p);
-		dev_warn(dev,
-			 "memacc=1: preview only, no MEM-ACC register was written. Compare the CAF-derived values before considering any secure/SCM write path.\n");
+		if (memacc == 1)
+			dev_warn(dev,
+				 "memacc=1: preview only, no MEM-ACC register was written. Compare the CAF-derived values before considering any secure/SCM write path.\n");
+		else
+			dev_warn(dev,
+				 "memacc=2: preview above is the PRE-write state. SEQ_REG(55-58) and SEQ_REG(32) are written later, after the sequencer is loaded, and then verified by readback.\n");
 	}
 
 	if (!dryrun) {
@@ -2686,6 +2839,8 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		}
 		osm_setup_itm(p);
 		osm_setup_sequencer(p);
+		if (memacc == 2)
+			osm_setup_memacc(p);
 
 		/* Table first, then ENABLE_REG: CAF also enables from
 		 * clk_osm_enable() after clk_osm_setup_hw_table() has run, so
