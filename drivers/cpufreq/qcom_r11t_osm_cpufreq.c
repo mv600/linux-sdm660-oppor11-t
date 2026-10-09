@@ -255,6 +255,19 @@
 #define APM_MX_MODE_VAL			0	/* caf:147 */
 #define APM_APC_MODE_VAL			0x3	/* caf:148 */
 
+/* MEM-ACC slots and masks [caf:71-75, 197-201].  The preview below only
+ * reads these slots; it never calls osm_write_seq() for MEM-ACC.
+ */
+#define MAX_MEM_ACC_LEVELS			3
+#define MAX_MEM_ACC_VAL_PER_LEVEL		3
+#define MAX_MEM_ACC_VALUES			(MAX_MEM_ACC_LEVELS * MAX_MEM_ACC_VAL_PER_LEVEL)
+#define MEM_ACC_SEQ_CONST(n)			(n)
+#define MEM_ACC_SEQ_REG_CFG_START(n)		(SEQ_REG(12 + (n)))
+#define MEM_ACC_SEQ_REG_VAL_START(n)		(SEQ_REG(60 + (n)))
+#define MEM_ACC_APM_READ_MASK			0xff
+#define R11T_L_VAL(freq_data)			((freq_data) & 0xff)
+#define R11T_OSM_SEQ_MINUS_ONE			0xff
+
 /* ITM handover payloads [caf:141-142].  Two clusters hand the domain
  * over to each other: pwrcl disables CL0 / enables CL1, perfcl does the
  * reverse.  Stock R11T declares qcom,apcs-itm-present with the SAME
@@ -466,6 +479,11 @@ static int apm;
 module_param(apm, int, 0644);
 MODULE_PARM_DESC(apm,
 		 "0 (default) = do not touch the Array Power Mux slots. 1 = program them for real. 2 = read-only preview: print every value mode 1 would write, next to a current sequencer-slot readback, and write nothing. The readback can be zero or stale, so use preview to validate targets before opting into apm=1; it is not a safety proof.");
+
+static int memacc;
+module_param(memacc, int, 0644);
+MODULE_PARM_DESC(memacc,
+		 "0 (default) = do not inspect MEM-ACC. 1 = read-only preview: print the CAF MEM-ACC level map and thresholds, the SEQ_REG(32) L_VAL target, the TZ-owned slot 49 address, and a readback of every MEM-ACC slot (32/49/51-59 and the secure-only 12-14/60-68 set); no MEM-ACC register is written.");
 
 static inline void osm_write(struct osm_cluster *c, u32 val, u32 offset)
 {
@@ -1219,6 +1237,159 @@ static void osm_preview_apm(struct osm_dev *p)
 			 readl_relaxed(b + SPM_CC_CTRL),
 			 BVAL(23, 16, 0xF));
 	}
+}
+
+static void osm_preview_memacc(struct osm_dev *p)
+{
+	unsigned int i, j;
+	bool secure_no_tz = of_find_property(p->dev->of_node, "qcom,osm-no-tz", NULL);
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		void __iomem *b = p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE;
+		int mem_acc_level_map[MAX_MEM_ACC_LEVELS] = { 0, 0, 0 };
+		int threshold_vc[4];
+		int curr_level, map_idx = 0;
+		int target_row = -1;
+		u32 want, have;
+		bool has_mem_acc_threshold_prop = false;
+
+		curr_level = c->num_entries ? c->lut[0].spare_data : 0;
+		for (j = 0; j < c->num_entries; j++) {
+			if (curr_level == MAX_MEM_ACC_LEVELS)
+				break;
+
+			if (c->lut[j].spare_data != curr_level) {
+				if (map_idx < MAX_MEM_ACC_LEVELS) {
+					/* Match CAF exactly: osm_parse_lut() stored a
+					 * 0-based corner, then CAF subtracts one here.
+					 */
+					mem_acc_level_map[map_idx++] =
+						(int)c->lut[j].virtual_corner - 1;
+				}
+				curr_level = c->lut[j].spare_data;
+			}
+		}
+
+		threshold_vc[0] = mem_acc_level_map[0];
+		threshold_vc[1] = mem_acc_level_map[0] + 1;
+		threshold_vc[2] = mem_acc_level_map[1];
+		threshold_vc[3] = mem_acc_level_map[1] + 1;
+
+		/* cluster0 is pwrcl (LITTLE, A53, cpus 0,5,6,7) and
+		 * cluster1 is perfcl (big, A73, cpus 1,2,3,4); print the
+		 * name and the DT cpu mask so the dmesg cannot be misread.
+		 */
+		dev_info(p->dev,
+			 "--- memacc=1 preview cluster%u (%s, cpus %*pbl) ---\n",
+			 i, c->name, cpumask_pr_args(c->cpus));
+		dev_info(p->dev,
+			 "  secure_no_tz=%d spare_transitions:",
+			 secure_no_tz ? 1 : 0);
+		for (j = 0; j < c->num_entries; j++) {
+			if (j && c->lut[j].spare_data != c->lut[j - 1].spare_data)
+				dev_info(p->dev, " row%u(vc=%u,spare=%u)", j,
+					 c->lut[j].virtual_corner,
+					 c->lut[j].spare_data);
+		}
+		dev_info(p->dev,
+			 " level_map={%d,%d,%d} threshold_vc={%d,%d,%d,%d}\n",
+			 mem_acc_level_map[0], mem_acc_level_map[1],
+			 mem_acc_level_map[2], threshold_vc[0], threshold_vc[1],
+			 threshold_vc[2], threshold_vc[3]);
+
+		/* CAF writes SEQ_REG(32) once per matching row without
+		 * breaking, so the last match is what actually lands in the
+		 * slot.  Keep the same semantics here in case a future table
+		 * ever repeats the threshold corner.
+		 */
+		for (j = 0; j < c->num_entries; j++) {
+			if (threshold_vc[3] == (int)c->lut[j].virtual_corner)
+				target_row = j;
+		}
+
+		want = target_row >= 0 ?
+			R11T_L_VAL(c->lut[target_row].freq_data) : 0;
+		have = readl_relaxed(b + SEQ_REG(32));
+		dev_info(p->dev,
+			 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s target_row=%d\n",
+			 32, want, have, target_row >= 0 &&
+			 want == have ? "same" : "DIFFERS",
+			 "memacc_lval", target_row);
+
+		want = (u32)(p->base_phys + (unsigned long)i * OSM_CORE_TABLE_SIZE +
+			      SEQ_REG(28));
+		have = readl_relaxed(b + SEQ_REG(49));
+		dev_info(p->dev,
+			 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s (TZ-owned; non-secure CAF does not write it)\n",
+			 49, want, have, want == have ? "same" : "DIFFERS",
+			 "memacc_seq28_addr");
+
+		for (j = 0; j < 4; j++) {
+			want = threshold_vc[j];
+			have = readl_relaxed(b + SEQ_REG(55 + j));
+			dev_info(p->dev,
+				 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s\n",
+				 55 + j, want, have,
+				 want == have ? "same" : "DIFFERS",
+				 "memacc_threshold");
+		}
+
+		want = MEM_ACC_APM_READ_MASK;
+		have = readl_relaxed(b + SEQ_REG(59));
+		dev_info(p->dev,
+			 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s (secure-only path)\n",
+			 59, want, have, want == have ? "same" : "DIFFERS",
+			 "memacc_apm_mask");
+
+		if (i == 1)
+			has_mem_acc_threshold_prop = of_find_property(p->dev->of_node,
+				"qcom,perfcl-apcs-mem-acc-threshold-voltage", NULL);
+		if (!has_mem_acc_threshold_prop) {
+			want = 0;
+			have = readl_relaxed(b + SEQ_REG(88));
+			dev_info(p->dev,
+				 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s (property absent, no crossover write)\n",
+				 88, want, have, want == have ? "same" : "DIFFERS",
+				 "memacc_crossover");
+		} else {
+			dev_info(p->dev,
+				 "  SEQ_REG(%2u) have 0x%08x (threshold-voltage property present; crossover needs regulator-count resolution)\n",
+				 88, readl_relaxed(b + SEQ_REG(88)));
+		}
+
+		/*
+		 * Secure-only path (CAF's secure_init == qcom,osm-no-tz).
+		 * The stock R11T DTS does not declare qcom,osm-no-tz, so
+		 * these are the slots our non-secure boot never programs.
+		 * Print their live values anyway: the readback alone tells us
+		 * whether the bootloader/TZ left them in a sane state, and it
+		 * costs nothing because the preview is read-only.
+		 */
+		for (j = 0; j < 4; j++) {
+			have = readl_relaxed(b + SEQ_REG(51 + j));
+			dev_info(p->dev,
+				 "  SEQ_REG(%2u) have 0x%08x (secure-only const %u)\n",
+				 51 + j, have, j + 1);
+		}
+		for (j = 0; j < MAX_MEM_ACC_VAL_PER_LEVEL; j++) {
+			have = readl_relaxed(b + MEM_ACC_SEQ_REG_CFG_START(j));
+			dev_info(p->dev,
+				 "  SEQ_REG(%2u) have 0x%08x (secure-only cfg[%u])\n",
+				 12 + j, have, j);
+		}
+		for (j = 0; j < MAX_MEM_ACC_VALUES; j++) {
+			have = readl_relaxed(b + MEM_ACC_SEQ_REG_VAL_START(j));
+			dev_info(p->dev,
+				 "  SEQ_REG(%2u) have 0x%08x (secure-only val[%u])\n",
+				 60 + j, have, j);
+		}
+
+		dev_info(p->dev,
+			 "  secure-only path applicable=%d (qcom,osm-no-tz + DT cfg/val); slots 51-54/59/12-14/60-68\n",
+			 secure_no_tz ? 1 : 0);
+	}
+	dev_info(p->dev, "memacc=1: preview only, no MEM-ACC register was written.\n");
 }
 
 static void osm_setup_apm(struct osm_dev *p)
@@ -2474,6 +2645,12 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		osm_preview_apm(p);
 		dev_warn(dev,
 			 "apm=2: preview only, no APM register was written. Compare 'want' against 'have', then decide whether apm=1 is safe to try live.\n");
+	}
+
+	if (memacc == 1) {
+		osm_preview_memacc(p);
+		dev_warn(dev,
+			 "memacc=1: preview only, no MEM-ACC register was written. Compare the CAF-derived values before considering any secure/SCM write path.\n");
 	}
 
 	if (!dryrun) {
