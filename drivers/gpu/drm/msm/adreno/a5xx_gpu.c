@@ -1014,22 +1014,64 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 
 static void a5xx_recover(struct msm_gpu *gpu)
 {
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
 	int i;
 
-	adreno_dump_info(gpu);
+	/*
+	 * Do not re-read the register file for diagnostics.  The fault IRQ
+	 * handler already captured what it could while the bus was alive;
+	 * after a fatal CP hang an MMIO read can stall forever and hard-lock
+	 * this CPU (interrupts masked), which is what turns a recoverable GPU
+	 * hang into a dead phone.  Use the snapshot instead.
+	 */
+	if (a5xx_gpu->fault_snapshot_valid) {
+		printk("revision: %u (%" ADRENO_CHIPID_FMT ")\n",
+			adreno_gpu->info->revn,
+			ADRENO_CHIPID_ARGS(adreno_gpu->chip_id));
+		printk("rb 0: rptr: %u rb wptr: %u\n",
+			a5xx_gpu->fault_cp_rb_rptr, a5xx_gpu->fault_cp_rb_wptr);
+		printk("fault status: rbbm=%8.8X rbbm3=%8.8X int0=%8.8X cp_int=%8.8X\n",
+			a5xx_gpu->fault_rbbm_status, a5xx_gpu->fault_rbbm_status3,
+			a5xx_gpu->fault_rbbm_int0_status,
+			a5xx_gpu->fault_cp_int_status);
+		printk("ib1: %16.16llX/%4.4x ib2: %16.16llX/%4.4x\n",
+			a5xx_gpu->fault_ib1_base, a5xx_gpu->fault_ib1_bufsz,
+			a5xx_gpu->fault_ib2_base, a5xx_gpu->fault_ib2_bufsz);
+		printk("ring window @%4.4x: %8.8X %8.8X %8.8X %8.8X %8.8X %8.8X %8.8X %8.8X\n",
+			a5xx_gpu->fault_rb_window_offset,
+			a5xx_gpu->fault_rb_window[0], a5xx_gpu->fault_rb_window[1],
+			a5xx_gpu->fault_rb_window[2], a5xx_gpu->fault_rb_window[3],
+			a5xx_gpu->fault_rb_window[4], a5xx_gpu->fault_rb_window[5],
+			a5xx_gpu->fault_rb_window[6], a5xx_gpu->fault_rb_window[7]);
+	} else {
+		adreno_dump_info(gpu);
 
-	for (i = 0; i < 8; i++) {
-		printk("CP_SCRATCH_REG%d: %u\n", i,
-			gpu_read(gpu, REG_A5XX_CP_SCRATCH_REG(i)));
+		for (i = 0; i < 8; i++) {
+			printk("CP_SCRATCH_REG%d: %u\n", i,
+				gpu_read(gpu, REG_A5XX_CP_SCRATCH_REG(i)));
+		}
 	}
 
-	if (hang_debug)
+	/* A full register dump is exactly what we must avoid on the fault
+	 * path: it walks the whole register file over a bus that may already
+	 * be dead. */
+	if (hang_debug && !a5xx_gpu->fault_snapshot_valid)
 		a5xx_dump(gpu);
 
+	/*
+	 * Write-only software reset: the dummy read that used to follow the
+	 * assert is exactly the kind of access that can stall on a wedged GPU,
+	 * and it serves no purpose beyond ordering, which wmb() gives us.
+	 */
+	wmb();
 	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 1);
-	gpu_read(gpu, REG_A5XX_RBBM_SW_RESET_CMD);
+	wmb();
 	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 0);
 	adreno_recover(gpu);
+
+	/* Recovery finished (or at least did not wedge us): drop the snapshot */
+	a5xx_gpu->fault_snapshot_valid = false;
 }
 
 static void a5xx_destroy(struct msm_gpu *gpu)
@@ -1233,6 +1275,8 @@ static void a5xx_gpmu_err_irq(struct msm_gpu *gpu)
 static void a5xx_fault_detect_irq(struct msm_gpu *gpu)
 {
 	struct drm_device *dev = gpu->dev;
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
 	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
 
 	/*
@@ -1244,15 +1288,62 @@ static void a5xx_fault_detect_irq(struct msm_gpu *gpu)
 	if (gpu_read(gpu, REG_A5XX_RBBM_STATUS3) & BIT(24))
 		return;
 
+	/*
+	 * Snapshot the fault state *here*, in interrupt context, while the
+	 * register bus is known to answer.  Once the CP has wedged, MMIO
+	 * reads can stall forever; the recovery worker runs later (and after
+	 * power-management transitions) and must not depend on being able to
+	 * read these registers.  A stalled read there would hard-lock a CPU
+	 * with interrupts masked, stalling RCU and freezing the system.
+	 */
+	a5xx_gpu->fault_snapshot_valid = false;
+	a5xx_gpu->fault_rbbm_status3 = gpu_read(gpu, REG_A5XX_RBBM_STATUS3);
+	a5xx_gpu->fault_rbbm_status = gpu_read(gpu, REG_A5XX_RBBM_STATUS);
+	a5xx_gpu->fault_rbbm_int0_status = gpu_read(gpu, REG_A5XX_RBBM_INT_0_STATUS);
+	a5xx_gpu->fault_cp_int_status = gpu_read(gpu, REG_A5XX_CP_INTERRUPT_STATUS);
+	a5xx_gpu->fault_cp_rb_rptr = gpu_read(gpu, REG_A5XX_CP_RB_RPTR);
+	a5xx_gpu->fault_cp_rb_wptr = gpu_read(gpu, REG_A5XX_CP_RB_WPTR);
+	a5xx_gpu->fault_ib1_base = gpu_read64(gpu, REG_A5XX_CP_IB1_BASE);
+	a5xx_gpu->fault_ib1_bufsz = gpu_read(gpu, REG_A5XX_CP_IB1_BUFSZ);
+	a5xx_gpu->fault_ib2_base = gpu_read64(gpu, REG_A5XX_CP_IB2_BASE);
+	a5xx_gpu->fault_ib2_bufsz = gpu_read(gpu, REG_A5XX_CP_IB2_BUFSZ);
+
+	/*
+	 * Also keep a small window of the ringbuffer around rptr.  The ring
+	 * is CPU-readable system memory, so this is safe from interrupt
+	 * context and shows the command the CP was executing when it died
+	 * (the "possible opcode" reported by the CP error handler).
+	 */
+	a5xx_gpu->fault_rb_window_offset = a5xx_gpu->fault_cp_rb_rptr;
+	if (ring && ring->start) {
+		u32 mask = (MSM_GPU_RINGBUFFER_SZ >> 2) - 1;
+		int i;
+
+		for (i = 0; i < A5XX_FAULT_RB_WINDOW_DWORDS; i++)
+			a5xx_gpu->fault_rb_window[i] =
+				ring->start[(a5xx_gpu->fault_cp_rb_rptr + i) & mask];
+	}
+	a5xx_gpu->fault_snapshot_valid = true;
+
 	DRM_DEV_ERROR(dev->dev, "gpu fault ring %d fence %x status %8.8X rb %4.4x/%4.4x ib1 %16.16llX/%4.4x ib2 %16.16llX/%4.4x\n",
 		ring ? ring->id : -1, ring ? ring->fctx->last_fence : 0,
-		gpu_read(gpu, REG_A5XX_RBBM_STATUS),
-		gpu_read(gpu, REG_A5XX_CP_RB_RPTR),
-		gpu_read(gpu, REG_A5XX_CP_RB_WPTR),
-		gpu_read64(gpu, REG_A5XX_CP_IB1_BASE),
-		gpu_read(gpu, REG_A5XX_CP_IB1_BUFSZ),
-		gpu_read64(gpu, REG_A5XX_CP_IB2_BASE),
-		gpu_read(gpu, REG_A5XX_CP_IB2_BUFSZ));
+		a5xx_gpu->fault_rbbm_status,
+		a5xx_gpu->fault_cp_rb_rptr,
+		a5xx_gpu->fault_cp_rb_wptr,
+		a5xx_gpu->fault_ib1_base,
+		a5xx_gpu->fault_ib1_bufsz,
+		a5xx_gpu->fault_ib2_base,
+		a5xx_gpu->fault_ib2_bufsz);
+
+	DRM_DEV_ERROR(dev->dev, "fault snapshot: status3=%8.8X rbbm_int=%8.8X cp_int=%8.8X rb_window@%4.4x=[%8.8X %8.8X %8.8X %8.8X %8.8X %8.8X %8.8X %8.8X]\n",
+		a5xx_gpu->fault_rbbm_status3,
+		a5xx_gpu->fault_rbbm_int0_status,
+		a5xx_gpu->fault_cp_int_status,
+		a5xx_gpu->fault_rb_window_offset,
+		a5xx_gpu->fault_rb_window[0], a5xx_gpu->fault_rb_window[1],
+		a5xx_gpu->fault_rb_window[2], a5xx_gpu->fault_rb_window[3],
+		a5xx_gpu->fault_rb_window[4], a5xx_gpu->fault_rb_window[5],
+		a5xx_gpu->fault_rb_window[6], a5xx_gpu->fault_rb_window[7]);
 
 	/* Turn off the hangcheck timer to keep it from bothering us */
 	timer_delete(&gpu->hangcheck_timer);
@@ -1415,10 +1506,18 @@ static int a5xx_pm_suspend(struct msm_gpu *gpu)
 	    adreno_is_a508(adreno_gpu) || adreno_is_a510(adreno_gpu))
 		mask = 0x7;
 
-	/* Clear the VBIF pipe before shutting down */
+	/*
+	 * Clear the VBIF pipe before shutting down.  The completion poll is
+	 * skipped when recovering from a wedged GPU: the read may stall the
+	 * bus, and after a hang the VBIF will not drain anyway -- the block
+	 * reset below and the power collapse clean it up.
+	 */
 	gpu_write(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL0, mask);
-	spin_until((gpu_read(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL1) &
-				mask) == mask);
+	if (a5xx_gpu->fault_snapshot_valid)
+		udelay(50);
+	else
+		spin_until((gpu_read(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL1) &
+					mask) == mask);
 
 	gpu_write(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL0, 0);
 
@@ -1575,29 +1674,51 @@ static void a5xx_gpu_state_get_hlsq_regs(struct msm_gpu *gpu,
 
 static struct msm_gpu_state *a5xx_gpu_state_get(struct msm_gpu *gpu)
 {
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
 	struct a5xx_gpu_state *a5xx_state = kzalloc_obj(*a5xx_state);
-	bool stalled = !!(gpu_read(gpu, REG_A5XX_RBBM_STATUS3) & BIT(24));
+	bool snapshot = a5xx_gpu->fault_snapshot_valid;
+	bool stalled;
+	bool mmio = !snapshot;
+
+	if (snapshot)
+		stalled = !!(a5xx_gpu->fault_rbbm_status3 & BIT(24));
+	else
+		stalled = !!(gpu_read(gpu, REG_A5XX_RBBM_STATUS3) & BIT(24));
 
 	if (!a5xx_state)
 		return ERR_PTR(-ENOMEM);
 
-	/* Temporarily disable hardware clock gating before reading the hw */
-	a5xx_set_hwcg(gpu, false);
+	/*
+	 * When the fault handler has already snapshotted the GPU state the
+	 * register bus may be dead: every additional MMIO read risks stalling
+	 * this CPU forever.  Capture only system-memory backed state then
+	 * (ringbuffer contents, mapped objects), which is what actually lets
+	 * us see the faulting command stream.
+	 */
+	if (mmio) {
+		/* Temporarily disable hardware clock gating before reading the hw */
+		a5xx_set_hwcg(gpu, false);
+	}
 
 	/* First get the generic state from the adreno core */
 	adreno_gpu_state_get(gpu, &(a5xx_state->base));
 
-	a5xx_state->base.rbbm_status = gpu_read(gpu, REG_A5XX_RBBM_STATUS);
+	if (snapshot)
+		a5xx_state->base.rbbm_status = a5xx_gpu->fault_rbbm_status;
+	else
+		a5xx_state->base.rbbm_status = gpu_read(gpu, REG_A5XX_RBBM_STATUS);
 
 	/*
 	 * Get the HLSQ regs with the help of the crashdumper, but only if
 	 * we are not stalled in an iommu fault (in which case the crashdumper
-	 * would not have access to memory)
+	 * would not have access to memory) and only while MMIO still works.
 	 */
-	if (!stalled)
+	if (!stalled && mmio)
 		a5xx_gpu_state_get_hlsq_regs(gpu, a5xx_state);
 
-	a5xx_set_hwcg(gpu, true);
+	if (mmio)
+		a5xx_set_hwcg(gpu, true);
 
 	return &a5xx_state->base;
 }
@@ -1771,7 +1892,15 @@ static struct msm_gpu *a5xx_gpu_init(struct drm_device *dev)
 
 	nr_rings = 4;
 
-	if (config->info->revn == 510)
+	/*
+	 * Keep a5xx preemption off on the parts where it has proven
+	 * unreliable.  On a512 (sdm660) ring preemption restores a stale
+	 * ring state and the CP resumes on a zeroed dword, which the CP
+	 * reports as "opcode error | possible opcode=0x00000000" and then
+	 * wedges.  With a single ring the preemption save/restore record
+	 * state machine is not used at all.
+	 */
+	if (config->info->revn == 510 || config->info->revn == 512)
 		nr_rings = 1;
 
 	ret = adreno_gpu_init(dev, pdev, adreno_gpu, config->info->funcs, nr_rings);

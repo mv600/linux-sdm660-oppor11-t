@@ -44,6 +44,30 @@ struct a5xx_gpu {
 	uint64_t shadow_iova;
 	uint32_t *shadow;
 
+	/*
+	 * Fault-time register snapshot, taken by the interrupt handler while
+	 * the GPU register bus is still known to be responsive.  After a
+	 * fatal CP hang the bus can stop answering, so recovery must consume
+	 * this snapshot instead of re-reading the register file -- a single
+	 * stalled MMIO read hard-locks the CPU with interrupts masked and
+	 * takes the whole system down with it (RCU stall + kick_all_cpus_sync
+	 * spinning on the stuck CPU).
+	 */
+#define A5XX_FAULT_RB_WINDOW_DWORDS 8
+	u32 fault_rbbm_status;
+	u32 fault_rbbm_status3;
+	u32 fault_rbbm_int0_status;
+	u32 fault_cp_int_status;
+	u32 fault_cp_rb_rptr;
+	u32 fault_cp_rb_wptr;
+	u64 fault_ib1_base;
+	u32 fault_ib1_bufsz;
+	u64 fault_ib2_base;
+	u32 fault_ib2_bufsz;
+	u32 fault_rb_window_offset;
+	u32 fault_rb_window[A5XX_FAULT_RB_WINDOW_DWORDS];
+	bool fault_snapshot_valid;
+
 	/* True if the microcode supports the WHERE_AM_I opcode */
 	bool has_whereami;
 };
