@@ -1070,8 +1070,13 @@ static void a5xx_recover(struct msm_gpu *gpu)
 	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 0);
 	adreno_recover(gpu);
 
-	/* Recovery finished (or at least did not wedge us): drop the snapshot */
+	/*
+	 * The reset above (and the re-initialisation inside adreno_recover())
+	 * brought the GPU back to a known state, so register access is safe
+	 * again.  Drop both the snapshot and the mmio embargo.
+	 */
 	a5xx_gpu->fault_snapshot_valid = false;
+	gpu->hw_dead = false;
 }
 
 static void a5xx_destroy(struct msm_gpu *gpu)
@@ -1325,6 +1330,14 @@ static void a5xx_fault_detect_irq(struct msm_gpu *gpu)
 	}
 	a5xx_gpu->fault_snapshot_valid = true;
 
+	/*
+	 * The CP is wedged: from here on register access can stall this CPU
+	 * forever.  Everything the crash capture and recovery path needs was
+	 * just read above, so forbid any further MMIO until the hardware has
+	 * been reset (see a5xx_recover()).
+	 */
+	gpu->hw_dead = true;
+
 	DRM_DEV_ERROR(dev->dev, "gpu fault ring %d fence %x status %8.8X rb %4.4x/%4.4x ib1 %16.16llX/%4.4x ib2 %16.16llX/%4.4x\n",
 		ring ? ring->id : -1, ring ? ring->fctx->last_fence : 0,
 		a5xx_gpu->fault_rbbm_status,
@@ -1513,7 +1526,7 @@ static int a5xx_pm_suspend(struct msm_gpu *gpu)
 	 * reset below and the power collapse clean it up.
 	 */
 	gpu_write(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL0, mask);
-	if (a5xx_gpu->fault_snapshot_valid)
+	if (gpu->hw_dead)
 		udelay(50);
 	else
 		spin_until((gpu_read(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL1) &
@@ -1679,22 +1692,24 @@ static struct msm_gpu_state *a5xx_gpu_state_get(struct msm_gpu *gpu)
 	struct a5xx_gpu_state *a5xx_state = kzalloc_obj(*a5xx_state);
 	bool snapshot = a5xx_gpu->fault_snapshot_valid;
 	bool stalled;
-	bool mmio = !snapshot;
-
-	if (snapshot)
-		stalled = !!(a5xx_gpu->fault_rbbm_status3 & BIT(24));
-	else
-		stalled = !!(gpu_read(gpu, REG_A5XX_RBBM_STATUS3) & BIT(24));
+	bool mmio = !gpu->hw_dead;
 
 	if (!a5xx_state)
 		return ERR_PTR(-ENOMEM);
 
+	if (mmio)
+		stalled = !!(gpu_read(gpu, REG_A5XX_RBBM_STATUS3) & BIT(24));
+	else if (snapshot)
+		stalled = !!(a5xx_gpu->fault_rbbm_status3 & BIT(24));
+	else
+		stalled = true;  /* no snapshot and mmio unsafe: assume the worst */
+
 	/*
-	 * When the fault handler has already snapshotted the GPU state the
-	 * register bus may be dead: every additional MMIO read risks stalling
-	 * this CPU forever.  Capture only system-memory backed state then
-	 * (ringbuffer contents, mapped objects), which is what actually lets
-	 * us see the faulting command stream.
+	 * When the fault handler has marked the hardware as unsafe to touch
+	 * the register bus may be dead: every additional MMIO read risks
+	 * stalling this CPU forever.  Capture only system-memory backed state
+	 * then (ringbuffer contents, mapped objects), which is what actually
+	 * lets us see the faulting command stream.
 	 */
 	if (mmio) {
 		/* Temporarily disable hardware clock gating before reading the hw */
@@ -1704,10 +1719,10 @@ static struct msm_gpu_state *a5xx_gpu_state_get(struct msm_gpu *gpu)
 	/* First get the generic state from the adreno core */
 	adreno_gpu_state_get(gpu, &(a5xx_state->base));
 
-	if (snapshot)
-		a5xx_state->base.rbbm_status = a5xx_gpu->fault_rbbm_status;
-	else
+	if (mmio)
 		a5xx_state->base.rbbm_status = gpu_read(gpu, REG_A5XX_RBBM_STATUS);
+	else if (snapshot)
+		a5xx_state->base.rbbm_status = a5xx_gpu->fault_rbbm_status;
 
 	/*
 	 * Get the HLSQ regs with the help of the crashdumper, but only if

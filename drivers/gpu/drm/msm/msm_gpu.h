@@ -262,6 +262,23 @@ struct msm_gpu {
 
 	struct msm_gpu_state *crashstate;
 
+	/**
+	 * @hw_dead: the GPU may no longer be touched with MMIO.
+	 *
+	 * Set by a fault IRQ handler once it has snapshotted everything it
+	 * needs, for faults after which further register access is unsafe.
+	 * Once the command processor of a hung GPU stops draining the
+	 * ringbuffer the interconnect can stop answering as well, and a
+	 * single register read then wedges the CPU that issued it -- that CPU
+	 * no longer takes interrupts, hard locks, and takes the rest of the
+	 * system down with it (RCU stalls, stuck workqueues, ...).
+	 *
+	 * While set, crash capture and recovery must only touch system memory
+	 * backed state.  The driver's recovery callback clears it once the
+	 * hardware has been reset and re-initialised.
+	 */
+	bool hw_dead;
+
 	/* True if the hardware supports expanded apriv (a650 and newer) */
 	bool hw_apriv;
 

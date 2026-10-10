@@ -770,7 +770,17 @@ int adreno_gpu_state_get(struct msm_gpu *gpu, struct msm_gpu_state *state)
 		state->ring[i].fence = gpu->rb[i]->memptrs->fence;
 		state->ring[i].iova = gpu->rb[i]->iova;
 		state->ring[i].seqno = gpu->rb[i]->fctx->last_fence;
-		state->ring[i].rptr = get_rptr(adreno_gpu, gpu->rb[i]);
+		/*
+		 * Reading the read pointer can be an MMIO access (depending on
+		 * whether the target has a WHERE_AM_I shadow).  When the fault
+		 * handler has marked the hardware as unsafe to touch, fall back
+		 * to the value the GPU left in the memory based memstore instead
+		 * of stalling the bus.
+		 */
+		if (gpu->hw_dead)
+			state->ring[i].rptr = gpu->rb[i]->memptrs->rptr;
+		else
+			state->ring[i].rptr = get_rptr(adreno_gpu, gpu->rb[i]);
 		state->ring[i].wptr = get_wptr(gpu->rb[i]);
 
 		/* Copy at least 'wptr' dwords of the data */
@@ -786,6 +796,22 @@ int adreno_gpu_state_get(struct msm_gpu *gpu, struct msm_gpu_state *state)
 			if (state->ring[i].data)
 				state->ring[i].data_size = size << 2;
 		}
+	}
+
+	/*
+	 * The list below is read back with one MMIO access per register --
+	 * thousands of them on a5xx.  Walking the whole register file of a
+	 * GPU whose bus has stopped answering wedges the CPU doing it
+	 * (forever, with interrupts effectively blocked), which hard locks
+	 * that CPU and freezes the system.  The registers that actually
+	 * matter for a hang are snapshotted from the fault interrupt, while
+	 * the bus is still known to answer, so skip the dump here.
+	 */
+	if (gpu->hw_dead) {
+		dev_warn_once(gpu->dev->dev,
+			"%s: gpu mmio unsafe, skipping register dump\n",
+			gpu->name);
+		return 0;
 	}
 
 	/* Some targets prefer to collect their own registers */
