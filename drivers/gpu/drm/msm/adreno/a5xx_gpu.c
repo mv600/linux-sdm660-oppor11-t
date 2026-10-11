@@ -513,7 +513,26 @@ static int a5xx_me_init(struct msm_gpu *gpu)
 	OUT_RING(ring, 0x00000000);
 
 	a5xx_flush(gpu, ring, true);
-	return a5xx_idle(gpu, ring) ? 0 : -EINVAL;
+	if (a5xx_idle(gpu, ring))
+		return 0;
+
+	/*
+	 * The ME never consumed CP_ME_INIT.  Print the state that shows
+	 * whether the CP RPTR is stale (CP state kept across a runtime
+	 * suspend without a reset), i.e. the read pointer running ahead of
+	 * the write pointer we just programmed - the failure mode this
+	 * driver used to hit on every resume.
+	 */
+	DRM_ERROR("%s: ME_INIT not consumed: CP_RB_CNTL=%8.8X CP_RB_RPTR_ADDR=%16.16llX CP_RB_RPTR=%8.8X CP_RB_WPTR=%8.8X wptr=%u rbbm=%8.8X\n",
+		gpu->name,
+		gpu_read(gpu, REG_A5XX_CP_RB_CNTL),
+		gpu_read64(gpu, REG_A5XX_CP_RB_RPTR_ADDR),
+		gpu_read(gpu, REG_A5XX_CP_RB_RPTR),
+		gpu_read(gpu, REG_A5XX_CP_RB_WPTR),
+		get_wptr(ring),
+		gpu_read(gpu, REG_A5XX_RBBM_STATUS));
+
+	return -EINVAL;
 }
 
 static int a5xx_preempt_start(struct msm_gpu *gpu)
@@ -698,6 +717,44 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
 	u32 hbb;
 	int ret;
+
+	/*
+	 * Runtime PM suspend never power-collapses this GPU.  The device tree
+	 * node only votes a voltage (&rpmpd RPMPD_VDDMX), the rail behind
+	 * 5000000.gpu-vdd is a fixed dummy regulator and the GPU CX/GX GDSCs
+	 * are not attached to the node, so the GPU keeps its register state
+	 * across a runtime suspend/resume cycle.
+	 *
+	 * msm_gpu_pm_resume() sets needs_hw_init and the next submit runs
+	 * a5xx_hw_init() again.  adreno_hw_init() rewinds the ringbuffer
+	 * (ring->cur/next back to the start, so the wptr is only the 9 dwords
+	 * of CP_ME_INIT), but without a reset the CP still has its old RPTR.
+	 * The CP then sees rptr > wptr, concludes the ring is empty and never
+	 * executes the freshly written CP_ME_INIT, so the first submit after
+	 * resume stalls until the ringbuffer drain times out:
+	 *
+	 *   adreno_idle: timeout waiting to drain ringbuffer 0 rptr/wptr = 80/9
+	 *   msm_dpu: CP | opcode error | possible opcode=0x00000000
+	 *   a5xx_irq: gpu fault ring 0 ... rb 0080/0056
+	 *
+	 * which then repeats as a MISC_HANG_DETECT storm until the phone
+	 * either wedges or recovers.  The root cause is that the driver
+	 * re-initialises a CP whose state was never lost.
+	 *
+	 * An RBBM software reset resets all of the GPU logic and restores the
+	 * registers (including the CP read pointer) to their default state
+	 * without turning the GFX rail off - exactly what the vendor
+	 * _soft_reset() and mainline a5xx_recover() use.  Doing it at the top
+	 * of every hw_init makes each re-init start from the same known-clean
+	 * hardware state that a cold boot gets, so the CP RPTR is back to 0
+	 * and agrees with the rewound ringbuffer.  The dummy read between the
+	 * assert and the deassert gives the pulse time to take effect.
+	 */
+	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 1);
+	gpu_read(gpu, REG_A5XX_RBBM_SW_RESET_CMD);
+	udelay(10);
+	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 0);
+	gpu_read(gpu, REG_A5XX_RBBM_SW_RESET_CMD);
 
 	gpu_write(gpu, REG_A5XX_VBIF_ROUND_ROBIN_QOS_ARB, 0x00000003);
 
@@ -1060,14 +1117,19 @@ static void a5xx_recover(struct msm_gpu *gpu)
 		a5xx_dump(gpu);
 
 	/*
-	 * Write-only software reset: the dummy read that used to follow the
-	 * assert is exactly the kind of access that can stall on a wedged GPU,
-	 * and it serves no purpose beyond ordering, which wmb() gives us.
+	 * RBBM software reset.  The dummy read between the assert and the
+	 * deassert is not just an ordering barrier: it is the documented way
+	 * to give the reset pulse a read cycle of time to take effect (see
+	 * the vendor _soft_reset(): "Do a dummy read to get a brief read
+	 * cycle delay for the reset to take effect").  Without it the pulse
+	 * can be too short, the GPU is not really reset, and the "recovery"
+	 * re-initialises a still-wedged CP so the next submit faults again.
 	 */
-	wmb();
 	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 1);
-	wmb();
+	gpu_read(gpu, REG_A5XX_RBBM_SW_RESET_CMD);
+	udelay(10);
 	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 0);
+	gpu_read(gpu, REG_A5XX_RBBM_SW_RESET_CMD);
 	adreno_recover(gpu);
 
 	/*
