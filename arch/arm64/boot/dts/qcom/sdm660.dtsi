@@ -89,11 +89,36 @@
 			opp-supported-hw = <0x70>;
 		};*/
 
+		/*
+		 * The opp-peak-kBps values below are the GPU->EBI peak
+		 * bandwidth votes of the stock firmware (kgsl
+		 * qcom,gpu-pwrlevel-bins -> qcom,bus-freq index into the
+		 * qcom,msm-bus,vectors-KBps table):
+		 *
+		 *   588 MHz -> level 10 = 5184000
+		 *   465 MHz -> level  9 = 4068000
+		 *   370 MHz -> level  8 = 3072000
+		 *   266 MHz -> level  3 =  800000   (ours is higher, keep)
+		 *   160 MHz -> level  3 =  800000   (ours is higher, keep)
+		 *
+		 * The inherited values sit exactly two table entries too low
+		 * for every level from 370 MHz upwards:
+		 *
+		 *   588 MHz: ours level  8, stock level 10
+		 *   465 MHz: ours level  7, stock level  9
+		 *   370 MHz: ours level  6, stock level  8
+		 *
+		 * i.e. the 588 MHz OPP asked for exactly the peak bandwidth the
+		 * stock firmware reserves for 370 MHz, leaving the GPU up to
+		 * 40% short of its stock memory bandwidth at its highest
+		 * operating point.  Only the under-voted levels are changed.
+		 */
+
 		/* bins 157,146,135 -> bits 6,5,4 */
 		opp-588000000 {
 			opp-hz = /bits/ 64 <588000000>;
 			opp-level = <RPM_SMD_LEVEL_NOM>;
-			opp-peak-kBps = <3072000>;
+			opp-peak-kBps = <5184000>;
 			opp-supported-hw = <0x70>;
 		};
 
@@ -101,7 +126,7 @@
 		opp-465000000 {
 			opp-hz = /bits/ 64 <465000000>;
 			opp-level = <RPM_SMD_LEVEL_SVS_PLUS>;
-			opp-peak-kBps = <2724000>;
+			opp-peak-kBps = <4068000>;
 			opp-supported-hw = <0x78>;
 		};
 
@@ -117,7 +142,7 @@
 		opp-370000000 {
 			opp-hz = /bits/ 64 <370000000>;
 			opp-level = <RPM_SMD_LEVEL_SVS>;
-			opp-peak-kBps = <2188000>;
+			opp-peak-kBps = <3072000>;
 			opp-supported-hw = <0xff>;
 		};
 

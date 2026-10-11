@@ -185,6 +185,14 @@ struct msm_dsi_host {
 	bool power_on;
 	bool enabled;
 	int irq;
+
+	/*
+	 * Optional panel-required CLKOUT timings in byte clocks, as given by
+	 * the panel vendor (stock panel DT qcom,mdss-dsi-t-clk-pre/post).
+	 * Negative means "not specified": use the PHY calculated value.
+	 */
+	int t_clk_pre;
+	int t_clk_post;
 };
 
 static inline u32 dsi_read(struct msm_dsi_host *msm_host, u32 reg)
@@ -798,6 +806,7 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 	enum mipi_dsi_pixel_format mipi_fmt = msm_host->format;
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
 	u32 data = 0, lane_ctrl = 0;
+	u32 clk_post, clk_pre;
 
 	if (flags & MIPI_DSI_MODE_VIDEO) {
 		if (flags & MIPI_DSI_MODE_VIDEO_HSE)
@@ -864,8 +873,22 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 		data |= DSI_TRIG_CTRL_BLOCK_DMA_WITHIN_FRAME;
 	dsi_write(msm_host, REG_DSI_TRIG_CTRL, data);
 
-	data = DSI_CLKOUT_TIMING_CTRL_T_CLK_POST(phy_shared_timings->clk_post) |
-		DSI_CLKOUT_TIMING_CTRL_T_CLK_PRE(phy_shared_timings->clk_pre);
+	/*
+	 * Prefer the panel vendor requested CLKOUT timings when the board
+	 * describes them; fall back to the PHY calculated values otherwise.
+	 */
+	clk_post = (msm_host->t_clk_post >= 0) ? msm_host->t_clk_post :
+						 phy_shared_timings->clk_post;
+	clk_pre = (msm_host->t_clk_pre >= 0) ? msm_host->t_clk_pre :
+					       phy_shared_timings->clk_pre;
+
+	DRM_DEV_DEBUG(&msm_host->pdev->dev,
+		      "clkout timing: t_clk_post %u t_clk_pre %u (phy %u/%u)\n",
+		      clk_post, clk_pre, phy_shared_timings->clk_post,
+		      phy_shared_timings->clk_pre);
+
+	data = DSI_CLKOUT_TIMING_CTRL_T_CLK_POST(clk_post & 0xff) |
+		DSI_CLKOUT_TIMING_CTRL_T_CLK_PRE(clk_pre & 0xff);
 	dsi_write(msm_host, REG_DSI_CLKOUT_TIMING_CTRL, data);
 
 	if ((cfg_hnd->major == MSM_DSI_VER_MAJOR_6G) &&
@@ -1890,6 +1913,7 @@ static int dsi_host_parse_dt(struct msm_dsi_host *msm_host)
 	struct device_node *np = dev->of_node;
 	struct device_node *endpoint;
 	const char *te_source;
+	u32 val;
 	int ret = 0;
 
 	/*
@@ -1928,6 +1952,22 @@ static int dsi_host_parse_dt(struct msm_dsi_host *msm_host)
 		}
 	}
 	ret = 0;
+
+	/*
+	 * The DSI CLKOUT (T_CLK_PRE/T_CLK_POST) timings are a receiver
+	 * (panel) requirement: the panel vendor ships explicit values in its
+	 * stock DT and they can be much larger than what the generic PHY
+	 * timing calculation derives from the DSI spec. An undersized
+	 * T_CLK_POST makes the clock lane leave HS too early for such panels,
+	 * which shows up as intermittent corruption of the transmitted
+	 * frames. Allow the stock values to be specified on the panel output
+	 * endpoint, next to qcom,te-source.
+	 */
+	if (!of_property_read_u32(endpoint, "qcom,mdss-dsi-t-clk-pre", &val))
+		msm_host->t_clk_pre = val & 0xff;
+
+	if (!of_property_read_u32(endpoint, "qcom,mdss-dsi-t-clk-post", &val))
+		msm_host->t_clk_post = val & 0xff;
 
 	if (of_property_present(np, "syscon-sfpb")) {
 		msm_host->sfpb = syscon_regmap_lookup_by_phandle(np,
@@ -1977,6 +2017,8 @@ int msm_dsi_host_init(struct msm_dsi *msm_dsi)
 
 	msm_host->vid_done_timeout = msecs_to_jiffies(50);
 	msm_host->pdev = pdev;
+	msm_host->t_clk_pre = -1;
+	msm_host->t_clk_post = -1;
 	msm_dsi->host = &msm_host->base;
 
 	ret = dsi_host_parse_dt(msm_host);

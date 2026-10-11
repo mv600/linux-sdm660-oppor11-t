@@ -257,6 +257,12 @@ static int dpu_encoder_phys_cmd_control_vblank_irq(
 	if (!dpu_encoder_phys_cmd_is_master(phys_enc))
 		goto end;
 
+	/* IRQ not yet initialized */
+	if (!phys_enc->irq[INTR_IDX_RDPTR]) {
+		ret = -EINVAL;
+		goto end;
+	}
+
 	/* protect against negative */
 	if (!enable && refcount == 0) {
 		ret = -EINVAL;
@@ -382,11 +388,18 @@ static void dpu_encoder_phys_cmd_tearcheck_config(
 				(mode->vtotal * drm_mode_vrefresh(mode));
 
 	/*
-	 * Set the sync_cfg_height to twice vtotal so that if we lose a
-	 * TE event coming from the display TE pin we won't stall immediately
+	 * By setting sync_cfg_height to near max register value, we essentially
+	 * disable sde hw generated TE signal, since hw TE will arrive first.
+	 * Only caveat is if due to error, we hit wrap-around. This also avoids
+	 * the internal (line-counter) TE racing the panel TE: the internal
+	 * counter line rate is derived from the vsync clock and is only an
+	 * approximation of the panel frame time, so with a height of only
+	 * 2 * vtotal the internally generated TE slowly overtakes the panel
+	 * one and the write pointer drifts against the panel read pointer,
+	 * which shows up as slowly creeping tearing/ghosting on screen.
 	 */
 	tc_cfg.hw_vsync_mode = 1;
-	tc_cfg.sync_cfg_height = mode->vtotal * 2;
+	tc_cfg.sync_cfg_height = 0xFFF0;
 	tc_cfg.vsync_init_val = mode->vdisplay;
 	tc_cfg.sync_threshold_start = DEFAULT_TEARCHECK_SYNC_THRESH_START;
 	tc_cfg.sync_threshold_continue = DEFAULT_TEARCHECK_SYNC_THRESH_CONTINUE;

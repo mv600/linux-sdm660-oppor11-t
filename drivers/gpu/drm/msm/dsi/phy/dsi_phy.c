@@ -847,6 +847,21 @@ int msm_dsi_phy_pll_restore_state(struct msm_dsi_phy *phy)
 
 void msm_dsi_phy_snapshot(struct msm_disp_state *disp_state, struct msm_dsi_phy *phy)
 {
+	/*
+	 * The PHY registers are only reachable while the PHY is powered and
+	 * its interface clock is running: they live behind an AHB clock that
+	 * is gated when the DSI link is off. Reading them while the link is
+	 * down never completes on the interconnect and raises a synchronous
+	 * external abort, which takes the whole system down. Only dump the
+	 * registers while msm_dsi_phy_enable() holds its runtime PM
+	 * reference, exactly like the DPU snapshot does.
+	 */
+	if (pm_runtime_get_if_active(&phy->pdev->dev) <= 0) {
+		pr_debug("%s: dsi%d phy powered off, skipping dump\n",
+			 __func__, phy->id);
+		return;
+	}
+
 	msm_disp_snapshot_add_block(disp_state,
 			phy->base_size, phy->base,
 			"dsi%d_phy", phy->id);
@@ -866,4 +881,6 @@ void msm_dsi_phy_snapshot(struct msm_disp_state *disp_state, struct msm_dsi_phy 
 		msm_disp_snapshot_add_block(disp_state,
 			phy->reg_size, phy->reg_base,
 			"dsi%d_reg", phy->id);
+
+	pm_runtime_put(&phy->pdev->dev);
 }
