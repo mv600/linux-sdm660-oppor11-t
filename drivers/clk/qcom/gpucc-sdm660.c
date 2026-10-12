@@ -328,7 +328,11 @@ static const struct regmap_config gpucc_660_regmap_config = {
 	.reg_bits	= 32,
 	.reg_stride	= 4,
 	.val_bits	= 32,
-	.max_register	= 0x9034,
+	/* GPUCC window is 0x9000 bytes; 0x9000..0x9038 belongs to the
+	 * GFX CPR/LDO block (node gfx_ldo), which must stay outside the
+	 * clock controller's regmap.
+	 */
+	.max_register	= 0x8ffc,
 	.fast_io	= true,
 };
 

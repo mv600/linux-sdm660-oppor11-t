@@ -1255,7 +1255,13 @@
 			#clock-cells = <1>;
 			#reset-cells = <1>;
 			#power-domain-cells = <1>;
-			reg = <0x05065000 0x9038>;
+			/* The GFX CPR/LDO block lives at 0x0506e000, which is
+			 * *outside* the GPUCC register window (the msm8998
+			 * binding uses 0x9000 for the same block).  Do not
+			 * extend past 0x9000 or the gfx-ldo node cannot claim
+			 * its registers.
+			 */
+			reg = <0x05065000 0x9000>;
 
 			clocks = <&xo_board>,
 				 <&gcc GCC_GPU_GPLL0_CLK>,
