@@ -82,12 +82,12 @@
 		};*/
 
 		/* bins 157,146,135 -> bits 6,5,4 */
-		/*opp-647000000 {
+		opp-647000000 {
 			opp-hz = /bits/ 64 <647000000>;
 			opp-level = <RPM_SMD_LEVEL_NOM_PLUS>;
-			opp-peak-kBps = <4068000>;
+			opp-peak-kBps = <7216000>;
 			opp-supported-hw = <0x70>;
-		};*/
+		};
 
 		/*
 		 * The opp-peak-kBps values below are the GPU->EBI peak
@@ -112,6 +112,15 @@
 		 * stock firmware reserves for 370 MHz, leaving the GPU up to
 		 * 40% short of its stock memory bandwidth at its highest
 		 * operating point.  Only the under-voted levels are changed.
+		 *
+		 * 647 MHz follows a different rule: it is the *top* pwrlevel of
+		 * speed bin 135 (this unit), and the stock firmware gives the
+		 * top pwrlevel the maximum bus vote (bus-freq = <0x0d> =
+		 * level 13 = 7216000, bus-min = level 12 = 6220000), whereas
+		 * 647 MHz uses level 11 = 5412000 on the bins where it is not
+		 * the top.  Use the bin 135 value so the GPU is never short of
+		 * its stock memory bandwidth at 647 MHz.  The inherited value
+		 * (level 9 = 4068000) was even below the 588 MHz vote.
 		 */
 
 		/* bins 157,146,135 -> bits 6,5,4 */
