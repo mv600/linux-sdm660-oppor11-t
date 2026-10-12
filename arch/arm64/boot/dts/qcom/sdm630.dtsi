@@ -1265,6 +1265,15 @@
 				      "gcc_gpu_gpll0_div_clk";
 		};
 
+		gfx_ldo: regulator@506e000 {
+			compatible = "qcom,sdm660-gfx-ldo";
+			reg = <0x0506e000 0x34>;
+
+			regulator-name = "msm_gfx_ldo";
+			regulator-min-microvolt = <400000>;
+			regulator-max-microvolt = <925000>;
+		};
+
 		lpass_smmu: iommu@5100000 {
 			compatible = "qcom,sdm630-smmu-v2", "qcom,smmu-v2";
 			reg = <0x05100000 0x40000>;

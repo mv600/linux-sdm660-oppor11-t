@@ -1161,6 +1161,19 @@ config REGULATOR_QCOM_REFGEN
 	  Say M here if you want to include support for this regulator as
 	  a module. The module will be named "qcom-refgen-regulator".
 
+config REGULATOR_QCOM_GFX_LDO
+	tristate "Qualcomm Technologies, Inc. SDM660 GFX LDO regulator driver"
+	depends on ARCH_QCOM || COMPILE_TEST
+	depends on HAS_IOMEM
+	help
+	  This driver supports the on-die GFX LDO/BHS power switch block
+	  found on Qualcomm SDM630/SDM660 SoCs, exposing the GPU (VDD_GFX)
+	  rail as a voltage regulator.  It covers the open-loop bypass (BHS)
+	  usage and the optional regulated (LDO) mode.
+
+	  Say M here if you want to include support for this regulator as a
+	  module. The module will be named "qcom-gfx-ldo".
+
 config REGULATOR_QCOM_RPM
 	tristate "Qualcomm RPM regulator driver"
 	depends on MFD_QCOM_RPM

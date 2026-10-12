@@ -786,6 +786,10 @@
 	status = "okay";
 };
 
+&adreno_gpu {
+	vdd-supply = <&gfx_ldo>;
+};
+
 &tlmm {
 	/* Jason reserves GPIO0-3, but R11T uses them for BLSP1 QUP1/I2C1. */
 	/delete-property/ gpio-reserved-ranges;
