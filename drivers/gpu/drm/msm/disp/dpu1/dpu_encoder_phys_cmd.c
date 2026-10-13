@@ -399,7 +399,7 @@ static void dpu_encoder_phys_cmd_tearcheck_config(
 	 * which shows up as slowly creeping tearing/ghosting on screen.
 	 */
 	tc_cfg.hw_vsync_mode = 1;
-	tc_cfg.sync_cfg_height = mode->vdisplay;
+	tc_cfg.sync_cfg_height = mode->vdisplay + 1;
 	tc_cfg.vsync_init_val = mode->vdisplay;
 	tc_cfg.sync_threshold_start = DEFAULT_TEARCHECK_SYNC_THRESH_START;
 	tc_cfg.sync_threshold_continue = DEFAULT_TEARCHECK_SYNC_THRESH_CONTINUE;
