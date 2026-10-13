@@ -1236,6 +1236,8 @@ static void a5xx_cp_err_irq(struct msm_gpu *gpu)
 {
 	u32 status = gpu_read(gpu, REG_A5XX_CP_INTERRUPT_STATUS);
 
+	dev_err(gpu->dev->dev, "CP error interrupt: status=%08x\n", status);
+
 	if (status & A5XX_CP_INT_CP_OPCODE_ERROR) {
 		u32 val;
 
