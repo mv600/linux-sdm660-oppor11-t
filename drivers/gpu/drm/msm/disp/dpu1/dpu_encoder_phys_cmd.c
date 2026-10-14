@@ -404,7 +404,7 @@ static void dpu_encoder_phys_cmd_tearcheck_config(
 	tc_cfg.sync_threshold_start = DEFAULT_TEARCHECK_SYNC_THRESH_START;
 	tc_cfg.sync_threshold_continue = DEFAULT_TEARCHECK_SYNC_THRESH_CONTINUE;
 	tc_cfg.start_pos = mode->vdisplay;
-	tc_cfg.rd_ptr_irq = tc_cfg.sync_cfg_height - 2;
+	tc_cfg.rd_ptr_irq = tc_cfg.sync_cfg_height - 1;
 
 	DPU_DEBUG_CMDENC(cmd_enc,
 		"tc vsync_clk_speed_hz %lu vtotal %u vrefresh %u\n",
