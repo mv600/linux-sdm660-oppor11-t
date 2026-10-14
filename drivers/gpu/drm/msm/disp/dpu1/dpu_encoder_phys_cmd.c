@@ -399,12 +399,12 @@ static void dpu_encoder_phys_cmd_tearcheck_config(
 	 * which shows up as slowly creeping tearing/ghosting on screen.
 	 */
 	tc_cfg.hw_vsync_mode = 1;
-	tc_cfg.sync_cfg_height = mode->vdisplay;
+	tc_cfg.sync_cfg_height = 0xFFF0;
 	tc_cfg.vsync_init_val = mode->vdisplay;
 	tc_cfg.sync_threshold_start = DEFAULT_TEARCHECK_SYNC_THRESH_START;
 	tc_cfg.sync_threshold_continue = DEFAULT_TEARCHECK_SYNC_THRESH_CONTINUE;
 	tc_cfg.start_pos = mode->vdisplay;
-	tc_cfg.rd_ptr_irq = tc_cfg.sync_cfg_height - 1;
+	tc_cfg.rd_ptr_irq = mode->vdisplay + 1;
 
 	DPU_DEBUG_CMDENC(cmd_enc,
 		"tc vsync_clk_speed_hz %lu vtotal %u vrefresh %u\n",
@@ -420,6 +420,12 @@ static void dpu_encoder_phys_cmd_tearcheck_config(
 		"tc cfgheight %u thresh_start %u thresh_cont %u\n",
 		tc_cfg.sync_cfg_height, tc_cfg.sync_threshold_start,
 		tc_cfg.sync_threshold_continue);
+
+	/* r11t: temporary marker to confirm the live tearcheck config on-target */
+	pr_info("r11t-tearcheck: hw_vsync_mode=%u sync_cfg_height=%u vsync_init_val=%u start_pos=%u rd_ptr_irq=%u vsync_count=%u vdisplay=%u\n",
+		tc_cfg.hw_vsync_mode, tc_cfg.sync_cfg_height, tc_cfg.vsync_init_val,
+		tc_cfg.start_pos, tc_cfg.rd_ptr_irq, tc_cfg.vsync_count,
+		mode->vdisplay);
 
 	if (phys_enc->has_intf_te)
 		phys_enc->hw_intf->ops.enable_tearcheck(phys_enc->hw_intf, &tc_cfg);
