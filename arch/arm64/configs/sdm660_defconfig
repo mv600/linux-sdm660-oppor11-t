@@ -969,14 +969,24 @@ CONFIG_PRINTK_TIME=y
 CONFIG_HZ_1000=y
 CONFIG_HZ=1000
 # CONFIG_DYNAMIC_DEBUG is not set
-# CONFIG_DEBUG_KERNEL is not set
-CONFIG_DEBUG_INFO_DWARF5=y
-CONFIG_DEBUG_INFO_BTF=y
+# DEBUG_KERNEL gates the hung-task/soft-lockup/hard-lockup detectors below;
+# without it kconfig silently dropped CONFIG_DETECT_HUNG_TASK and
+# CONFIG_HARDLOCKUP_DETECTOR, which the HZ=1000 comment above relies on.
+CONFIG_DEBUG_KERNEL=y
+# CONFIG_DEBUG_PREEMPT is not set
+# Enabling DEBUG_KERNEL also makes the two dormant DEBUG_INFO_* lines below
+# live; that would pull in CONFIG_DEBUG_INFO (much bigger image, much slower
+# build) plus CONFIG_DEBUG_INFO_BTF, which requires pahole and is not
+# installed in the CI image.  Keep debug info disabled.
+# CONFIG_DEBUG_INFO_DWARF5 is not set
+# CONFIG_DEBUG_INFO_BTF is not set
+CONFIG_DEBUG_INFO_NONE=y
 CONFIG_MAGIC_SYSRQ=y
 CONFIG_DEBUG_FS=y
 CONFIG_PANIC_TIMEOUT=-1
 CONFIG_HARDLOCKUP_DETECTOR=y
 CONFIG_DETECT_HUNG_TASK=y
+CONFIG_SOFTLOCKUP_DETECTOR=y
 # CONFIG_RCU_TRACE is not set
 # CONFIG_TRACEFS_AUTOMOUNT_DEPRECATED is not set
 CONFIG_FUNCTION_TRACER=y
