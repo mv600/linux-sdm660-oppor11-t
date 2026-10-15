@@ -60,9 +60,16 @@
 			compatible = "ramoops";
 			reg = <0x0 0xb0000000 0x0 0x400000>;
 			console-size = <0x200000>;
-			record-size = <0x0>;
+			/*
+			 * record-size was 0, so pstore never produced a
+			 * dmesg-ramoops record and a panic left no kernel log
+			 * behind.  Take the 2 MiB from the unused pmsg area
+			 * instead of growing the 4 MiB reservation; the console
+			 * area (which survives a silent reset) stays as is.
+			 */
+			record-size = <0x200000>;
 			ftrace-size = <0x0>;
-			pmsg-size = <0x200000>;
+			pmsg-size = <0x0>;
 		};
 	};
 
