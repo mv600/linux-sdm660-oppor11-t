@@ -1163,13 +1163,27 @@ static const struct regmap_config msm8916_codec_regmap_config = {
 	.cache_type = REGCACHE_FLAT,
 };
 
+/*
+ * The codec's "mclk" is owned by the ADSP (q6afe) LPASS service rather than by
+ * a local GCC clock. On a cold boot the q6afe clock provider can be registered
+ * while the audio service is not yet ready to service the
+ * AFE_SVC_CMD_SET_PARAM that enabling this clock issues; the request then comes
+ * back as -EINVAL (-22). Because that is a terminal error, the probe would fail
+ * for the whole boot and the sound card would never register (no audio until
+ * reboot). A missing clock provider, by contrast, is already reported as
+ * -EPROBE_DEFER by msm8916_wcd_digital_get_clks(). Give the already-registered
+ * service a bounded amount of time to become ready before giving up.
+ */
+#define MSM8916_WCD_DIGITAL_MCLK_RETRIES	40
+#define MSM8916_WCD_DIGITAL_MCLK_RETRY_MS	50
+
 static int msm8916_wcd_digital_probe(struct platform_device *pdev)
 {
 	struct msm8916_wcd_digital_priv *priv;
 	struct device *dev = &pdev->dev;
 	void __iomem *base;
 	struct regmap *digital_map;
-	int ret;
+	int ret, i;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
@@ -1195,7 +1209,12 @@ static int msm8916_wcd_digital_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ret = clk_prepare_enable(priv->mclk);
+	for (i = 0; i < MSM8916_WCD_DIGITAL_MCLK_RETRIES; i++) {
+		ret = clk_prepare_enable(priv->mclk);
+		if (!ret)
+			break;
+		msleep(MSM8916_WCD_DIGITAL_MCLK_RETRY_MS);
+	}
 	if (ret < 0) {
 		dev_err(dev, "failed to enable mclk %d\n", ret);
 		goto err_clk;
