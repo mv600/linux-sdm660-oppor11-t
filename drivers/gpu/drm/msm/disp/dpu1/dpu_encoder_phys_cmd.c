@@ -39,22 +39,7 @@
 #define DEFAULT_TEARCHECK_SYNC_THRESH_START	4
 #define DEFAULT_TEARCHECK_SYNC_THRESH_CONTINUE	4
 
-/*
- * r11t P1 probe (temporary, read-only).
- *
- * Reads the pingpong read-pointer counter (the hardware's model of the panel
- * scan position, reloaded to VSYNC_INIT_VAL on every external TE) together
- * with the pingpong write pointer, so we can tell whether a frame is pushed
- * into panel RAM at the TE/vblank boundary or in the middle of an active scan.
- *
- * Offsets are duplicated from dpu_hw_pingpong.c; no writes are performed.
- */
-#define R11T_PP_INT_COUNT_VAL	0x014
-#define R11T_PP_LINE_COUNT	0x02C
-
 static void dpu_encoder_phys_cmd_enable_te(struct dpu_encoder_phys *phys_enc);
-
-static void r11t_p1_sample(struct dpu_encoder_phys *phys_enc, const char *tag);
 
 static bool dpu_encoder_phys_cmd_is_master(struct dpu_encoder_phys *phys_enc)
 {
@@ -99,45 +84,6 @@ static void _dpu_encoder_phys_cmd_update_intf_cfg(
 		phys_enc->hw_intf->ops.program_intf_cmd_cfg(phys_enc->hw_intf, &cmd_mode_cfg);
 }
 
-/*
- * r11t P1 probe (temporary, read-only).
- *
- * Semantics: rd_line  = PP_INT_COUNT_VAL[15:0]  - read pointer (panel scan model)
- *     rd_frame = PP_INT_COUNT_VAL[31:16] - model frame counter
- *     wr_line  = PP_LINE_COUNT[15:0]     - write pointer
- *     wr_frame = PP_LINE_COUNT[31:16]    - write frame counter
- *
- * Interpretation (see 问题排查与修复文档 §5.9.17):
- *   - the read pointer is reloaded to `vsync_init_val` (= vdisplay) on every
- *     external TE, so (rd_line - vdisplay) is the panel scan position within
- *     the current frame;
- *   - if the tearcheck start-ROI gate works, a frame written to panel RAM
- *     always begins at the vblank, so the write pointer stays in lockstep
- *     with the read pointer and the tx-done sample lands at a near-constant
- *     scan position;
- *   - if it does not, the tx-done sample scatters by exactly the scan
- *     position at which that frame's write started (= the tear line).
- */
-static void r11t_p1_sample(struct dpu_encoder_phys *phys_enc, const char *tag)
-{
-	struct dpu_hw_pingpong *pp;
-	u32 rd, wr;
-
-	if (!phys_enc || !phys_enc->hw_pp)
-		return;
-
-	pp = phys_enc->hw_pp;
-	if (!pp->ops.get_line_count || phys_enc->enable_state != DPU_ENC_ENABLED)
-		return;
-
-	rd = DPU_REG_READ(&pp->hw, R11T_PP_INT_COUNT_VAL);
-	wr = DPU_REG_READ(&pp->hw, R11T_PP_LINE_COUNT);
-
-	pr_info("r11t-p1: %s pp=%d rd_line=%u rd_frame=%u wr_line=%u wr_frame=%u\n",
-		tag, pp->idx - PINGPONG_0,
-		rd & 0xffff, rd >> 16, wr & 0xffff, wr >> 16);
-}
-
 static void dpu_encoder_phys_cmd_pp_tx_done_irq(void *arg)
 {
 	struct dpu_encoder_phys *phys_enc = arg;
@@ -147,8 +93,6 @@ static void dpu_encoder_phys_cmd_pp_tx_done_irq(void *arg)
 
 	if (!phys_enc->hw_pp)
 		return;
-
-	r11t_p1_sample(phys_enc, "tx");
 
 	DPU_ATRACE_BEGIN("pp_done_irq");
 	/* notify all synchronous clients first, then asynchronous clients */
@@ -174,8 +118,6 @@ static void dpu_encoder_phys_cmd_te_rd_ptr_irq(void *arg)
 
 	DPU_ATRACE_BEGIN("rd_ptr_irq");
 	cmd_enc = to_dpu_encoder_phys_cmd(phys_enc);
-
-	r11t_p1_sample(phys_enc, "te");
 
 	dpu_encoder_vblank_callback(phys_enc->parent, phys_enc);
 
@@ -660,9 +602,6 @@ static void dpu_encoder_phys_cmd_prepare_for_kickoff(
 		DPU_ERROR("invalid encoder\n");
 		return;
 	}
-
-	r11t_p1_sample(phys_enc, "kick");
-
 	DRM_DEBUG_KMS("id:%u pp:%d pending_cnt:%d\n", DRMID(phys_enc->parent),
 		      phys_enc->hw_pp->idx - PINGPONG_0,
 		      atomic_read(&phys_enc->pending_kickoff_cnt));
