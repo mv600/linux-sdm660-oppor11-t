@@ -651,12 +651,21 @@
 				<GIC_SPI 229 IRQ_TYPE_LEVEL_HIGH>,
 				<GIC_SPI 231 IRQ_TYPE_LEVEL_HIGH>,
 
+				/*
+				 * The downstream firmware describes SPI 374..378 as
+				 * IRQ_TYPE_LEVEL_LOW.  Mainline's GIC does not support
+				 * level-low SPIs (gic_set_type() returns -EINVAL), so
+				 * requesting the context fault IRQs of those SMMU
+				 * contexts fails, leaving their translation faults
+				 * unreported.  All other SMMU interrupts (including the
+				 * adjacent contexts 373, 462..467) are level-high.
+				 */
 				<GIC_SPI 373 IRQ_TYPE_LEVEL_HIGH>,
-				<GIC_SPI 374 IRQ_TYPE_LEVEL_LOW>,
-				<GIC_SPI 375 IRQ_TYPE_LEVEL_LOW>,
-				<GIC_SPI 376 IRQ_TYPE_LEVEL_LOW>,
-				<GIC_SPI 377 IRQ_TYPE_LEVEL_LOW>,
-				<GIC_SPI 378 IRQ_TYPE_LEVEL_LOW>,
+				<GIC_SPI 374 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 375 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 376 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 377 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 378 IRQ_TYPE_LEVEL_HIGH>,
 				<GIC_SPI 462 IRQ_TYPE_LEVEL_HIGH>,
 				<GIC_SPI 463 IRQ_TYPE_LEVEL_HIGH>,
 				<GIC_SPI 464 IRQ_TYPE_LEVEL_HIGH>,
