@@ -786,6 +786,13 @@
 	status = "okay";
 };
 
+/* Hardware video decode/encode (Venus VPU). Firmware is the stock blob at
+ * qcom/venus-4.4/venus.mdt (driver default from sdm660_res), installed from
+ * the stock modem partition image (/mnt/modem/image/venus.*). */
+&venus {
+	status = "okay";
+};
+
 &adreno_gpu {
 	vdd-supply = <&gfx_ldo>;
 };
