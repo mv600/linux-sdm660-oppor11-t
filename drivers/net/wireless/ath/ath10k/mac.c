@@ -3192,7 +3192,6 @@ static void ath10k_bss_disassoc(struct ieee80211_hw *hw,
 {
 	struct ath10k *ar = hw->priv;
 	struct ath10k_vif *arvif = (void *)vif->drv_priv;
-	struct ieee80211_sta_vht_cap vht_cap = {};
 	int ret;
 
 	lockdep_assert_held(&ar->conf_mutex);
@@ -3207,13 +3206,13 @@ static void ath10k_bss_disassoc(struct ieee80211_hw *hw,
 
 	arvif->def_wep_key_idx = -1;
 
-	ret = ath10k_mac_vif_recalc_txbf(ar, vif, vht_cap);
-	if (ret) {
-		ath10k_warn(ar, "failed to recalc txbf for vdev %i: %d\n",
-			    arvif->vdev_id, ret);
-		return;
-	}
-
+	/*
+	 * Do not reset TxBF here: WCN3990 firmware (e.g. WLAN.HL.1.0.1.c2)
+	 * crashes when the vdev's TxBF parameter is set while the vdev has no
+	 * peer for its AP, so the firmware dies on every disassociation.
+	 * ath10k_bss_assoc() programs TxBF again from the next AP's
+	 * capabilities before bringing the vdev up, so nothing is lost.
+	 */
 	arvif->is_up = false;
 
 	ath10k_mac_txpower_recalc(ar);
