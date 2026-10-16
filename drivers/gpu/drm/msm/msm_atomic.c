@@ -4,6 +4,8 @@
  * Author: Rob Clark <robdclark@gmail.com>
  */
 
+#include <linux/module.h>
+
 #include <drm/drm_atomic_uapi.h>
 #include <drm/drm_vblank.h>
 
@@ -11,6 +13,28 @@
 #include "msm_drv.h"
 #include "msm_gem.h"
 #include "msm_kms.h"
+
+/*
+ * R11T (SDM660) display bring-up experiment.  See the host-side bring-up log
+ * (section 7.24) for the measurements behind it.
+ *
+ * msm_atomic_commit_tail() waits for the flush twice: once at the very
+ * beginning, before the plane state is programmed into the hardware, and once
+ * after flush_commit().  On this board the second one blocks for a full frame
+ * (~15.4 ms at 60 Hz, measured with the dpu tracepoints) because it waits for
+ * the DPU to finish pushing the frame to the command-mode panel.  The first
+ * wait is what protects the frame that may still be in flight, so it is kept.
+ *
+ * Skipping the post-flush wait hands the flip_done event back to userspace one
+ * frame earlier, which lets the compositor render the next frame while the DPU
+ * is still transferring the previous one.  Keep 0 (upstream behaviour) unless
+ * measuring:
+ *   echo 1 > /sys/module/msm/parameters/msm_skip_post_flush_wait
+ */
+static bool msm_skip_post_flush_wait;
+module_param(msm_skip_post_flush_wait, bool, 0644);
+MODULE_PARM_DESC(msm_skip_post_flush_wait,
+	"msm: skip the post-flush wait in msm_atomic_commit_tail() (default=0, upstream behaviour)");
 
 /*
  * Helpers to control vblanks while we flush.. basically just to ensure
@@ -307,7 +331,8 @@ fallback:
 	 * Wait for flush to complete:
 	 */
 	trace_msm_atomic_wait_flush_start(crtc_mask);
-	kms->funcs->wait_flush(kms, crtc_mask);
+	if (!msm_skip_post_flush_wait)
+		kms->funcs->wait_flush(kms, crtc_mask);
 	trace_msm_atomic_wait_flush_finish(crtc_mask);
 
 	vblank_put(kms, crtc_mask);

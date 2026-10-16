@@ -5,6 +5,7 @@
 
 #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
 #include <linux/delay.h>
+#include <linux/module.h>
 #include <linux/string_choices.h>
 #include "dpu_encoder_phys.h"
 #include "dpu_hw_interrupts.h"
@@ -693,6 +694,25 @@ static int dpu_encoder_phys_cmd_wait_for_tx_complete(
 	return rc;
 }
 
+/*
+ * R11T (SDM660) display bring-up experiment, companion to
+ * msm_skip_post_flush_wait in msm_atomic.c (see the host-side bring-up log,
+ * section 7.24).
+ *
+ * Upstream documents the wait in dpu_kms_wait_for_commit_done() as "may be a
+ * no-op for command mode panels", but the command-mode implementation falls
+ * through to wait_for_tx_complete() and blocks until pp_done, i.e. for a whole
+ * frame.  dpu_encoder_phys_cmd_prepare_for_kickoff() already waits for the
+ * pingpong to go idle before every kickoff, which is the synchronization the
+ * hardware needs.  Turning this on makes the documented "no-op" real, for A/B
+ * measurements only:
+ *   echo 1 > /sys/module/msm/parameters/dpu_cmd_skip_commit_done_wait
+ */
+static bool dpu_cmd_skip_commit_done_wait;
+module_param(dpu_cmd_skip_commit_done_wait, bool, 0644);
+MODULE_PARM_DESC(dpu_cmd_skip_commit_done_wait,
+	"DPU: make wait_for_commit_done() a no-op for command-mode panels (default=0, upstream behaviour)");
+
 static int dpu_encoder_phys_cmd_wait_for_commit_done(
 		struct dpu_encoder_phys *phys_enc)
 {
@@ -703,6 +723,9 @@ static int dpu_encoder_phys_cmd_wait_for_commit_done(
 	if (phys_enc->irq[INTR_IDX_CTL_START] &&
 	    !phys_enc->hw_ctl->ops.is_started(phys_enc->hw_ctl))
 		return _dpu_encoder_phys_cmd_wait_for_ctl_start(phys_enc);
+
+	if (dpu_cmd_skip_commit_done_wait)
+		return 0;
 
 	return dpu_encoder_phys_cmd_wait_for_tx_complete(phys_enc);
 }
