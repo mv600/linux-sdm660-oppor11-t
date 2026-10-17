@@ -90,6 +90,31 @@ MODULE_PARM_DESC(probe_wait_ms,
 		 " before disconnecting (reason 4).");
 
 /*
+ * R11T (SDM660) workaround.  The WCN3990 firmware shipped in the R11T modem
+ * partition (WLAN.HL.1.0.1.c2.1-00098, built 2019-10-21) asserts in
+ * wlan_vdev.c whenever the AP toggles its channel width (20 <-> 40 MHz) in a
+ * beacon, i.e. on every AP bandwidth change:
+ *
+ *   wlan0: AP xx changed bandwidth in beacon, new used config is 2437.000 MHz, width 2 (2447.000/0 MHz)
+ *   qcom-q6v5-mss 4080000.remoteproc: fatal error received:
+ *       err_qdi.c:459:EF:wlan_process:1:cmnos_thread.c:3285:Asserted in wlan_vdev.c:_w
+ *
+ * The AP in question toggles the width roughly every 25 minutes, and boot -4
+ * of 2026-10-17 shows a perfect 1:1 correlation: 14 bandwidth changes, 14
+ * fatal errors.  Each one kills the WLAN protection domain on the modem DSP,
+ * and a failed recovery ("port failed halt" plus IPA pipe reset timeouts)
+ * then takes the whole SoC down.
+ *
+ * With this knob set, the channel width negotiated at association time is kept
+ * and width-only changes seen in beacons are not pushed to the driver (and so
+ * not to the firmware).  Default 0 keeps the unmodified upstream behaviour.
+ */
+static bool ignore_beacon_bw_change;
+module_param(ignore_beacon_bw_change, bool, 0644);
+MODULE_PARM_DESC(ignore_beacon_bw_change,
+		 "Ignore channel-width changes announced in beacons, keep the width negotiated at association (default=0, upstream behaviour)");
+
+/*
  * How many Beacon frames need to have been used in average signal strength
  * before starting to indicate signal change events.
  */
@@ -1364,6 +1389,20 @@ static int ieee80211_config_bw(struct ieee80211_link_data *link,
 	chanreq.oper = ap_chandef;
 	ieee80211_set_chanreq_ap(sdata, &chanreq, &link->u.mgd.conn,
 				 &ap_chandef);
+
+	/*
+	 * R11T workaround, see ignore_beacon_bw_change: do not follow a width
+	 * change announced in a beacon.  Both the channel context and the
+	 * matching HT operation element change are programmed into the
+	 * firmware, which asserts on this device.  Keep what association
+	 * negotiated.  Only width changes are affected; a change of the
+	 * primary channel is still followed.
+	 */
+	if (ignore_beacon_bw_change && stype == IEEE80211_STYPE_BEACON &&
+	    chanreq.oper.chan->center_freq ==
+			link->conf->chanreq.oper.chan->center_freq &&
+	    !ieee80211_chanreq_identical(&chanreq, &link->conf->chanreq))
+		return 0;
 
 	/*
 	 * if HT operation mode changed store the new one -
