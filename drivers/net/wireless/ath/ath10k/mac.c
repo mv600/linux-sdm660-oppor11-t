@@ -5469,6 +5469,8 @@ err:
 	return ret;
 }
 
+static void ath10k_conn_watchdog_clear(struct ath10k *ar);
+
 static void ath10k_stop(struct ieee80211_hw *hw, bool suspend)
 {
 	struct ath10k *ar = hw->priv;
@@ -5503,6 +5505,8 @@ static void ath10k_stop(struct ieee80211_hw *hw, bool suspend)
 	cancel_delayed_work_sync(&ar->scan.timeout);
 	cancel_work_sync(&ar->restart_work);
 	cancel_work_sync(&ar->recovery_check_work);
+	cancel_delayed_work_sync(&ar->conn_watchdog_work);
+	ath10k_conn_watchdog_clear(ar);
 }
 
 static int ath10k_config_ps(struct ath10k *ar)
@@ -6179,6 +6183,126 @@ static void ath10k_recalculate_mgmt_rate(struct ath10k *ar,
 		ath10k_warn(ar, "failed to set mgmt tx rate %d\n", ret);
 }
 
+/* F6: firmware authentication engine watchdog.
+ *
+ * Observed firmware defect (WLAN.HL.1.0.1.c2.1-00098): when the AP the card
+ * is associated to disappears without a deauth frame, the supplicant retries
+ * authentication once against the BSS that just vanished.  If that single
+ * authentication gets no response, the firmware ends up unable to
+ * authenticate to *any* BSS until it is reloaded (rfkill toggle / reboot).
+ * The WMI management-tx command path, the vdev state machine and TX
+ * completions all stay healthy - only over-the-air authentication silently
+ * gets no response.
+ *
+ * mac80211 calls mgd_prepare_tx() before every authentication attempt and
+ * mgd_complete_tx() once a response arrived, so a missing complete_tx() is
+ * an exact "the firmware never answered" signal.  Count consecutive
+ * unanswered auth attempts (only while not associated, to leave roaming
+ * alone) and once the tunable threshold is reached, kick the driver's
+ * existing firmware recovery machinery.
+ */
+
+#define ATH10K_CONN_WATCHDOG_WINDOW_MS	2500
+#define ATH10K_CONN_WATCHDOG_RETRY_MS	30000
+
+static void ath10k_conn_watchdog_clear(struct ath10k *ar)
+{
+	spin_lock_bh(&ar->data_lock);
+	ar->conn_watchdog_noresp = false;
+	ar->conn_watchdog_fails = 0;
+	spin_unlock_bh(&ar->data_lock);
+}
+
+static void ath10k_conn_watchdog_arm(struct ath10k *ar)
+{
+	spin_lock_bh(&ar->data_lock);
+	ar->conn_watchdog_noresp = true;
+	spin_unlock_bh(&ar->data_lock);
+
+	/* (Re)arm a while after the last try of the current attempt. */
+	mod_delayed_work(ar->workqueue, &ar->conn_watchdog_work,
+			 msecs_to_jiffies(ATH10K_CONN_WATCHDOG_WINDOW_MS));
+}
+
+void ath10k_conn_watchdog_work(struct work_struct *work)
+{
+	struct ath10k *ar = container_of(work, struct ath10k,
+					 conn_watchdog_work.work);
+	unsigned int fails;
+	bool noresp;
+
+	spin_lock_bh(&ar->data_lock);
+	noresp = ar->conn_watchdog_noresp;
+	ar->conn_watchdog_noresp = false;
+	if (noresp)
+		ar->conn_watchdog_fails++;
+	fails = ar->conn_watchdog_fails;
+	spin_unlock_bh(&ar->data_lock);
+
+	if (!noresp)
+		return;
+
+	ath10k_warn(ar, "auth attempt got no response (%u/%u consecutive)\n",
+		    fails, ath10k_conn_watchdog_fails);
+
+	if (fails < ath10k_conn_watchdog_fails)
+		return;
+
+	ath10k_conn_watchdog_clear(ar);
+
+	if (atomic_read(&ar->pending_recovery)) {
+		ath10k_dbg(ar, ATH10K_DBG_MAC,
+			   "conn watchdog: recovery already pending\n");
+		return;
+	}
+
+	if (time_before(jiffies, ar->conn_watchdog_last_recovery +
+			msecs_to_jiffies(ATH10K_CONN_WATCHDOG_RETRY_MS))) {
+		ath10k_dbg(ar, ATH10K_DBG_MAC,
+			   "conn watchdog: recovery rate limited\n");
+		return;
+	}
+
+	ar->conn_watchdog_last_recovery = jiffies;
+
+	ath10k_warn(ar, "firmware auth engine not responding, restarting hardware\n");
+	ath10k_core_start_recovery(ar);
+}
+
+static void ath10k_mac_op_mgd_prepare_tx(struct ieee80211_hw *hw,
+					 struct ieee80211_vif *vif,
+					 struct ieee80211_prep_tx_info *info)
+{
+	struct ath10k *ar = hw->priv;
+
+	if (!ath10k_conn_watchdog_fails)
+		return;
+
+	if (info->subtype != IEEE80211_STYPE_AUTH)
+		return;
+
+	/* Only watch (re)connection attempts, not roams of an already
+	 * associated interface.
+	 */
+	if (vif->cfg.assoc)
+		return;
+
+	ath10k_conn_watchdog_arm(ar);
+}
+
+static void ath10k_mac_op_mgd_complete_tx(struct ieee80211_hw *hw,
+					  struct ieee80211_vif *vif,
+					  struct ieee80211_prep_tx_info *info)
+{
+	struct ath10k *ar = hw->priv;
+
+	/* The management frame exchange finished - either an auth response
+	 * came back, or the attempt was abandoned locally.  Either way it
+	 * must not be counted as an unanswered attempt.
+	 */
+	ath10k_conn_watchdog_clear(ar);
+}
+
 static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
 				    struct ieee80211_vif *vif,
 				    struct ieee80211_bss_conf *info,
@@ -6349,6 +6473,12 @@ static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
 				ath10k_monitor_stop(ar);
 			ath10k_bss_assoc(hw, vif, info);
 			ath10k_monitor_recalc(ar);
+
+			/* F6: a successful association means the auth engine
+			 * works; clear the watchdog.
+			 */
+			ath10k_conn_watchdog_clear(ar);
+			cancel_delayed_work(&ar->conn_watchdog_work);
 		} else {
 			ath10k_bss_disassoc(hw, vif);
 		}
@@ -9555,6 +9685,8 @@ static const struct ieee80211_ops ath10k_ops = {
 	.remove_interface		= ath10k_remove_interface,
 	.configure_filter		= ath10k_configure_filter,
 	.bss_info_changed		= ath10k_bss_info_changed,
+	.mgd_prepare_tx			= ath10k_mac_op_mgd_prepare_tx,
+	.mgd_complete_tx		= ath10k_mac_op_mgd_complete_tx,
 	.set_coverage_class		= ath10k_mac_op_set_coverage_class,
 	.hw_scan			= ath10k_hw_scan,
 	.cancel_hw_scan			= ath10k_cancel_hw_scan,

@@ -1216,6 +1216,14 @@ struct ath10k {
 	/* continuous recovery fail count */
 	atomic_t fail_cont_count;
 
+	/* F6: watchdog for an unresponsive firmware authentication engine.
+	 * Protected by data_lock.
+	 */
+	struct delayed_work conn_watchdog_work;
+	unsigned long conn_watchdog_last_recovery;
+	unsigned int conn_watchdog_fails;
+	bool conn_watchdog_noresp;
+
 	/* cycle count is reported twice for each visited channel during scan.
 	 * access protected by data_lock
 	 */
@@ -1339,6 +1347,7 @@ static inline bool ath10k_peer_stats_enabled(struct ath10k *ar)
 
 extern unsigned int ath10k_frame_mode;
 extern unsigned long ath10k_coredump_mask;
+extern unsigned int ath10k_conn_watchdog_fails;
 
 void ath10k_core_napi_sync_disable(struct ath10k *ar);
 void ath10k_core_napi_enable(struct ath10k *ar);
