@@ -3174,6 +3174,36 @@ static void ath10k_bss_assoc(struct ieee80211_hw *hw,
 
 	ath10k_mac_set_sar_power(ar);
 
+	/* F2 experiment (see 问题排查与修复记录.md): configure the firmware
+	 * beacon-miss engine with the same values the stock stack uses on
+	 * this device. The OEM WCNSS_qcom_cfg.ini (VENDOR_EDIT block,
+	 * Yadong.Hu 2017/04/20) sets gRoamBmissFirstBcnt=10 and
+	 * gRoamBmissFinalBcnt=20 ("10 and 20 means 30 beacon miss, then maybe
+	 * trigger disconnect"). Without these vdev params the WCN3990
+	 * firmware (WLAN.HL.1.0.1.c2.1-00098) never reports
+	 * WMI_ROAM_REASON_BEACON_MISS, so mac80211 never learns that the AP
+	 * vanished silently (假连接 相①).
+	 */
+	ret = ath10k_wmi_vdev_set_param(ar, arvif->vdev_id,
+					ar->wmi.vdev_param->bmiss_first_bcnt,
+					10);
+	if (ret)
+		ath10k_warn(ar, "f2: failed to set bmiss first bcnt on vdev %i: %d\n",
+			    arvif->vdev_id, ret);
+	else
+		ath10k_info(ar, "f2: bmiss_first_bcnt=10 applied on vdev %i\n",
+			    arvif->vdev_id);
+
+	ret = ath10k_wmi_vdev_set_param(ar, arvif->vdev_id,
+					ar->wmi.vdev_param->bmiss_final_bcnt,
+					20);
+	if (ret)
+		ath10k_warn(ar, "f2: failed to set bmiss final bcnt on vdev %i: %d\n",
+			    arvif->vdev_id, ret);
+	else
+		ath10k_info(ar, "f2: bmiss_final_bcnt=20 applied on vdev %i\n",
+			    arvif->vdev_id);
+
 	/* Workaround: Some firmware revisions (tested with qca6174
 	 * WLAN.RM.2.0-00073) have buggy powersave state machine and must be
 	 * poked with peer param command.
