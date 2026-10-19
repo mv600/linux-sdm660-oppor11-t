@@ -123,49 +123,10 @@
 		 * (level 9 = 4068000) was even below the 588 MHz vote.
 		 */
 
-		/*
-		 * r11t (mv600): keep every GPU OPP on the *same* RPM level on
-		 * purpose.
-		 *
-		 * The GPU is the only consumer of the VDDMX rail on sdm660 and
-		 * the Adreno 5xx driver has no GPU regulator of its own (see the
-		 * note at the top of this table), so the OPP core programs the MX
-		 * rail voltage *only* by pushing this property into the rpmpd
-		 * domain:
-		 *
-		 *   _set_opp_level() -> dev_pm_domain_set_performance_state()
-		 *                    -> rpmpd RPMPD_VDDMX (RPM "mx" level)
-		 *
-		 * Measured on the device: with the GPU pinned to 647 MHz the "mx"
-		 * domain reports performance state 320 = RPM_SMD_LEVEL_NOM_PLUS,
-		 * i.e. every GPU OPP really is an MX rail voltage step.  Under
-		 * ondemand the rail was being rammed between MIN_SVS (48) and
-		 * NOM_PLUS (320) thousands of times (trans_stat: 1288
-		 * transitions) and those VDDMX voltage transitions are what
-		 * reboots/hangs this board.
-		 *
-		 * Raising every OPP to NOM_PLUS - the level the top, proven-good
-		 * 647 MHz OPP already used - freezes the rail: the core clock
-		 * still scales through devfreq/ondemand, but no OPP change can
-		 * move VDDMX any more, so frequency switching can no longer glitch
-		 * it.  Cost: MX no longer droops at low clocks; that is acceptable
-		 * here, the alternative is reboots.
-		 *
-		 * The interconnect votes are unaffected: ICC bandwidth comes from
-		 * opp-peak-kBps through _set_opp_bw()/icc_set_bw(), the ICC
-		 * framework never looks at opp-level (dev_pm_opp_find_level* is
-		 * not used there), so several frequencies may share one level.
-		 * Keep opp-peak-kBps distinct per OPP.
-		 *
-		 * Original levels, for reference / to undo:
-		 *   647 NOM_PLUS, 588 NOM, 465 SVS_PLUS, 430 SVS_PLUS,
-		 *   370 SVS, 266 LOW_SVS, 160 MIN_SVS, 19.2 MIN_SVS
-		 */
-
 		/* bins 157,146,135 -> bits 6,5,4 */
 		opp-588000000 {
 			opp-hz = /bits/ 64 <588000000>;
-			opp-level = <RPM_SMD_LEVEL_NOM_PLUS>;
+			opp-level = <RPM_SMD_LEVEL_NOM>;
 			opp-peak-kBps = <5184000>;
 			opp-supported-hw = <0x70>;
 		};
@@ -173,7 +134,7 @@
 		/* bins 157,146,135,122 -> bits 6,5,4,3 */
 		opp-465000000 {
 			opp-hz = /bits/ 64 <465000000>;
-			opp-level = <RPM_SMD_LEVEL_NOM_PLUS>;
+			opp-level = <RPM_SMD_LEVEL_SVS_PLUS>;
 			opp-peak-kBps = <4068000>;
 			opp-supported-hw = <0x78>;
 		};
@@ -181,7 +142,7 @@
 		/* this one is for SDM636 with bin 90, bit 2 */
 		opp-430000000 {
 			opp-hz = /bits/ 64 <430000000>;
-			opp-level = <RPM_SMD_LEVEL_NOM_PLUS>;
+			opp-level = <RPM_SMD_LEVEL_SVS_PLUS>;
 			opp-peak-kBps = <2724000>;
 			opp-supported-hw = <0x4>;
 		};
@@ -189,21 +150,21 @@
 		/* 370 MHz and below are supported in all bins */
 		opp-370000000 {
 			opp-hz = /bits/ 64 <370000000>;
-			opp-level = <RPM_SMD_LEVEL_NOM_PLUS>;
+			opp-level = <RPM_SMD_LEVEL_SVS>;
 			opp-peak-kBps = <3072000>;
 			opp-supported-hw = <0xff>;
 		};
 
 		opp-266000000 {
 			opp-hz = /bits/ 64 <266000000>;
-			opp-level = <RPM_SMD_LEVEL_NOM_PLUS>;
+			opp-level = <RPM_SMD_LEVEL_LOW_SVS>;
 			opp-peak-kBps = <1648000>;
 			opp-supported-hw = <0xff>;
 		};
 
 		opp-160000000 {
 			opp-hz = /bits/ 64 <160000000>;
-			opp-level = <RPM_SMD_LEVEL_NOM_PLUS>;
+			opp-level = <RPM_SMD_LEVEL_MIN_SVS>;
 			opp-peak-kBps = <1200000>;
 			opp-supported-hw = <0xff>;
 		};
@@ -211,7 +172,7 @@
 		/* Idle, parented to gpucc_cxo */
 		opp-19200000 {
 			opp-hz = /bits/ 64 <19200000>;
-			opp-level = <RPM_SMD_LEVEL_NOM_PLUS>;
+			opp-level = <RPM_SMD_LEVEL_MIN_SVS>;
 			opp-peak-kBps = <1200000>;
 			opp-supported-hw = <0xff>;
 		};
