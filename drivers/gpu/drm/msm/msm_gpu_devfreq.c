@@ -12,22 +12,31 @@
 #include <linux/math64.h>
 #include <linux/units.h>
 
+static unsigned long get_freq(struct msm_gpu *gpu);
+
 /*
- * Hold back GPU frequency changes (together with the ICC bandwidth
- * vote that dev_pm_opp_set_rate() applies alongside them) for at most
- * this many consecutive devfreq polling intervals (polling_ms = 50, so
- * about 10s) while the GPU stays busy.  If no idle->active
- * transition shows up to apply the change at a safe point, apply it
- * anyway rather than freezing the frequency forever.
+ * Hold back GPU *downward* frequency changes (together with the ICC
+ * bandwidth vote and voltage corner that dev_pm_opp_set_rate()
+ * applies alongside them) while the GPU stays busy, releasing them at
+ * the next idle->active safe point, for at most this many consecutive
+ * devfreq polling intervals (polling_ms = 50, so about 10s).
  *
- * The original fuse of 8 intervals (~400ms) proved far too eager: on
- * parts without a GMU to quiesce the GPU (a5xx/sdm660) the forced
- * mid-busy switch is exactly the corruption this deferral exists to
- * prevent, and a 60s scroll trace showed 45% of applied switches
- * landing in the fuse window with the GPU fully loaded, which is why
- * the fix had no visible effect.  Continuous busy stretches longer
- * than a few seconds are not a realistic workload, so this now only
- * acts as a last-resort anti-freeze ceiling.
+ * Direction decides safety: a downward move takes the clock, the
+ * bandwidth vote and the voltage corner all in the dangerous
+ * direction underneath commands still in flight, while an upward move
+ * only increases every one of those quantities (more margin, never
+ * less), so upclocks are applied immediately.  Deferring them as well
+ * stalls rendering for as long as the GPU stays busy, and a 60s
+ * scroll trace with both directions deferred measured two stretches
+ * of ~10s with zero safe points where the GPU sat at 19.2MHz under
+ * load 99-100 until the fuse fired - scrolling with continuous busy
+ * never reaches an idle->active transition.
+ *
+ * The fuse only bounds the downward deferral, as a last-resort
+ * anti-freeze ceiling: the original 8 intervals (~400ms) proved far
+ * too eager (45% of applied switches landed mid-busy during a 60s
+ * scroll), and 200 intervals only fire on pathological sustained busy
+ * stretches where the alternative is freezing the frequency forever.
  */
 #define MAX_DEFERRED_FREQ_CHANGES 200
 
@@ -71,24 +80,46 @@ static int msm_devfreq_target(struct device *dev, unsigned long *freq,
 	 * commands that are still in flight, and on hardware whose
 	 * regulators only have partial support (see the sdm660 OPP
 	 * table) that can corrupt whatever the GPU is rendering at
-	 * that instant.  Hold the change back until the next
-	 * idle->active transition, the same safe point the idle
-	 * shadow above uses, instead of switching underneath active
-	 * rendering.  Parts with a GMU (gpu_set_freq) sequence the
-	 * transition themselves and keep the existing behaviour.
+	 * that instant - but only when the move is downward: a raise
+	 * adds clock, bandwidth and voltage margin and is safe to apply
+	 * at any time.  Hold a downward change back until the next
+	 * idle->active transition, the same safe point the idle shadow
+	 * above uses; apply an upward change immediately so that
+	 * scrolling never waits for a safe point that continuous busy
+	 * may not offer for seconds.  Parts with a GMU (gpu_set_freq)
+	 * sequence the transition themselves and keep the existing
+	 * behaviour.
 	 */
 	if (!df->at_safe_point && !gpu->funcs->gpu_set_freq) {
-		if (++df->defer_count < MAX_DEFERRED_FREQ_CHANGES) {
-			df->pending_freq = *freq;
-			dev_pm_opp_put(opp);
-			return 0;
+		unsigned long cur = get_freq(gpu);
+
+		if (*freq < cur) {
+			if (++df->defer_count < MAX_DEFERRED_FREQ_CHANGES) {
+				df->pending_freq = *freq;
+				dev_pm_opp_put(opp);
+				return 0;
+			}
+			/*
+			 * The GPU stayed busy for too long to wait for a
+			 * safe point; apply the down-change anyway.  One
+			 * switch is better than freezing the frequency
+			 * forever, and if the target did not actually move
+			 * this is a no-op anyway.
+			 */
+		} else {
+			/*
+			 * Upward (or no-op): newer than anything deferred
+			 * while the GPU was busy, so it supersedes it and
+			 * the switch happens right here.  Nothing needs the
+			 * fuse, so reset the down-deferral streak too.
+			 */
+			df->pending_freq = 0;
+			df->defer_count = 0;
+			if (*freq == cur) {
+				dev_pm_opp_put(opp);
+				return 0;
+			}
 		}
-		/*
-		 * The GPU stayed busy for too long to wait for a safe
-		 * point; apply the change anyway.  One switch is better
-		 * than freezing the frequency, and if the target did not
-		 * actually move this is a no-op anyway.
-		 */
 	}
 	df->defer_count = 0;
 
