@@ -600,6 +600,42 @@ static void _dpu_crtc_complete_flip(struct drm_crtc *crtc)
 	struct drm_device *dev = crtc->dev;
 	unsigned long flags;
 
+	/*
+	 * R11T: rather than handing the page-flip event back at kickoff, let
+	 * the vblank interrupt deliver it, i.e. at the frame boundary at which
+	 * the panel picks the new frame up.  Userspace must not be told that a
+	 * flip completed before the new buffer is on screen: if it is, the
+	 * compositor re-uses that buffer (or drops its framebuffer) while the
+	 * DPU is still scanning it, which shows as a one-frame artifact.
+	 *
+	 * drm_crtc_arm_vblank_event() does not take a vblank reference in this
+	 * tree, but drm_handle_vblank_events() drops one when it delivers the
+	 * event, so take it here - that also keeps the vblank interrupt running
+	 * until the event has really been delivered.  It can enable the vblank,
+	 * so it has to be called before taking event_lock.
+	 */
+	if (dpu_crtc->event && msm_flip_complete_at_vblank() &&
+			!drm_crtc_vblank_get(crtc)) {
+		bool armed = false;
+
+		spin_lock_irqsave(&dev->event_lock, flags);
+		if (dpu_crtc->event) {
+			DRM_DEBUG_VBL("%s: arm event: %p\n", dpu_crtc->name,
+				      dpu_crtc->event);
+			trace_dpu_crtc_complete_flip(DRMID(crtc));
+			drm_crtc_arm_vblank_event(crtc, dpu_crtc->event);
+			dpu_crtc->event = NULL;
+			armed = true;
+		}
+		spin_unlock_irqrestore(&dev->event_lock, flags);
+
+		if (armed)
+			return;
+
+		/* nothing to arm: give the vblank reference back */
+		drm_crtc_vblank_put(crtc);
+	}
+
 	spin_lock_irqsave(&dev->event_lock, flags);
 	if (dpu_crtc->event) {
 		DRM_DEBUG_VBL("%s: send event: %p\n", dpu_crtc->name,

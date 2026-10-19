@@ -16,7 +16,7 @@
 
 /*
  * R11T (SDM660) display bring-up experiment.  See the host-side bring-up log
- * (section 7.24) for the measurements behind it.
+ * (sections 7.24 and 20) for the measurements behind it.
  *
  * msm_atomic_commit_tail() waits for the flush twice: once at the very
  * beginning, before the plane state is programmed into the hardware, and once
@@ -25,16 +25,47 @@
  * the DPU to finish pushing the frame to the command-mode panel.  The first
  * wait is what protects the frame that may still be in flight, so it is kept.
  *
- * Skipping the post-flush wait hands the flip_done event back to userspace one
- * frame earlier, which lets the compositor render the next frame while the DPU
- * is still transferring the previous one.  Keep 0 (upstream behaviour) unless
- * measuring:
- *   echo 1 > /sys/module/msm/parameters/msm_skip_post_flush_wait
+ * The page-flip completion event is what tells the compositor that the buffer
+ * it queued is on screen, so *when* it is delivered matters as much as how
+ * fast the commit itself returns:
+ *
+ *   0  upstream: wait for the frame to reach the panel and complete the flip
+ *      only afterwards.  Nothing can be reused early, but the compositor
+ *      cannot start the next frame until the panel has taken this one, which
+ *      costs a whole frame and halves the frame rate to ~30fps.
+ *   1  skip the wait and complete the flip at kickoff.  The commit pipeline
+ *      never blocks so the compositor keeps ~60fps, but userspace is told the
+ *      flip is done up to a full frame before the DPU has latched the new
+ *      buffer; it then re-uses that buffer (or drops the framebuffer) while
+ *      the DPU is still scanning it, which shows up as a one-frame colorful
+ *      artifact that clears itself.
+ *   2  skip the blocking wait, but complete the flip from the vblank
+ *      interrupt, i.e. exactly at the frame boundary at which the panel picks
+ *      the new frame up.  Userspace learns about the flip at the same point as
+ *      in case 0, so the buffer is not reused early, yet the commit pipeline
+ *      is never held up, so the ~60fps of case 1 is kept.
+ *
+ * The value is writable at runtime, e.g.
+ *   echo 2 > /sys/module/msm/parameters/msm_skip_post_flush_wait
  */
-static bool msm_skip_post_flush_wait;
-module_param(msm_skip_post_flush_wait, bool, 0644);
+#define MSM_POST_FLUSH_WAIT			0
+#define MSM_POST_FLUSH_SKIP			1
+#define MSM_POST_FLUSH_SKIP_EVENT_AT_VBLANK	2
+
+static unsigned int msm_skip_post_flush_wait = MSM_POST_FLUSH_WAIT;
+module_param(msm_skip_post_flush_wait, uint, 0644);
 MODULE_PARM_DESC(msm_skip_post_flush_wait,
-	"msm: skip the post-flush wait in msm_atomic_commit_tail() (default=0, upstream behaviour)");
+	"msm: 0=wait for the frame to reach the panel (upstream, default), 1=skip the post-flush wait (page-flip completed early), 2=skip the wait and complete the flip from the vblank interrupt");
+
+/*
+ * True when the post-flush wait is skipped and the page-flip completion is
+ * delivered from the vblank interrupt instead of at kickoff (value 2 above).
+ * Used by dpu_crtc.c, which is where the page-flip event is handed back.
+ */
+bool msm_flip_complete_at_vblank(void)
+{
+	return msm_skip_post_flush_wait == MSM_POST_FLUSH_SKIP_EVENT_AT_VBLANK;
+}
 
 /*
  * Helpers to control vblanks while we flush.. basically just to ensure
@@ -331,7 +362,7 @@ fallback:
 	 * Wait for flush to complete:
 	 */
 	trace_msm_atomic_wait_flush_start(crtc_mask);
-	if (!msm_skip_post_flush_wait)
+	if (msm_skip_post_flush_wait == MSM_POST_FLUSH_WAIT)
 		kms->funcs->wait_flush(kms, crtc_mask);
 	trace_msm_atomic_wait_flush_finish(crtc_mask);
 

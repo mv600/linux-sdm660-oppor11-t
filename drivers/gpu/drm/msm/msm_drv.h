@@ -37,6 +37,12 @@
 extern struct fault_attr fail_gem_alloc;
 extern struct fault_attr fail_gem_iova;
 
+/*
+ * R11T bring-up: true when the page-flip completion should be delivered from
+ * the vblank interrupt instead of at kickoff (see msm_atomic.c).
+ */
+bool msm_flip_complete_at_vblank(void);
+
 struct drm_fb_helper;
 struct drm_fb_helper_surface_size;
 
