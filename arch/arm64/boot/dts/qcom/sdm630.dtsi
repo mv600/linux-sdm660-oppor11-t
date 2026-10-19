@@ -1127,7 +1127,7 @@
 				"rbcpr",
 				"core";
 
-			power-domains = <&rpmpd RPMPD_VDDMX>;
+			power-domains = <&rpmpd RPMPD_VDDCX>;
 			iommus = <&kgsl_smmu 0>;
 
 			nvmem-cells = <&gpu_speed_bin>;
