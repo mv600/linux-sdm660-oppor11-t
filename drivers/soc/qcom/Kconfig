@@ -160,6 +160,22 @@ config QCOM_R11T_MEMSHARE
 	  Provide the Dynamic Heap Memory Share QMI service required by the
 	  OPPO R11T modem firmware during early startup.
 
+config QCOM_R11T_GFX_MEM_ACC
+	tristate "OPPO R11T (SDM660) GPU mem-acc level register (experiment)"
+	depends on ARCH_QCOM || COMPILE_TEST
+	depends on DEBUG_FS
+	help
+	  Maps the SDM660 "acc-sel-l1" register at 0x01fcf004 and exposes the
+	  GPU "mem-acc" level (1 or 2) through
+	  /sys/kernel/debug/qcom_r11t_gfx_mem_acc/{raw,level}.
+
+	  The vendor GPU corner table (qcom,mem-acc-voltage = <1 1 1 2 2 2 2>)
+	  asks for mem-acc level 2 from 465 MHz upwards, but this tree never
+	  writes the bit.  The module writes nothing at load time and restores
+	  the baseline on unload; it exists to A/B the missing level.
+
+	  Say N unless you are running that experiment.
+
 config QCOM_RPM_MASTER_STATS
 	tristate "Qualcomm RPM Master stats"
 	depends on ARCH_QCOM || COMPILE_TEST

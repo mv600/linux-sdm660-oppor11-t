@@ -20,6 +20,7 @@ obj-$(CONFIG_QCOM_RAMP_CTRL)	+= ramp_controller.o
 obj-$(CONFIG_QCOM_RMTFS_MEM)	+= rmtfs_mem.o
 obj-$(CONFIG_QCOM_R11T_MEMSHARE) += qcom-r11t-memshare.o
 qcom-r11t-memshare-y := qcom_r11t_memshare.o qcom_r11t_memshare_qmi.o
+obj-$(CONFIG_QCOM_R11T_GFX_MEM_ACC) += qcom_r11t_gfx_mem_acc.o
 obj-$(CONFIG_QCOM_RPM_MASTER_STATS)	+= rpm_master_stats.o
 obj-$(CONFIG_QCOM_RPMH)		+= qcom_rpmh.o
 qcom_rpmh-y			+= rpmh-rsc.o
