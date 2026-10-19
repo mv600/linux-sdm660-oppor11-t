@@ -16,11 +16,20 @@
  * Hold back GPU frequency changes (together with the ICC bandwidth
  * vote that dev_pm_opp_set_rate() applies alongside them) for at most
  * this many consecutive devfreq polling intervals (polling_ms = 50, so
- * about 400ms) while the GPU stays busy.  If no idle->active
+ * about 10s) while the GPU stays busy.  If no idle->active
  * transition shows up to apply the change at a safe point, apply it
  * anyway rather than freezing the frequency forever.
+ *
+ * The original fuse of 8 intervals (~400ms) proved far too eager: on
+ * parts without a GMU to quiesce the GPU (a5xx/sdm660) the forced
+ * mid-busy switch is exactly the corruption this deferral exists to
+ * prevent, and a 60s scroll trace showed 45% of applied switches
+ * landing in the fuse window with the GPU fully loaded, which is why
+ * the fix had no visible effect.  Continuous busy stretches longer
+ * than a few seconds are not a realistic workload, so this now only
+ * acts as a last-resort anti-freeze ceiling.
  */
-#define MAX_DEFERRED_FREQ_CHANGES 8
+#define MAX_DEFERRED_FREQ_CHANGES 200
 
 /*
  * Power Management:
