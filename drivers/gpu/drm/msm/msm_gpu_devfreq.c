@@ -13,6 +13,16 @@
 #include <linux/units.h>
 
 /*
+ * Hold back GPU frequency changes (together with the ICC bandwidth
+ * vote that dev_pm_opp_set_rate() applies alongside them) for at most
+ * this many consecutive devfreq polling intervals (polling_ms = 50, so
+ * about 400ms) while the GPU stays busy.  If no idle->active
+ * transition shows up to apply the change at a safe point, apply it
+ * anyway rather than freezing the frequency forever.
+ */
+#define MAX_DEFERRED_FREQ_CHANGES 8
+
+/*
  * Power Management:
  */
 
@@ -31,17 +41,49 @@ static int msm_devfreq_target(struct device *dev, unsigned long *freq,
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
 
-	trace_msm_gpu_freq_change(dev_pm_opp_get_freq(opp));
-
 	/*
 	 * If the GPU is idle, devfreq is not aware, so just stash
-	 * the new target freq (to use when we return to active)
+	 * the new target freq (to use when we return to active).
+	 * It is newer than anything deferred while the GPU was busy,
+	 * so it supersedes a pending change.
 	 */
 	if (df->idle_freq) {
+		df->pending_freq = 0;
+		df->defer_count = 0;
 		df->idle_freq = *freq;
 		dev_pm_opp_put(opp);
 		return 0;
 	}
+
+	/*
+	 * Without a GMU to sequence the transition there is nothing
+	 * that quiesces the GPU before dev_pm_opp_set_rate() switches
+	 * the GPUCC clock and the ICC bandwidth vote underneath
+	 * commands that are still in flight, and on hardware whose
+	 * regulators only have partial support (see the sdm660 OPP
+	 * table) that can corrupt whatever the GPU is rendering at
+	 * that instant.  Hold the change back until the next
+	 * idle->active transition, the same safe point the idle
+	 * shadow above uses, instead of switching underneath active
+	 * rendering.  Parts with a GMU (gpu_set_freq) sequence the
+	 * transition themselves and keep the existing behaviour.
+	 */
+	if (!df->at_safe_point && !gpu->funcs->gpu_set_freq) {
+		if (++df->defer_count < MAX_DEFERRED_FREQ_CHANGES) {
+			df->pending_freq = *freq;
+			dev_pm_opp_put(opp);
+			return 0;
+		}
+		/*
+		 * The GPU stayed busy for too long to wait for a safe
+		 * point; apply the change anyway.  One switch is better
+		 * than freezing the frequency, and if the target did not
+		 * actually move this is a no-op anyway.
+		 */
+	}
+	df->defer_count = 0;
+
+	trace_msm_gpu_freq_change(dev_pm_opp_get_freq(opp));
 
 	if (gpu->funcs->gpu_set_freq) {
 		mutex_lock(&df->lock);
@@ -321,9 +363,25 @@ void msm_devfreq_active(struct msm_gpu *gpu)
 	 * We could have become active again before the idle work had a
 	 * chance to run, in which case the df->idle_freq would have
 	 * still been zero.  In this case, no need to change freq.
+	 *
+	 * The GPU is idle right here (this runs before the first submit
+	 * is kicked), so this is a safe point to change the clock and
+	 * the bandwidth vote: apply both the idle shadow and whatever
+	 * frequency change was deferred while the GPU was busy.
 	 */
+	df->at_safe_point = true;
+
 	if (target_freq)
 		msm_devfreq_target(&gpu->pdev->dev, &target_freq, 0);
+
+	if (df->pending_freq) {
+		target_freq = df->pending_freq;
+		df->pending_freq = 0;
+		msm_devfreq_target(&gpu->pdev->dev, &target_freq, 0);
+	}
+
+	df->at_safe_point = false;
+	df->defer_count = 0;
 
 	mutex_unlock(&df->devfreq->lock);
 
@@ -354,11 +412,26 @@ static void msm_devfreq_idle_work(struct kthread_work *work)
 
 	idle_freq = get_freq(gpu);
 
-	if (priv->gpu_clamp_to_idle)
+	/*
+	 * The GPU is idle here, so a debugfs-requested clamp must be
+	 * applied directly rather than deferred (see
+	 * msm_devfreq_target()).
+	 */
+	if (priv->gpu_clamp_to_idle) {
+		df->at_safe_point = true;
 		msm_devfreq_target(&gpu->pdev->dev, &target_freq, 0);
+		df->at_safe_point = false;
+	}
 
 	df->idle_time = ktime_get();
 	df->idle_freq = idle_freq;
+	/*
+	 * Not clearing df->pending_freq here: a change deferred while
+	 * the GPU was busy must survive until the next
+	 * idle->active transition applies it (msm_devfreq_active()),
+	 * unless the governor stashes a newer target while idle.
+	 */
+	df->defer_count = 0;
 
 	mutex_unlock(&df->devfreq->lock);
 }

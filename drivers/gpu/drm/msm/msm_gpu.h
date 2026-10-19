@@ -130,6 +130,30 @@ struct msm_gpu_devfreq {
 	 */
 	unsigned long idle_freq;
 	/**
+	 * @pending_freq:
+	 * Frequency change requested by the devfreq governor while the GPU
+	 * was busy, held back until the next idle->active transition, so
+	 * that the clock and the ICC bandwidth vote are never changed
+	 * underneath commands in flight (see msm_devfreq_target()).
+	 * Zero when there is nothing to apply.
+	 */
+	unsigned long pending_freq;
+	/**
+	 * @defer_count:
+	 * Number of consecutive frequency changes deferred while the GPU
+	 * stayed busy.  Once it reaches MAX_DEFERRED_FREQ_CHANGES (see
+	 * msm_gpu_devfreq.c) the next change is applied directly, so a
+	 * continuously busy GPU cannot get stuck at a stale frequency.
+	 */
+	unsigned int defer_count;
+	/**
+	 * @at_safe_point:
+	 * Set while the caller invokes msm_devfreq_target() at a point
+	 * where the GPU is idle (msm_devfreq_active(),
+	 * msm_devfreq_idle_work()), bypassing the deferral.
+	 */
+	bool at_safe_point;
+	/**
 	 * @boost_freq:
 	 * A PM QoS constraint to boost min freq for a period of time
 	 * until the boost expires.
