@@ -1101,19 +1101,32 @@ static void a5xx_recover(struct msm_gpu *gpu)
 			a5xx_gpu->fault_rb_window[2], a5xx_gpu->fault_rb_window[3],
 			a5xx_gpu->fault_rb_window[4], a5xx_gpu->fault_rb_window[5],
 			a5xx_gpu->fault_rb_window[6], a5xx_gpu->fault_rb_window[7]);
-	} else {
+	} else if (!gpu->hw_dead) {
 		adreno_dump_info(gpu);
 
 		for (i = 0; i < 8; i++) {
 			printk("CP_SCRATCH_REG%d: %u\n", i,
 				gpu_read(gpu, REG_A5XX_CP_SCRATCH_REG(i)));
 		}
+	} else {
+		/*
+		 * No fault snapshot and MMIO is embargoed (a hangcheck
+		 * timeout wedged the CP without a MISC_HANG_DETECT fault to
+		 * snapshot from).  The register bus may be dead, so skip
+		 * every diagnostic read here: get_rptr(), the scratch
+		 * registers and the full register dump all do MMIO and would
+		 * stall this CPU forever, which is exactly what recovery is
+		 * supposed to prevent.
+		 */
+		dev_warn_once(gpu->dev->dev,
+			"%s: gpu mmio unsafe during recovery, skipping diagnostics\n",
+			gpu->name);
 	}
 
 	/* A full register dump is exactly what we must avoid on the fault
 	 * path: it walks the whole register file over a bus that may already
 	 * be dead. */
-	if (hang_debug && !a5xx_gpu->fault_snapshot_valid)
+	if (hang_debug && !a5xx_gpu->fault_snapshot_valid && !gpu->hw_dead)
 		a5xx_dump(gpu);
 
 	/*
@@ -1426,6 +1439,34 @@ static void a5xx_fault_detect_irq(struct msm_gpu *gpu)
 	timer_delete(&gpu->hangcheck_timer);
 
 	kthread_queue_work(gpu->worker, &gpu->recover_work);
+}
+
+/*
+ * Called by the hangcheck timer once it has proven the CP is wedged (the
+ * ringbuffer fence has not moved and the GPU reports no progress).  Unlike
+ * a MISC_HANG_DETECT fault there is no interrupt to snapshot the registers
+ * from, and by this point the register bus may already have stopped
+ * answering: the CP wedging and the interconnect wedging are the same
+ * event on this target.  Forbid MMIO so the recovery worker (which runs
+ * with gpu->lock held) only touches system memory backed state instead of
+ * stalling forever on a readl() that will never return.
+ *
+ * The recovery callback (a5xx_recover()) clears hw_dead once the RBBM
+ * reset has brought the GPU back.
+ */
+static void a5xx_hang_dead(struct msm_gpu *gpu)
+{
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
+
+	/*
+	 * No valid snapshot exists for a hangcheck timeout (the fault
+	 * interrupt never fired), so crash capture must not fall back to
+	 * stale fault_* registers either -- those are only meaningful when
+	 * fault_snapshot_valid is set.
+	 */
+	a5xx_gpu->fault_snapshot_valid = false;
+	gpu->hw_dead = true;
 }
 
 #define RBBM_ERROR_MASK \
@@ -2020,6 +2061,7 @@ const struct adreno_gpu_funcs a5xx_gpu_funcs = {
 		.submit = a5xx_submit,
 		.active_ring = a5xx_active_ring,
 		.irq = a5xx_irq,
+		.hang_dead = a5xx_hang_dead,
 		.destroy = a5xx_destroy,
 #if defined(CONFIG_DEBUG_FS) || defined(CONFIG_DEV_COREDUMP)
 		.show = a5xx_show,

@@ -672,6 +672,16 @@ static void hangcheck_handler(struct timer_list *t)
 		DRM_DEV_ERROR(dev->dev, "%s:     submitted fence: %u\n",
 				gpu->name, ring->fctx->last_fence);
 
+		/*
+		 * The CP has stopped draining the ringbuffer.  Give the
+		 * target a chance to embargo MMIO before the recover worker
+		 * runs: on some targets a register read can stall forever
+		 * once the CP is wedged, and the worker would then hang with
+		 * gpu->lock held, so recovery would never happen.
+		 */
+		if (gpu->funcs->hang_dead)
+			gpu->funcs->hang_dead(gpu);
+
 		kthread_queue_work(gpu->worker, &gpu->recover_work);
 	}
 

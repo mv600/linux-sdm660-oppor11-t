@@ -92,6 +92,23 @@ struct msm_gpu_funcs {
 	 * for cmdstream that is buffered in this FIFO upstream of the CP fw.
 	 */
 	bool (*progress)(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+
+	/**
+	 * hang_dead: Optional hook called from the hangcheck timer once a
+	 * lockup has been confirmed (the CP has stopped draining the
+	 * ringbuffer) but before the recover worker is queued.
+	 *
+	 * A hangcheck timeout means the command processor is wedged.  On
+	 * targets where the interconnect can stop answering register reads
+	 * at that point, the driver must mark the hardware as unsafe to
+	 * touch with MMIO (gpu->hw_dead) here: there is no fault interrupt
+	 * to take a register snapshot, and the recovery path would otherwise
+	 * stall forever on a single readl() while holding gpu->lock, which
+	 * hard-locks the CPU and never recovers.  With hw_dead set, crash
+	 * capture and recovery fall back to system memory backed state.
+	 */
+	void (*hang_dead)(struct msm_gpu *gpu);
+
 	void (*sysprof_setup)(struct msm_gpu *gpu);
 };
 
