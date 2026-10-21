@@ -22,100 +22,30 @@
 
 /*
  * GPU Snapshot:
+ *
+ * The "gpu" debugfs file has been removed on this target.  Opening it used
+ * to:
+ *
+ *   1. take gpu->lock,
+ *   2. pm_runtime_get_sync() + msm_gpu_hw_init(), which touches MMIO
+ *      (on a5xx a5xx_hw_init() starts with an RBBM software reset), and
+ *   3. only then call gpu_state_get(), which is where gpu->hw_dead is
+ *      finally consulted.
+ *
+ * A read of the whole a5xx register file stalls forever once the GPU bus
+ * has stopped answering, and because steps 2 and 3 happen before the
+ * gpu->hw_dead check they run regardless of whether the fault handler or
+ * the hangcheck timer has already given up on the hardware.  The thread
+ * then holds gpu->lock forever, wedging every submit behind it (and with
+ * it the whole display pipeline) until the phone silently resets.
+ *
+ * This was reproduced twice by simply reading
+ * /sys/kernel/debug/dri/0/gpu on an otherwise idle, healthy system, so the
+ * entry is gone rather than merely guarded.  The crash capture path
+ * (msm_gpu_crashstate_capture()) still calls gpu_state_get() directly, but
+ * it does so with gpu->hw_dead already set, which makes
+ * a5xx_gpu_state_get() skip all MMIO.
  */
-
-struct msm_gpu_show_priv {
-	struct msm_gpu_state *state;
-	struct drm_device *dev;
-};
-
-static int msm_gpu_show(struct seq_file *m, void *arg)
-{
-	struct drm_printer p = drm_seq_file_printer(m);
-	struct msm_gpu_show_priv *show_priv = m->private;
-	struct msm_drm_private *priv = show_priv->dev->dev_private;
-	struct msm_gpu *gpu = priv->gpu;
-	int ret;
-
-	ret = mutex_lock_interruptible(&gpu->lock);
-	if (ret)
-		return ret;
-
-	drm_printf(&p, "%s Status:\n", gpu->name);
-	gpu->funcs->show(gpu, show_priv->state, &p);
-
-	mutex_unlock(&gpu->lock);
-
-	return 0;
-}
-
-static int msm_gpu_release(struct inode *inode, struct file *file)
-{
-	struct seq_file *m = file->private_data;
-	struct msm_gpu_show_priv *show_priv = m->private;
-	struct msm_drm_private *priv = show_priv->dev->dev_private;
-	struct msm_gpu *gpu = priv->gpu;
-
-	mutex_lock(&gpu->lock);
-	gpu->funcs->gpu_state_put(show_priv->state);
-	mutex_unlock(&gpu->lock);
-
-	kfree(show_priv);
-
-	return single_release(inode, file);
-}
-
-static int msm_gpu_open(struct inode *inode, struct file *file)
-{
-	struct drm_device *dev = inode->i_private;
-	struct msm_drm_private *priv = dev->dev_private;
-	struct msm_gpu *gpu = priv->gpu;
-	struct msm_gpu_show_priv *show_priv;
-	int ret;
-
-	if (!gpu || !gpu->funcs->gpu_state_get)
-		return -ENODEV;
-
-	show_priv = kmalloc_obj(*show_priv);
-	if (!show_priv)
-		return -ENOMEM;
-
-	ret = mutex_lock_interruptible(&gpu->lock);
-	if (ret)
-		goto free_priv;
-
-	pm_runtime_get_sync(&gpu->pdev->dev);
-	msm_gpu_hw_init(gpu);
-	show_priv->state = gpu->funcs->gpu_state_get(gpu);
-	pm_runtime_put_sync(&gpu->pdev->dev);
-
-	mutex_unlock(&gpu->lock);
-
-	if (IS_ERR(show_priv->state)) {
-		ret = PTR_ERR(show_priv->state);
-		goto free_priv;
-	}
-
-	show_priv->dev = dev;
-
-	ret = single_open(file, msm_gpu_show, show_priv);
-	if (ret)
-		goto free_priv;
-
-	return 0;
-
-free_priv:
-	kfree(show_priv);
-	return ret;
-}
-
-static const struct file_operations msm_gpu_fops = {
-	.owner = THIS_MODULE,
-	.open = msm_gpu_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = msm_gpu_release,
-};
 
 #ifdef CONFIG_DRM_MSM_KMS
 static int msm_fb_show(struct seq_file *m, void *arg)
@@ -368,9 +298,6 @@ static void msm_debugfs_gpu_init(struct drm_minor *minor)
 	struct drm_device *dev = minor->dev;
 	struct msm_drm_private *priv = dev->dev_private;
 	struct dentry *gpu_devfreq;
-
-	debugfs_create_file("gpu", S_IRUSR, minor->debugfs_root,
-		dev, &msm_gpu_fops);
 
 	debugfs_create_u32("hangcheck_period_ms", 0600, minor->debugfs_root,
 		&priv->hangcheck_period);
