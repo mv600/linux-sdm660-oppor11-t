@@ -49,18 +49,6 @@ static inline size_t buffer_start(struct persistent_ram_zone *prz)
 	return atomic_read(&prz->buffer->start);
 }
 
-static inline void notrace persistent_ram_flush(void)
-{
-	/*
-	 * Close any write-combining group before waiting for the stores to
-	 * complete.  dgh() prevents later stores from merging into this update;
-	 * wmb() then orders the data and circular-buffer metadata before a panic
-	 * can restart the machine.
-	 */
-	io_stop_wc();
-	wmb();
-}
-
 /* increase and wrap the start pointer, returning the old value */
 static size_t buffer_start_add(struct persistent_ram_zone *prz, size_t a)
 {
@@ -360,7 +348,6 @@ int notrace persistent_ram_write(struct persistent_ram_zone *prz,
 	persistent_ram_update(prz, s, start, c);
 
 	persistent_ram_update_header_ecc(prz);
-	persistent_ram_flush();
 
 	return count;
 }
@@ -391,7 +378,6 @@ int notrace persistent_ram_write_user(struct persistent_ram_zone *prz,
 		ret = persistent_ram_update_user(prz, s, start, c);
 
 	persistent_ram_update_header_ecc(prz);
-	persistent_ram_flush();
 
 	return unlikely(ret) ? ret : count;
 }
@@ -418,7 +404,6 @@ void persistent_ram_zap(struct persistent_ram_zone *prz)
 	atomic_set(&prz->buffer->start, 0);
 	atomic_set(&prz->buffer->size, 0);
 	persistent_ram_update_header_ecc(prz);
-	persistent_ram_flush();
 }
 
 #define MEM_TYPE_WCOMBINE	0
