@@ -61,6 +61,15 @@
 			reg = <0x0 0xb0000000 0x0 0x400000>;
 			console-size = <0x200000>;
 			/*
+			 * Keep the region out of the linear map so that no Normal
+			 * alias overlaps the ramoops mapping.  mem-type 1 selects an
+			 * unbuffered Device mapping instead of Normal-NC, so a hard
+			 * reset cannot strand buffered stores in a write-combining
+			 * buffer.
+			 */
+			no-map;
+			mem-type = <1>;
+			/*
 			 * record-size was 0, so pstore never produced a
 			 * dmesg-ramoops record and a panic left no kernel log
 			 * behind.  Take the 2 MiB from the unused pmsg area
