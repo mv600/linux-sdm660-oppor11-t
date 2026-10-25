@@ -88,9 +88,12 @@ struct dwc3_qcom {
 	enum usb_dr_mode	mode;
 	bool			is_suspended;
 	bool			pm_suspended;
+	bool			select_utmi_as_pipe_clk;
 	struct icc_path		*icc_path_ddr;
 	struct icc_path		*icc_path_apps;
 };
+
+static void dwc3_qcom_select_utmi_clk(struct dwc3_qcom *qcom);
 
 static inline void dwc3_qcom_setbits(void __iomem *base, u32 offset, u32 val)
 {
@@ -483,6 +486,14 @@ static int dwc3_qcom_resume(struct dwc3_qcom *qcom, bool wakeup)
 	if (ret)
 		dev_warn(qcom->dev, "failed to enable interconnect: %d\n", ret);
 
+	/*
+	 * The legacy wrapper needs the UTMI-as-PIPE selection before the DWC3
+	 * child resumes. Restoring the clocks alone leaves the controller unable
+	 * to complete EP0 SETEPCONFIG after system sleep.
+	 */
+	if (qcom->select_utmi_as_pipe_clk)
+		dwc3_qcom_select_utmi_clk(qcom);
+
 	/* Clear existing events from PHY related to L2 in/out */
 	for (i = 0; i < qcom->num_ports; i++) {
 		dwc3_qcom_setbits(qcom->qscratch_base,
@@ -736,7 +747,6 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	struct device		*dev = &pdev->dev;
 	struct dwc3_qcom	*qcom;
 	int			ret, i;
-	bool			ignore_pipe_clk;
 	bool			wakeup_source;
 
 	qcom = devm_kzalloc(&pdev->dev, sizeof(*qcom), GFP_KERNEL);
@@ -788,9 +798,9 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	 * Disable pipe_clk requirement if specified. Used when dwc3
 	 * operates without SSPHY and only HS/FS/LS modes are supported.
 	 */
-	ignore_pipe_clk = device_property_read_bool(dev,
+	qcom->select_utmi_as_pipe_clk = device_property_read_bool(dev,
 				"qcom,select-utmi-as-pipe-clk");
-	if (ignore_pipe_clk)
+	if (qcom->select_utmi_as_pipe_clk)
 		dwc3_qcom_select_utmi_clk(qcom);
 
 	ret = dwc3_qcom_of_register_core(pdev);
