@@ -2302,7 +2302,8 @@ static struct gdsc usb_30_gdsc = {
 	.pd = {
 		.name = "usb_30_gdsc",
 	},
-	.pwrsts = PWRSTS_OFF_ON,
+	/* Keep the USB power domain alive until DWC3 supports a full power cycle. */
+	.pwrsts = PWRSTS_RET_ON,
 	.flags = VOTABLE,
 };
 
