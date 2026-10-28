@@ -587,15 +587,10 @@ static int osm_setup_hw_table(struct osm_cluster *c)
  * clk_osm_set_rate() [caf:676-717]: software only writes the row number and the
  * OSM hardware plus the PMIC perform the voltage ramp.
  *
- * Do NOT read this as "the FSMs are already configured".  They are not: the
- * stock DTB carries qcom,safe-fsm-en / boost-fsm-en / wfx-fsm-en /
- * ps-fsm-en / droop-fsm-en / pc-fsm-en, but this driver neither reads those
- * six properties nor programs the matching registers that CAF programs in
- * clk_osm_init_fsm() [caf:2126-2245].  Until that is ported, only
- * ENABLE_REG and the LUT are set, so row changes are performed by the OSM
- * without the safe/boost/droop FSM ramp sequencing CAF relies on.  Expect
- * this to work for stepping between rows the LUT already covers; treat
- * anything involving a voltage excursion as unproven.
+ * The stock FSM properties are read during probe and osm_setup_fsms() programs
+ * the matching enable bits and timers before the sequencer is loaded.  A
+ * successful row write only proves that the OSM accepted the request; it does
+ * not by itself prove that every stock OSM policy knob is equivalent.
  *
  * CAF also pokes LLM_SW_OVERRIDE_REG (0x1038) around this write, but only when
  * qcom,llm-sw-overr exists in DT.  The R11 stock DTB does not carry that
