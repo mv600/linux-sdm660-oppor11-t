@@ -14,6 +14,37 @@
 
 static unsigned long get_freq(struct msm_gpu *gpu);
 
+static ssize_t gpu_busy_percent_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct msm_gpu *gpu = dev_to_gpu(dev->parent);
+	u32 busy_percent;
+
+	if (!gpu)
+		return -ENODEV;
+
+	mutex_lock(&gpu->devfreq.lock);
+	busy_percent = gpu->devfreq.busy_percent;
+	mutex_unlock(&gpu->devfreq.lock);
+
+	return sysfs_emit(buf, "%u\n", busy_percent);
+}
+static DEVICE_ATTR_RO(gpu_busy_percent);
+
+static struct attribute *msm_devfreq_attrs[] = {
+	&dev_attr_gpu_busy_percent.attr,
+	NULL,
+};
+
+static const struct attribute_group msm_devfreq_attr_group = {
+	.attrs = msm_devfreq_attrs,
+};
+
+static const struct attribute_group *msm_devfreq_attr_groups[] = {
+	&msm_devfreq_attr_group,
+	NULL,
+};
+
 /*
  * Hold back GPU *downward* frequency changes (together with the ICC
  * bandwidth vote and voltage corner that dev_pm_opp_set_rate()
@@ -173,6 +204,7 @@ static int msm_devfreq_get_dev_status(struct device *dev,
 	df->time = time;
 
 	if (df->suspended) {
+		df->busy_percent = 0;
 		mutex_unlock(&df->lock);
 		status->busy_time = 0;
 		return 0;
@@ -191,6 +223,14 @@ static int msm_devfreq_get_dev_status(struct device *dev,
 
 	status->busy_time = busy_time;
 
+	mutex_lock(&df->lock);
+	if (status->total_time)
+		df->busy_percent = min_t(u64,
+				div64_ul(busy_time * 100, status->total_time), 100);
+	else
+		df->busy_percent = 0;
+	mutex_unlock(&df->lock);
+
 	return 0;
 }
 
@@ -207,6 +247,7 @@ static struct devfreq_dev_profile msm_devfreq_profile = {
 	.target = msm_devfreq_target,
 	.get_dev_status = msm_devfreq_get_dev_status,
 	.get_cur_freq = msm_devfreq_get_cur_freq,
+	.dev_groups = msm_devfreq_attr_groups,
 };
 
 static void msm_devfreq_boost_work(struct kthread_work *work);

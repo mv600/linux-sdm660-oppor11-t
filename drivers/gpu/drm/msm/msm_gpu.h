@@ -181,6 +181,12 @@ struct msm_gpu_devfreq {
 	 * cycles since last sampling period.
 	 */
 	u64 busy_cycles;
+	/**
+	 * @busy_percent: GPU busy percentage from the most recent devfreq
+	 * sampling period.  Exposed read-only to userspace so monitoring does
+	 * not need to touch GPU registers.
+	 */
+	u32 busy_percent;
 	/** @time: Time of last sampling period.  */
 	ktime_t time;
 	/** @idle_time: Time of last transition to idle.  */
