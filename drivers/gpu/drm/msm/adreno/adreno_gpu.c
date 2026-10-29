@@ -767,6 +767,7 @@ int adreno_gpu_state_get(struct msm_gpu *gpu, struct msm_gpu_state *state)
 	for (i = 0; i < gpu->nr_rings; i++) {
 		int size = 0, j;
 
+		dev_info(gpu->dev->dev, "gpu-probe: generic ring %d start\n", i);
 		state->ring[i].fence = gpu->rb[i]->memptrs->fence;
 		state->ring[i].iova = gpu->rb[i]->iova;
 		state->ring[i].seqno = gpu->rb[i]->fctx->last_fence;
@@ -782,14 +783,20 @@ int adreno_gpu_state_get(struct msm_gpu *gpu, struct msm_gpu_state *state)
 		else
 			state->ring[i].rptr = get_rptr(adreno_gpu, gpu->rb[i]);
 		state->ring[i].wptr = get_wptr(gpu->rb[i]);
+		dev_info(gpu->dev->dev,
+			"gpu-probe: generic ring %d rptr=%u wptr=%u\n", i,
+			state->ring[i].rptr, state->ring[i].wptr);
 
 		/* Copy at least 'wptr' dwords of the data */
 		size = state->ring[i].wptr;
 
 		/* After wptr find the last non zero dword to save space */
+		dev_info(gpu->dev->dev, "gpu-probe: generic ring %d scan start\n", i);
 		for (j = state->ring[i].wptr; j < MSM_GPU_RINGBUFFER_SZ >> 2; j++)
 			if (gpu->rb[i]->start[j])
 				size = j + 1;
+		dev_info(gpu->dev->dev, "gpu-probe: generic ring %d scan done size=%d\n",
+			i, size);
 
 		if (size) {
 			state->ring[i].data = kvmemdup(gpu->rb[i]->start, size << 2, GFP_KERNEL);
@@ -823,7 +830,10 @@ int adreno_gpu_state_get(struct msm_gpu *gpu, struct msm_gpu_state *state)
 		count += adreno_gpu->registers[i + 1] -
 			adreno_gpu->registers[i] + 1;
 
+	dev_info(gpu->dev->dev, "gpu-probe: generic register alloc count=%d\n", count);
 	state->registers = kcalloc(count * 2, sizeof(u32), GFP_KERNEL);
+	dev_info(gpu->dev->dev, "gpu-probe: generic register alloc returned %px\n",
+		state->registers);
 	if (state->registers) {
 		int pos = 0;
 
@@ -832,10 +842,15 @@ int adreno_gpu_state_get(struct msm_gpu *gpu, struct msm_gpu_state *state)
 			u32 end   = adreno_gpu->registers[i + 1];
 			u32 addr;
 
+			dev_info(gpu->dev->dev,
+				"gpu-probe: generic range %d %04x..%04x start\n",
+				i / 2, start, end);
 			for (addr = start; addr <= end; addr++) {
 				state->registers[pos++] = addr;
 				state->registers[pos++] = gpu_read(gpu, addr);
 			}
+			dev_info(gpu->dev->dev,
+				"gpu-probe: generic range %d done\n", i / 2);
 		}
 
 		state->nr_registers = count;
