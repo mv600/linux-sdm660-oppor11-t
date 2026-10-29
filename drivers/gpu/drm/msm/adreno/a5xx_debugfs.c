@@ -155,6 +155,94 @@ DEFINE_DEBUGFS_ATTRIBUTE(reset_fops, NULL, reset_set, "%llx\n");
 DEFINE_DEBUGFS_ATTRIBUTE(speedbin_fops, speedbin_get, NULL, "%llu\n");
 
 
+/*
+ * Temporary bring-up probe for the GPU debugfs reset.  Each write performs
+ * exactly one stage and logs it before the MMIO access, so the last message
+ * in pstore identifies the operation that stopped answering.
+ */
+static int gpu_probe_set(void *data, u64 val)
+{
+	struct drm_device *dev = data;
+	struct msm_drm_private *priv = dev->dev_private;
+	struct msm_gpu *gpu = priv->gpu;
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	u32 v;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EINVAL;
+
+	dev_info(gpu->dev->dev, "gpu-probe: stage %llu start\n", val);
+
+	switch (val) {
+	case 1:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		dev_info(gpu->dev->dev, "gpu-probe: lock acquired\n");
+		ret = pm_runtime_get_sync(&gpu->pdev->dev);
+		dev_info(gpu->dev->dev, "gpu-probe: runtime get returned %d\n", ret);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return 0;
+	case 2:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		dev_info(gpu->dev->dev, "gpu-probe: before hw_init\n");
+		ret = msm_gpu_hw_init(gpu);
+		dev_info(gpu->dev->dev, "gpu-probe: hw_init returned %d\n", ret);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return 0;
+	case 3:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		dev_info(gpu->dev->dev, "gpu-probe: before status3 read\n");
+		v = gpu_read(gpu, REG_A5XX_RBBM_STATUS3);
+		dev_info(gpu->dev->dev, "gpu-probe: status3=%08x\n", v);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return 0;
+	case 4:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		dev_info(gpu->dev->dev, "gpu-probe: before hwcg off\n");
+		a5xx_set_hwcg(gpu, false);
+		dev_info(gpu->dev->dev, "gpu-probe: hwcg off returned\n");
+		a5xx_set_hwcg(gpu, true);
+		dev_info(gpu->dev->dev, "gpu-probe: hwcg on returned\n");
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return 0;
+	case 5:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		dev_info(gpu->dev->dev, "gpu-probe: before generic register dump\n");
+		ret = adreno_gpu_state_get(gpu, kzalloc_obj(struct msm_gpu_state));
+		dev_info(gpu->dev->dev, "gpu-probe: generic dump returned %d\n", ret);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return ret;
+	default:
+		return -EINVAL;
+	}
+
+	/* Keep the compiler happy about adreno_gpu when adding new stages. */
+	(void)adreno_gpu;
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(gpu_probe_fops, NULL, gpu_probe_set, "%llu\n");
+
+
 void a5xx_debugfs_init(struct msm_gpu *gpu, struct drm_minor *minor)
 {
 	struct drm_device *dev;
@@ -174,5 +262,7 @@ void a5xx_debugfs_init(struct msm_gpu *gpu, struct drm_minor *minor)
 					&reset_fops);
 		debugfs_create_file_unsafe("speedbin", S_IRUGO, minor->debugfs_root, dev,
                                         &speedbin_fops);
+		debugfs_create_file_unsafe("gpu-probe", S_IWUSR, minor->debugfs_root, dev,
+					&gpu_probe_fops);
 	}
 }
