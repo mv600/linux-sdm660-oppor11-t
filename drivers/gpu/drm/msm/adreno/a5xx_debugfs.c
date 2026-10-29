@@ -252,6 +252,133 @@ static int gpu_probe_set(void *data, u64 val)
 		mutex_unlock(&gpu->lock);
 		return 0;
 	}
+	case 29: {
+		struct msm_ringbuffer *ring;
+
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		for (u32 i = 0; i < gpu->nr_rings; i++) {
+			ring = gpu->rb[i];
+			dev_info(gpu->dev->dev,
+				"gpu-probe: ring %u fence=%u seqno=%u rptr_mem=%u wptr_sw=%u iova=%llx\n",
+				i, ring->memptrs->fence, ring->fctx->last_fence,
+				ring->memptrs->rptr, get_wptr(ring), ring->iova);
+			dev_info(gpu->dev->dev,
+				"gpu-probe: ring %u rptr_hw start\n", i);
+			v = gpu->funcs->get_rptr(gpu, ring);
+			dev_info(gpu->dev->dev, "gpu-probe: ring %u rptr_hw=%u\n",
+				i, v);
+		}
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return 0;
+	}
+	case 30: {
+		struct msm_ringbuffer *ring;
+		u32 size;
+
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		for (u32 i = 0; i < gpu->nr_rings; i++) {
+			ring = gpu->rb[i];
+			size = ring->cur - ring->start;
+			dev_info(gpu->dev->dev,
+				"gpu-probe: ring %u copy start size=%u\n", i, size);
+			if (size) {
+				void *data = kvmemdup(ring->start, size << 2, GFP_KERNEL);
+
+				dev_info(gpu->dev->dev,
+					"gpu-probe: ring %u copy returned %px\n", i, data);
+				kvfree(data);
+			}
+			dev_info(gpu->dev->dev, "gpu-probe: ring %u copy done\n", i);
+		}
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return 0;
+	}
+	case 31: {
+		struct msm_gpu_state *state = kzalloc_obj(*state);
+
+		if (!state)
+			return -ENOMEM;
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret) {
+			kfree(state);
+			return ret;
+		}
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		dev_info(gpu->dev->dev, "gpu-probe: generic state get start\n");
+		ret = adreno_gpu_state_get(gpu, state);
+		dev_info(gpu->dev->dev,
+			"gpu-probe: generic state get returned %d regs=%d\n",
+			ret, state->nr_registers);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		adreno_gpu_state_destroy(state);
+		kfree(state);
+		return ret;
+	}
+	case 32: {
+		struct msm_gpu_state *state;
+
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		dev_info(gpu->dev->dev, "gpu-probe: a5xx state get start\n");
+		state = gpu->funcs->gpu_state_get(gpu);
+		dev_info(gpu->dev->dev,
+			"gpu-probe: a5xx state get returned %px status=%08x\n",
+			state, IS_ERR_OR_NULL(state) ? 0 : state->rbbm_status);
+		if (!IS_ERR_OR_NULL(state))
+			gpu->funcs->gpu_state_put(state);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return 0;
+	}
+	case 33:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		dev_info(gpu->dev->dev, "gpu-probe: RBBM_STATUS read start\n");
+		v = gpu_read(gpu, REG_A5XX_RBBM_STATUS);
+		dev_info(gpu->dev->dev, "gpu-probe: RBBM_STATUS=%08x\n", v);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return 0;
+	case 34:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		ret = a5xx_crashdumper_probe(gpu, -2);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return ret;
+	case 35:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		ret = a5xx_crashdumper_probe(gpu, -1);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return ret;
+	case 36 ... 50:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		ret = a5xx_crashdumper_probe(gpu, val - 36);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return ret;
 	default:
 		return -EINVAL;
 	}

@@ -76,6 +76,7 @@ struct a5xx_gpu {
 
 #ifdef CONFIG_DEBUG_FS
 void a5xx_debugfs_init(struct msm_gpu *gpu, struct drm_minor *minor);
+int a5xx_crashdumper_probe(struct msm_gpu *gpu, int index);
 #endif
 
 /*

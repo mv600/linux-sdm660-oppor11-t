@@ -1790,6 +1790,76 @@ static void a5xx_gpu_state_get_hlsq_regs(struct msm_gpu *gpu,
 	msm_gem_kernel_put(dumper.bo, gpu->vm);
 }
 
+#ifdef CONFIG_DEBUG_FS
+/*
+ * Temporary bring-up probe: run one crashdumper operation at a time so a
+ * stalled register or command processor is visible in the last kernel log.
+ * index < 0 only allocates the dumper; index == -1 runs an empty script.
+ */
+int a5xx_crashdumper_probe(struct msm_gpu *gpu, int index)
+{
+	struct a5xx_crashdumper dumper = { 0 };
+	u64 *ptr;
+	u64 offset;
+	u32 count;
+	int ret;
+
+	DRM_DEV_INFO(gpu->dev->dev, "gpu-probe: crashdumper init start\n");
+	ret = a5xx_crashdumper_init(gpu, &dumper);
+	if (ret)
+		return ret;
+	DRM_DEV_INFO(gpu->dev->dev, "gpu-probe: crashdumper init done iova=%llx\n",
+		dumper.iova);
+
+	if (index < -1) {
+		ret = 0;
+		goto out;
+	}
+
+	if (index >= ARRAY_SIZE(a5xx_hlsq_aperture_regs)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ptr = dumper.ptr;
+	offset = dumper.iova + (256 * SZ_1K);
+	count = index < 0 ? 0 : a5xx_hlsq_aperture_regs[index].count;
+
+	if (index >= 0) {
+		u32 type = a5xx_hlsq_aperture_regs[index].type;
+
+		DRM_DEV_INFO(gpu->dev->dev,
+			"gpu-probe: crashdumper entry %d type=%02x offset=%04x count=%u\n",
+			index, type, a5xx_hlsq_aperture_regs[index].regoffset,
+			count);
+		*ptr++ = ((u64) type << 8);
+		*ptr++ = (((u64) REG_A5XX_HLSQ_DBG_READ_SEL) << 44) |
+			(1 << 21) | 1;
+		*ptr++ = offset;
+		*ptr++ = (((u64) REG_A5XX_HLSQ_DBG_AHB_READ_APERTURE) << 44)
+			| count;
+	}
+	*ptr++ = 0;
+	*ptr++ = 0;
+
+	DRM_DEV_INFO(gpu->dev->dev, "gpu-probe: crashdumper run start\n");
+	ret = a5xx_crashdumper_run(gpu, &dumper);
+	DRM_DEV_INFO(gpu->dev->dev, "gpu-probe: crashdumper run returned %d\n",
+		ret);
+	if (!ret && count) {
+		u32 *data = dumper.ptr + (256 * SZ_1K);
+
+		DRM_DEV_INFO(gpu->dev->dev,
+			"gpu-probe: crashdumper first=%08x last=%08x\n",
+			data[0], data[count - 1]);
+	}
+
+out:
+	msm_gem_kernel_put(dumper.bo, gpu->vm);
+	return ret;
+}
+#endif
+
 static struct msm_gpu_state *a5xx_gpu_state_get(struct msm_gpu *gpu)
 {
 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
