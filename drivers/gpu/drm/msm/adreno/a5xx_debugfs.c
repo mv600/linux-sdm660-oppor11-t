@@ -220,17 +220,38 @@ static int gpu_probe_set(void *data, u64 val)
 		pm_runtime_put_sync(&gpu->pdev->dev);
 		mutex_unlock(&gpu->lock);
 		return 0;
-	case 5:
+	case 5 ... 28: {
+		const unsigned int *regs;
+		u32 start, end, addr;
+
+		/* The generic register table has 128 ranges. */
+		regs = to_adreno_gpu(gpu)->registers;
 		ret = mutex_lock_interruptible(&gpu->lock);
 		if (ret)
 			return ret;
 		pm_runtime_get_sync(&gpu->pdev->dev);
-		dev_info(gpu->dev->dev, "gpu-probe: before generic register dump\n");
-		ret = adreno_gpu_state_get(gpu, kzalloc_obj(struct msm_gpu_state));
-		dev_info(gpu->dev->dev, "gpu-probe: generic dump returned %d\n", ret);
+		start = (val - 5) * 8;
+		end = min_t(u32, start + 7, 255);
+		dev_info(gpu->dev->dev, "gpu-probe: register ranges %u..%u\n",
+			 start, end);
+		for (u32 i = start; i <= end; i += 2) {
+			u32 first = regs[i];
+			u32 last = regs[i + 1];
+
+			dev_info(gpu->dev->dev, "gpu-probe: range %u: %04x..%04x\n",
+				 i / 2, first, last);
+			for (addr = first; addr <= last; addr++) {
+				u32 v = gpu_read(gpu, addr);
+
+				dev_info(gpu->dev->dev, "gpu-probe: %04x=%08x\n",
+					 addr, v);
+			}
+		}
+		dev_info(gpu->dev->dev, "gpu-probe: register group done\n");
 		pm_runtime_put_sync(&gpu->pdev->dev);
 		mutex_unlock(&gpu->lock);
-		return ret;
+		return 0;
+	}
 	default:
 		return -EINVAL;
 	}
