@@ -379,6 +379,28 @@ static int gpu_probe_set(void *data, u64 val)
 		pm_runtime_put_sync(&gpu->pdev->dev);
 		mutex_unlock(&gpu->lock);
 		return ret;
+	case 51:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		dev_info(gpu->dev->dev, "gpu-probe: read a800 start\n");
+		v = gpu_read(gpu, 0xa800);
+		dev_info(gpu->dev->dev, "gpu-probe: a800=%08x\n", v);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return 0;
+	case 52:
+		ret = mutex_lock_interruptible(&gpu->lock);
+		if (ret)
+			return ret;
+		pm_runtime_get_sync(&gpu->pdev->dev);
+		dev_info(gpu->dev->dev, "gpu-probe: read a820 start\n");
+		v = gpu_read(gpu, 0xa820);
+		dev_info(gpu->dev->dev, "gpu-probe: a820=%08x\n", v);
+		pm_runtime_put_sync(&gpu->pdev->dev);
+		mutex_unlock(&gpu->lock);
+		return 0;
 	default:
 		return -EINVAL;
 	}
