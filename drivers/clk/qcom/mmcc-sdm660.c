@@ -2789,7 +2789,7 @@ static const struct regmap_config mmcc_660_regmap_config = {
 	.reg_bits	= 32,
 	.reg_stride	= 4,
 	.val_bits	= 32,
-	.max_register	= 0x40000,
+	.max_register	= 0x10004, /* Matches the vendor register window. */
 	.fast_io	= true,
 };
 
