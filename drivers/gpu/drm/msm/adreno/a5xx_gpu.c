@@ -1547,9 +1547,14 @@ static const u32 a5xx_registers[] = {
 	0xE800, 0xE806, 0xE810, 0xE89A, 0xE8A0, 0xE8A4, 0xE8AA, 0xE8EB,
 	0xE900, 0xE905, 0xEB80, 0xEB8F, 0xEBB0, 0xEBB0, 0xEC00, 0xEC05,
 	0xEC08, 0xECE9, 0xECF0, 0xECF0, 0xEA80, 0xEA80, 0xEA82, 0xEAA3,
-	0xEAA5, 0xEAC2, 0xA800, 0xA800, 0xA820, 0xA828, 0xA840, 0xA87D,
-	0XA880, 0xA88D, 0xA890, 0xA8A3, 0xA8D0, 0xA8D8, 0xA8E0, 0xA8F5,
-	0xAC60, 0xAC60, ~0,
+	0xEAA5, 0xEAC2, ~0,
+};
+
+/* GPMU registers, only valid on parts with a GPMU (a530/a540) */
+static const u32 a5xx_gpmu_registers[] = {
+	0xA800, 0xA800, 0xA820, 0xA828, 0xA840, 0xA87D, 0xA880, 0xA88D,
+	0xA890, 0xA8A3, 0xA8D0, 0xA8D8, 0xA8E0, 0xA8F5, 0xAC60, 0xAC60,
+	~0,
 };
 
 static void a5xx_dump(struct msm_gpu *gpu)
@@ -1673,6 +1678,7 @@ struct a5xx_crashdumper {
 struct a5xx_gpu_state {
 	struct msm_gpu_state base;
 	u32 *hlsqregs;
+	u32 *gpmuregs;
 };
 
 static int a5xx_crashdumper_init(struct msm_gpu *gpu,
@@ -1790,75 +1796,27 @@ static void a5xx_gpu_state_get_hlsq_regs(struct msm_gpu *gpu,
 	msm_gem_kernel_put(dumper.bo, gpu->vm);
 }
 
-#ifdef CONFIG_DEBUG_FS
-/*
- * Temporary bring-up probe: run one crashdumper operation at a time so a
- * stalled register or command processor is visible in the last kernel log.
- * index < 0 only allocates the dumper; index == -1 runs an empty script.
- */
-int a5xx_crashdumper_probe(struct msm_gpu *gpu, int index)
+static void a5xx_gpu_state_get_gpmu_regs(struct msm_gpu *gpu,
+		struct a5xx_gpu_state *a5xx_state)
 {
-	struct a5xx_crashdumper dumper = { 0 };
-	u64 *ptr;
-	u64 offset;
-	u32 count;
-	int ret;
+	u32 count = 0, pos = 0;
+	int i;
 
-	DRM_DEV_INFO(gpu->dev->dev, "gpu-probe: crashdumper init start\n");
-	ret = a5xx_crashdumper_init(gpu, &dumper);
-	if (ret)
-		return ret;
-	DRM_DEV_INFO(gpu->dev->dev, "gpu-probe: crashdumper init done iova=%llx\n",
-		dumper.iova);
+	for (i = 0; a5xx_gpmu_registers[i] != ~0; i += 2)
+		count += a5xx_gpmu_registers[i + 1] - a5xx_gpmu_registers[i] + 1;
 
-	if (index < -1) {
-		ret = 0;
-		goto out;
+	a5xx_state->gpmuregs = kcalloc(count, sizeof(u32), GFP_KERNEL);
+	if (!a5xx_state->gpmuregs)
+		return;
+
+	for (i = 0; a5xx_gpmu_registers[i] != ~0; i += 2) {
+		u32 addr;
+
+		for (addr = a5xx_gpmu_registers[i]; addr <= a5xx_gpmu_registers[i + 1]; addr++)
+			a5xx_state->gpmuregs[pos++] = gpu_read(gpu, addr);
 	}
-
-	if (index >= ARRAY_SIZE(a5xx_hlsq_aperture_regs)) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	ptr = dumper.ptr;
-	offset = dumper.iova + (256 * SZ_1K);
-	count = index < 0 ? 0 : a5xx_hlsq_aperture_regs[index].count;
-
-	if (index >= 0) {
-		u32 type = a5xx_hlsq_aperture_regs[index].type;
-
-		DRM_DEV_INFO(gpu->dev->dev,
-			"gpu-probe: crashdumper entry %d type=%02x offset=%04x count=%u\n",
-			index, type, a5xx_hlsq_aperture_regs[index].regoffset,
-			count);
-		*ptr++ = ((u64) type << 8);
-		*ptr++ = (((u64) REG_A5XX_HLSQ_DBG_READ_SEL) << 44) |
-			(1 << 21) | 1;
-		*ptr++ = offset;
-		*ptr++ = (((u64) REG_A5XX_HLSQ_DBG_AHB_READ_APERTURE) << 44)
-			| count;
-	}
-	*ptr++ = 0;
-	*ptr++ = 0;
-
-	DRM_DEV_INFO(gpu->dev->dev, "gpu-probe: crashdumper run start\n");
-	ret = a5xx_crashdumper_run(gpu, &dumper);
-	DRM_DEV_INFO(gpu->dev->dev, "gpu-probe: crashdumper run returned %d\n",
-		ret);
-	if (!ret && count) {
-		u32 *data = dumper.ptr + (256 * SZ_1K);
-
-		DRM_DEV_INFO(gpu->dev->dev,
-			"gpu-probe: crashdumper first=%08x last=%08x\n",
-			data[0], data[count - 1]);
-	}
-
-out:
-	msm_gem_kernel_put(dumper.bo, gpu->vm);
-	return ret;
 }
-#endif
+
 
 static struct msm_gpu_state *a5xx_gpu_state_get(struct msm_gpu *gpu)
 {
@@ -1899,6 +1857,9 @@ static struct msm_gpu_state *a5xx_gpu_state_get(struct msm_gpu *gpu)
 	else if (snapshot)
 		a5xx_state->base.rbbm_status = a5xx_gpu->fault_rbbm_status;
 
+	if (mmio && (adreno_is_a530(adreno_gpu) || adreno_is_a540(adreno_gpu)))
+		a5xx_gpu_state_get_gpmu_regs(gpu, a5xx_state);
+
 	/*
 	 * Get the HLSQ regs with the help of the crashdumper, but only if
 	 * we are not stalled in an iommu fault (in which case the crashdumper
@@ -1921,6 +1882,7 @@ static void a5xx_gpu_state_destroy(struct kref *kref)
 		struct a5xx_gpu_state, base);
 
 	kfree(a5xx_state->hlsqregs);
+	kfree(a5xx_state->gpmuregs);
 
 	adreno_gpu_state_destroy(state);
 	kfree(a5xx_state);
@@ -1948,6 +1910,17 @@ static void a5xx_show(struct msm_gpu *gpu, struct msm_gpu_state *state,
 		return;
 
 	adreno_show(gpu, state, p);
+
+	if (a5xx_state->gpmuregs) {
+		u32 o, gpmu_pos = 0;
+
+		drm_printf(p, "registers-gpmu:\n");
+
+		for (i = 0; a5xx_gpmu_registers[i] != ~0; i += 2)
+			for (o = a5xx_gpmu_registers[i]; o <= a5xx_gpmu_registers[i + 1]; o++)
+				drm_printf(p, "  - { offset: 0x%04x, value: 0x%08x }\n",
+					o << 2, a5xx_state->gpmuregs[gpmu_pos++]);
+	}
 
 	/* Dump the additional a5xx HLSQ registers */
 	if (!a5xx_state->hlsqregs)
