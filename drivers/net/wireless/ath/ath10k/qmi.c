@@ -8,6 +8,7 @@
 #include <linux/device.h>
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
+#include <linux/hex.h>
 #include <linux/idr.h>
 #include <linux/kernel.h>
 #include <linux/of.h>
