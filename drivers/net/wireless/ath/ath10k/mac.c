@@ -324,11 +324,9 @@ static int ath10k_install_key(struct ath10k_vif *arvif,
 	if (ret)
 		return ret;
 
-	if (cmd != DISABLE_KEY) {
-		time_left = wait_for_completion_timeout(&ar->install_key_done, 3 * HZ);
-		if (time_left == 0)
-			return -ETIMEDOUT;
-	}
+	time_left = wait_for_completion_timeout(&ar->install_key_done, 3 * HZ);
+	if (time_left == 0)
+		return -ETIMEDOUT;
 
 	return 0;
 }
@@ -3174,36 +3172,6 @@ static void ath10k_bss_assoc(struct ieee80211_hw *hw,
 
 	ath10k_mac_set_sar_power(ar);
 
-	/* F2 experiment (see 问题排查与修复记录.md): configure the firmware
-	 * beacon-miss engine with the same values the stock stack uses on
-	 * this device. The OEM WCNSS_qcom_cfg.ini (VENDOR_EDIT block,
-	 * Yadong.Hu 2017/04/20) sets gRoamBmissFirstBcnt=10 and
-	 * gRoamBmissFinalBcnt=20 ("10 and 20 means 30 beacon miss, then maybe
-	 * trigger disconnect"). Without these vdev params the WCN3990
-	 * firmware (WLAN.HL.1.0.1.c2.1-00098) never reports
-	 * WMI_ROAM_REASON_BEACON_MISS, so mac80211 never learns that the AP
-	 * vanished silently (假连接 相①).
-	 */
-	ret = ath10k_wmi_vdev_set_param(ar, arvif->vdev_id,
-					ar->wmi.vdev_param->bmiss_first_bcnt,
-					10);
-	if (ret)
-		ath10k_warn(ar, "f2: failed to set bmiss first bcnt on vdev %i: %d\n",
-			    arvif->vdev_id, ret);
-	else
-		ath10k_info(ar, "f2: bmiss_first_bcnt=10 applied on vdev %i\n",
-			    arvif->vdev_id);
-
-	ret = ath10k_wmi_vdev_set_param(ar, arvif->vdev_id,
-					ar->wmi.vdev_param->bmiss_final_bcnt,
-					20);
-	if (ret)
-		ath10k_warn(ar, "f2: failed to set bmiss final bcnt on vdev %i: %d\n",
-			    arvif->vdev_id, ret);
-	else
-		ath10k_info(ar, "f2: bmiss_final_bcnt=20 applied on vdev %i\n",
-			    arvif->vdev_id);
-
 	/* Workaround: Some firmware revisions (tested with qca6174
 	 * WLAN.RM.2.0-00073) have buggy powersave state machine and must be
 	 * poked with peer param command.
@@ -3222,6 +3190,7 @@ static void ath10k_bss_disassoc(struct ieee80211_hw *hw,
 {
 	struct ath10k *ar = hw->priv;
 	struct ath10k_vif *arvif = (void *)vif->drv_priv;
+	struct ieee80211_sta_vht_cap vht_cap = {};
 	int ret;
 
 	lockdep_assert_held(&ar->conf_mutex);
@@ -3236,13 +3205,13 @@ static void ath10k_bss_disassoc(struct ieee80211_hw *hw,
 
 	arvif->def_wep_key_idx = -1;
 
-	/*
-	 * Do not reset TxBF here: WCN3990 firmware (e.g. WLAN.HL.1.0.1.c2)
-	 * crashes when the vdev's TxBF parameter is set while the vdev has no
-	 * peer for its AP, so the firmware dies on every disassociation.
-	 * ath10k_bss_assoc() programs TxBF again from the next AP's
-	 * capabilities before bringing the vdev up, so nothing is lost.
-	 */
+	ret = ath10k_mac_vif_recalc_txbf(ar, vif, vht_cap);
+	if (ret) {
+		ath10k_warn(ar, "failed to recalc txbf for vdev %i: %d\n",
+			    arvif->vdev_id, ret);
+		return;
+	}
+
 	arvif->is_up = false;
 
 	ath10k_mac_txpower_recalc(ar);
@@ -4932,50 +4901,6 @@ static struct ieee80211_sta_vht_cap ath10k_create_vht_cap(struct ath10k *ar)
 	vht_cap.vht_supported = 1;
 	vht_cap.cap = ar->vht_cap_info;
 
-	/*
-	 * WCN3990 is a 2x2 802.11ac Wave 2 radio whose hardware bandwidth
-	 * limit is 80 MHz.  Do not advertise 160 MHz / 80+80 MHz support.
-	 *
-	 * Supp Channel Width and Ext NSS BW in the firmware's vht_cap_info use
-	 * a firmware-private compressed layout (see
-	 * include/linux/ieee80211-vht.h -- note this is *not* the upstream
-	 * bit layout).  Both fields being non-zero makes mac80211's
-	 * ieee80211_chandef_vht_oper() conclude support_160 == true:
-	 *
-	 *   vht_cap = hw->wiphy->bands[band]->vht_cap.cap;
-	 *   support_160 = (vht_cap & (IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_MASK |
-	 *                             IEEE80211_VHT_CAP_EXT_NSS_BW_MASK));
-	 *
-	 * An 80 MHz BSS whose VHT Operation element happens to advertise a
-	 * center segment offset of 8 channels then hits the 802.11ac interop
-	 * workaround and gets upgraded to NL80211_CHAN_WIDTH_160:
-	 *
-	 *   case IEEE80211_VHT_CHANWIDTH_80MHZ:
-	 *         new.width = NL80211_CHAN_WIDTH_80;
-	 *         new.center_freq1 = cf0;
-	 *         if (ccf1) {
-	 *                 diff = abs(ccf1 - ccf0);
-	 *                 if ((diff == 8) && support_160) {
-	 *                         new.width = NL80211_CHAN_WIDTH_160;
-	 *
-	 * which ath10k_mac_vdev_start() then hands to the firmware via
-	 * chan_to_phymode() as MODE_11AC_VHT160.  The radio cannot be tuned
-	 * for 160 MHz, so 5 GHz TX goes silently dead: association always
-	 * times out with no auth response and no status code, while scan
-	 * (which uses WMI_SCAN_CHAN_LIST and never goes through
-	 * chan_to_phymode()) keeps working fine.
-	 *
-	 * Clearing both fields keeps the advertised capability honest (this
-	 * radio does everything up to 80 MHz) and leaves every other VHT
-	 * capability (LDPC / STBC / beamforming / MCS) intact.
-	 *
-	 * Both masks must be cleared together: this radio's vht_cap_info is
-	 * 0x739139ba, whose bits 31:30 are also non-zero, so clearing only
-	 * SUPP_CHAN_WIDTH_MASK would leave support_160 true.
-	 */
-	vht_cap.cap &= ~(IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_MASK |
-			 IEEE80211_VHT_CAP_EXT_NSS_BW_MASK);
-
 	if (ar->vht_cap_info & (IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
 				IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE)) {
 		val = ath10k_mac_get_vht_cap_bf_sts(ar);
@@ -5469,8 +5394,6 @@ err:
 	return ret;
 }
 
-static void ath10k_conn_watchdog_clear(struct ath10k *ar);
-
 static void ath10k_stop(struct ieee80211_hw *hw, bool suspend)
 {
 	struct ath10k *ar = hw->priv;
@@ -5505,8 +5428,6 @@ static void ath10k_stop(struct ieee80211_hw *hw, bool suspend)
 	cancel_delayed_work_sync(&ar->scan.timeout);
 	cancel_work_sync(&ar->restart_work);
 	cancel_work_sync(&ar->recovery_check_work);
-	cancel_delayed_work_sync(&ar->conn_watchdog_work);
-	ath10k_conn_watchdog_clear(ar);
 }
 
 static int ath10k_config_ps(struct ath10k *ar)
@@ -6183,126 +6104,6 @@ static void ath10k_recalculate_mgmt_rate(struct ath10k *ar,
 		ath10k_warn(ar, "failed to set mgmt tx rate %d\n", ret);
 }
 
-/* F6: firmware authentication engine watchdog.
- *
- * Observed firmware defect (WLAN.HL.1.0.1.c2.1-00098): when the AP the card
- * is associated to disappears without a deauth frame, the supplicant retries
- * authentication once against the BSS that just vanished.  If that single
- * authentication gets no response, the firmware ends up unable to
- * authenticate to *any* BSS until it is reloaded (rfkill toggle / reboot).
- * The WMI management-tx command path, the vdev state machine and TX
- * completions all stay healthy - only over-the-air authentication silently
- * gets no response.
- *
- * mac80211 calls mgd_prepare_tx() before every authentication attempt and
- * mgd_complete_tx() once a response arrived, so a missing complete_tx() is
- * an exact "the firmware never answered" signal.  Count consecutive
- * unanswered auth attempts (only while not associated, to leave roaming
- * alone) and once the tunable threshold is reached, kick the driver's
- * existing firmware recovery machinery.
- */
-
-#define ATH10K_CONN_WATCHDOG_WINDOW_MS	2500
-#define ATH10K_CONN_WATCHDOG_RETRY_MS	30000
-
-static void ath10k_conn_watchdog_clear(struct ath10k *ar)
-{
-	spin_lock_bh(&ar->data_lock);
-	ar->conn_watchdog_noresp = false;
-	ar->conn_watchdog_fails = 0;
-	spin_unlock_bh(&ar->data_lock);
-}
-
-static void ath10k_conn_watchdog_arm(struct ath10k *ar)
-{
-	spin_lock_bh(&ar->data_lock);
-	ar->conn_watchdog_noresp = true;
-	spin_unlock_bh(&ar->data_lock);
-
-	/* (Re)arm a while after the last try of the current attempt. */
-	mod_delayed_work(ar->workqueue, &ar->conn_watchdog_work,
-			 msecs_to_jiffies(ATH10K_CONN_WATCHDOG_WINDOW_MS));
-}
-
-void ath10k_conn_watchdog_work(struct work_struct *work)
-{
-	struct ath10k *ar = container_of(work, struct ath10k,
-					 conn_watchdog_work.work);
-	unsigned int fails;
-	bool noresp;
-
-	spin_lock_bh(&ar->data_lock);
-	noresp = ar->conn_watchdog_noresp;
-	ar->conn_watchdog_noresp = false;
-	if (noresp)
-		ar->conn_watchdog_fails++;
-	fails = ar->conn_watchdog_fails;
-	spin_unlock_bh(&ar->data_lock);
-
-	if (!noresp)
-		return;
-
-	ath10k_warn(ar, "auth attempt got no response (%u/%u consecutive)\n",
-		    fails, ath10k_conn_watchdog_fails);
-
-	if (fails < ath10k_conn_watchdog_fails)
-		return;
-
-	ath10k_conn_watchdog_clear(ar);
-
-	if (atomic_read(&ar->pending_recovery)) {
-		ath10k_dbg(ar, ATH10K_DBG_MAC,
-			   "conn watchdog: recovery already pending\n");
-		return;
-	}
-
-	if (time_before(jiffies, ar->conn_watchdog_last_recovery +
-			msecs_to_jiffies(ATH10K_CONN_WATCHDOG_RETRY_MS))) {
-		ath10k_dbg(ar, ATH10K_DBG_MAC,
-			   "conn watchdog: recovery rate limited\n");
-		return;
-	}
-
-	ar->conn_watchdog_last_recovery = jiffies;
-
-	ath10k_warn(ar, "firmware auth engine not responding, restarting hardware\n");
-	ath10k_core_start_recovery(ar);
-}
-
-static void ath10k_mac_op_mgd_prepare_tx(struct ieee80211_hw *hw,
-					 struct ieee80211_vif *vif,
-					 struct ieee80211_prep_tx_info *info)
-{
-	struct ath10k *ar = hw->priv;
-
-	if (!ath10k_conn_watchdog_fails)
-		return;
-
-	if (info->subtype != IEEE80211_STYPE_AUTH)
-		return;
-
-	/* Only watch (re)connection attempts, not roams of an already
-	 * associated interface.
-	 */
-	if (vif->cfg.assoc)
-		return;
-
-	ath10k_conn_watchdog_arm(ar);
-}
-
-static void ath10k_mac_op_mgd_complete_tx(struct ieee80211_hw *hw,
-					  struct ieee80211_vif *vif,
-					  struct ieee80211_prep_tx_info *info)
-{
-	struct ath10k *ar = hw->priv;
-
-	/* The management frame exchange finished - either an auth response
-	 * came back, or the attempt was abandoned locally.  Either way it
-	 * must not be counted as an unanswered attempt.
-	 */
-	ath10k_conn_watchdog_clear(ar);
-}
-
 static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
 				    struct ieee80211_vif *vif,
 				    struct ieee80211_bss_conf *info,
@@ -6473,12 +6274,6 @@ static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
 				ath10k_monitor_stop(ar);
 			ath10k_bss_assoc(hw, vif, info);
 			ath10k_monitor_recalc(ar);
-
-			/* F6: a successful association means the auth engine
-			 * works; clear the watchdog.
-			 */
-			ath10k_conn_watchdog_clear(ar);
-			cancel_delayed_work(&ar->conn_watchdog_work);
 		} else {
 			ath10k_bss_disassoc(hw, vif);
 		}
@@ -6997,8 +6792,8 @@ static void ath10k_sta_rc_update_wk(struct work_struct *wk)
 		enum wmi_phy_mode mode;
 
 		mode = chan_to_phymode(&def);
-		ath10k_dbg(ar, ATH10K_DBG_STA, "mac update sta %pM peer bw %d phymode %d def.width %d\n",
-			   sta->addr, bw, mode, def.width);
+		ath10k_dbg(ar, ATH10K_DBG_STA, "mac update sta %pM peer bw %d phymode %d\n",
+			   sta->addr, bw, mode);
 
 		err = ath10k_wmi_peer_set_param(ar, arvif->vdev_id, sta->addr,
 						ar->wmi.peer_param->phymode, mode);
@@ -9685,8 +9480,6 @@ static const struct ieee80211_ops ath10k_ops = {
 	.remove_interface		= ath10k_remove_interface,
 	.configure_filter		= ath10k_configure_filter,
 	.bss_info_changed		= ath10k_bss_info_changed,
-	.mgd_prepare_tx			= ath10k_mac_op_mgd_prepare_tx,
-	.mgd_complete_tx		= ath10k_mac_op_mgd_complete_tx,
 	.set_coverage_class		= ath10k_mac_op_set_coverage_class,
 	.hw_scan			= ath10k_hw_scan,
 	.cancel_hw_scan			= ath10k_cancel_hw_scan,
