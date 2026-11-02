@@ -1247,6 +1247,7 @@ int ath10k_qmi_deinit(struct ath10k *ar)
 	struct ath10k_qmi *qmi = ar_snoc->qmi;
 
 	qmi->state = ATH10K_QMI_STATE_DEINIT;
+	ath10k_qmi_remove_msa_permission(qmi);
 	qmi_handle_release(&qmi->qmi_hdl);
 	cancel_work_sync(&qmi->event_work);
 	destroy_workqueue(qmi->event_wq);
