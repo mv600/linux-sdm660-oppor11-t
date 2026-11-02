@@ -2583,6 +2583,9 @@ static void ath10k_core_restart(struct work_struct *work)
 	complete(&ar->scan.completed);
 	complete(&ar->scan.on_channel);
 	complete(&ar->offchan_tx_completed);
+	spin_lock_bh(&ar->data_lock);
+	ar->install_key.pending = false;
+	spin_unlock_bh(&ar->data_lock);
 	complete(&ar->install_key_done);
 	complete(&ar->vdev_setup_done);
 	complete(&ar->vdev_delete_done);

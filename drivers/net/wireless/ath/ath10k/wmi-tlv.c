@@ -38,6 +38,9 @@ static const struct wmi_tlv_policy wmi_tlv_policies[] = {
 		= { .min_len = sizeof(struct wmi_chan_info_event) },
 	[WMI_TLV_TAG_STRUCT_VDEV_START_RESPONSE_EVENT]
 		= { .min_len = sizeof(struct wmi_vdev_start_response_event) },
+	[WMI_TLV_TAG_STRUCT_VDEV_INSTALL_KEY_COMPLETE_EVENT] = {
+		.min_len = sizeof(struct wmi_tlv_vdev_install_key_complete_ev),
+	},
 	[WMI_TLV_TAG_STRUCT_PEER_STA_KICKOUT_EVENT]
 		= { .min_len = sizeof(struct wmi_peer_sta_kickout_event) },
 	[WMI_TLV_TAG_STRUCT_HOST_SWBA_EVENT]
@@ -219,6 +222,69 @@ static void ath10k_wmi_tlv_event_vdev_delete_resp(struct ath10k *ar,
 {
 	ath10k_dbg(ar, ATH10K_DBG_WMI, "WMI_VDEV_DELETE_RESP_EVENTID\n");
 	complete(&ar->vdev_delete_done);
+}
+
+static int ath10k_wmi_tlv_event_vdev_install_key_complete(struct ath10k *ar,
+							  struct sk_buff *skb)
+{
+	const struct wmi_tlv_vdev_install_key_complete_ev *ev;
+	const void **tb;
+	u32 vdev_id, key_idx, key_flags, status;
+	bool match;
+	int ret;
+
+	if (ar->hw_rev != ATH10K_HW_WCN3990) {
+		ath10k_dbg(ar, ATH10K_DBG_WMI,
+			   "WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID\n");
+		return 0;
+	}
+
+	tb = ath10k_wmi_tlv_parse_alloc(ar, skb->data, skb->len, GFP_ATOMIC);
+	if (IS_ERR(tb)) {
+		ret = PTR_ERR(tb);
+		ath10k_warn(ar, "failed to parse install key completion: %d\n", ret);
+		return ret;
+	}
+
+	ev = tb[WMI_TLV_TAG_STRUCT_VDEV_INSTALL_KEY_COMPLETE_EVENT];
+	if (!ev) {
+		kfree(tb);
+		ath10k_warn(ar, "missing install key completion event\n");
+		return -EPROTO;
+	}
+
+	vdev_id = __le32_to_cpu(ev->vdev_id);
+	key_idx = __le32_to_cpu(ev->key_idx);
+	key_flags = __le32_to_cpu(ev->key_flags);
+	status = __le32_to_cpu(ev->status);
+
+	ath10k_dbg(ar, ATH10K_DBG_WMI,
+		   "install key complete vdev %u peer %pM key %u flags 0x%x status %u\n",
+		   vdev_id, ev->peer_macaddr.addr, key_idx, key_flags, status);
+
+	spin_lock_bh(&ar->data_lock);
+	match = ar->install_key.pending &&
+		ar->install_key.vdev_id == vdev_id &&
+		ar->install_key.key_idx == key_idx &&
+		ar->install_key.key_flags == key_flags &&
+		(!ar->install_key.has_peer ||
+		 ether_addr_equal(ar->install_key.peer, ev->peer_macaddr.addr));
+	if (match) {
+		ar->install_key.completed = true;
+		ar->install_key.status = status;
+	}
+	spin_unlock_bh(&ar->data_lock);
+
+	if (!match) {
+		ath10k_warn(ar, "unexpected install key completion vdev %u peer %pM key %u flags 0x%x\n",
+			    vdev_id, ev->peer_macaddr.addr, key_idx, key_flags);
+		kfree(tb);
+		return -ENOENT;
+	}
+
+	kfree(tb);
+	complete(&ar->install_key_done);
+	return 0;
 }
 
 static int ath10k_wmi_tlv_parse_peer_stats_info(struct ath10k *ar, u16 tag, u16 len,
@@ -755,9 +821,7 @@ static void ath10k_wmi_tlv_op_rx(struct ath10k *ar, struct sk_buff *skb)
 		ath10k_wmi_event_addba_complete(ar, skb);
 		break;
 	case WMI_TLV_VDEV_INSTALL_KEY_COMPLETE_EVENTID:
-		ath10k_dbg_dump(ar, ATH10K_DBG_WMI, NULL,
-				"install key complete raw: ", skb->data, skb->len);
-		ath10k_wmi_event_vdev_install_key_complete(ar, skb);
+		ath10k_wmi_tlv_event_vdev_install_key_complete(ar, skb);
 		break;
 	case WMI_TLV_SERVICE_READY_EVENTID:
 		ath10k_wmi_event_service_ready(ar, skb);

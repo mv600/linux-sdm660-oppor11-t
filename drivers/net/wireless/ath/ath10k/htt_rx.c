@@ -4179,7 +4179,8 @@ bool ath10k_htt_t2h_msg_handler(struct ath10k *ar, struct sk_buff *skb)
 			  __le16_to_cpu(ev->peer_id),
 			  !!(ev->flags & HTT_SECURITY_IS_UNICAST),
 			  MS(ev->flags, HTT_SECURITY_TYPE));
-		complete(&ar->install_key_done);
+		if (ar->hw_rev != ATH10K_HW_WCN3990)
+			complete(&ar->install_key_done);
 		break;
 	}
 	case HTT_T2H_MSG_TYPE_RX_FRAG_IND: {

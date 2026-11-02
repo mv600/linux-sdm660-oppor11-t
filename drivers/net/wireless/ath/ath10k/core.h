@@ -1154,6 +1154,16 @@ struct ath10k {
 	u8 cfg_rx_chainmask;
 
 	struct completion install_key_done;
+	struct {
+		bool pending;
+		bool completed;
+		u32 vdev_id;
+		u8 peer[ETH_ALEN];
+		bool has_peer;
+		u32 key_idx;
+		u32 key_flags;
+		u32 status;
+	} install_key;
 
 	int last_wmi_vdev_start_status;
 	struct completion vdev_setup_done;

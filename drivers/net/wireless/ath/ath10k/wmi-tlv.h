@@ -2037,6 +2037,16 @@ struct wmi_tlv_bcn_tx_status_ev {
 	__le32 tx_status;
 } __packed;
 
+#define WMI_VDEV_INSTALL_KEY_COMPL_STATUS_SUCCESS 0
+
+struct wmi_tlv_vdev_install_key_complete_ev {
+	__le32 vdev_id;
+	struct wmi_mac_addr peer_macaddr;
+	__le32 key_idx;
+	__le32 key_flags;
+	__le32 status;
+} __packed;
+
 struct wmi_tlv_bcn_prb_info {
 	__le32 caps;
 	__le32 erp;

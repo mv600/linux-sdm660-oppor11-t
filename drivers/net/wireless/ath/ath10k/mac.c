@@ -320,13 +320,50 @@ static int ath10k_install_key(struct ath10k_vif *arvif,
 	if (arvif->nohwcrypt)
 		return 1;
 
+	if (ar->hw_rev == ATH10K_HW_WCN3990) {
+		spin_lock_bh(&ar->data_lock);
+		ar->install_key.pending = true;
+		ar->install_key.completed = false;
+		ar->install_key.vdev_id = arvif->vdev_id;
+		ar->install_key.key_idx = key->keyidx;
+		ar->install_key.key_flags = flags;
+		ar->install_key.has_peer = macaddr;
+		if (macaddr)
+			ether_addr_copy(ar->install_key.peer, macaddr);
+		spin_unlock_bh(&ar->data_lock);
+	}
+
 	ret = ath10k_send_key(arvif, key, cmd, macaddr, flags);
-	if (ret)
+	if (ret) {
+		if (ar->hw_rev == ATH10K_HW_WCN3990) {
+			spin_lock_bh(&ar->data_lock);
+			ar->install_key.pending = false;
+			spin_unlock_bh(&ar->data_lock);
+		}
 		return ret;
+	}
 
 	time_left = wait_for_completion_timeout(&ar->install_key_done, 3 * HZ);
-	if (time_left == 0)
+
+	if (ar->hw_rev == ATH10K_HW_WCN3990) {
+		bool completed;
+		u32 status;
+
+		spin_lock_bh(&ar->data_lock);
+		completed = ar->install_key.completed;
+		status = ar->install_key.status;
+		ar->install_key.pending = false;
+		spin_unlock_bh(&ar->data_lock);
+
+		if (time_left == 0)
+			return -ETIMEDOUT;
+		if (!completed)
+			return -EIO;
+		if (status)
+			return -EINVAL;
+	} else if (time_left == 0) {
 		return -ETIMEDOUT;
+	}
 
 	return 0;
 }
@@ -3205,11 +3242,13 @@ static void ath10k_bss_disassoc(struct ieee80211_hw *hw,
 
 	arvif->def_wep_key_idx = -1;
 
-	ret = ath10k_mac_vif_recalc_txbf(ar, vif, vht_cap);
-	if (ret) {
-		ath10k_warn(ar, "failed to recalc txbf for vdev %i: %d\n",
-			    arvif->vdev_id, ret);
-		return;
+	if (ar->hw_rev != ATH10K_HW_WCN3990) {
+		ret = ath10k_mac_vif_recalc_txbf(ar, vif, vht_cap);
+		if (ret) {
+			ath10k_warn(ar, "failed to recalc txbf for vdev %i: %d\n",
+				    arvif->vdev_id, ret);
+			return;
+		}
 	}
 
 	arvif->is_up = false;
