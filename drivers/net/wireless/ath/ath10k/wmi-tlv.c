@@ -755,6 +755,8 @@ static void ath10k_wmi_tlv_op_rx(struct ath10k *ar, struct sk_buff *skb)
 		ath10k_wmi_event_addba_complete(ar, skb);
 		break;
 	case WMI_TLV_VDEV_INSTALL_KEY_COMPLETE_EVENTID:
+		ath10k_dbg_dump(ar, ATH10K_DBG_WMI, NULL,
+				"install key complete raw: ", skb->data, skb->len);
 		ath10k_wmi_event_vdev_install_key_complete(ar, skb);
 		break;
 	case WMI_TLV_SERVICE_READY_EVENTID:
