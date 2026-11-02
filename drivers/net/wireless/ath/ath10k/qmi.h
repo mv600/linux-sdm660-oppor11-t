@@ -27,6 +27,7 @@ struct ath10k_msa_mem_info {
 	phys_addr_t addr;
 	u32 size;
 	bool secure;
+	bool wlan_owned;
 };
 
 struct ath10k_qmi_chip_info {
@@ -108,6 +109,7 @@ struct ath10k_qmi {
 	struct ath10k_qmi_cal_data cal_data[MAX_NUM_CAL_V01];
 	bool msa_fixed_perm;
 	bool no_msa_ready_indicator;
+	bool msa_permissions_owned;
 	enum ath10k_qmi_state state;
 };
 

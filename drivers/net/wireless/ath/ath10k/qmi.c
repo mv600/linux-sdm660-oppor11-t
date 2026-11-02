@@ -44,6 +44,9 @@ static int ath10k_qmi_map_msa_permission(struct ath10k_qmi *qmi,
 	u32 perm_count;
 	int ret;
 
+	if (mem_info->wlan_owned)
+		return 0;
+
 	src_perms = BIT(QCOM_SCM_VMID_HLOS);
 
 	dst_perms[0].vmid = QCOM_SCM_VMID_MSS_MSA;
@@ -61,10 +64,16 @@ static int ath10k_qmi_map_msa_permission(struct ath10k_qmi *qmi,
 
 	ret = qcom_scm_assign_mem(mem_info->addr, mem_info->size,
 				  &src_perms, dst_perms, perm_count);
-	if (ret < 0)
+	if (ret < 0) {
 		ath10k_err(ar, "failed to assign msa map permissions: %d\n", ret);
+		return ret;
+	}
 
-	return ret;
+	mem_info->wlan_owned = true;
+	ath10k_info(ar, "msa perm: assigned WLAN addr 0x%pa size 0x%x secure %d\n",
+		    &mem_info->addr, mem_info->size, mem_info->secure);
+
+	return 0;
 }
 
 static int ath10k_qmi_unmap_msa_permission(struct ath10k_qmi *qmi,
@@ -74,6 +83,9 @@ static int ath10k_qmi_unmap_msa_permission(struct ath10k_qmi *qmi,
 	struct ath10k *ar = qmi->ar;
 	u64 src_perms;
 	int ret;
+
+	if (!mem_info->wlan_owned)
+		return 0;
 
 	src_perms = BIT(QCOM_SCM_VMID_MSS_MSA) | BIT(QCOM_SCM_VMID_WLAN);
 
@@ -85,10 +97,16 @@ static int ath10k_qmi_unmap_msa_permission(struct ath10k_qmi *qmi,
 
 	ret = qcom_scm_assign_mem(mem_info->addr, mem_info->size,
 				  &src_perms, &dst_perms, 1);
-	if (ret < 0)
+	if (ret < 0) {
 		ath10k_err(ar, "failed to unmap msa permissions: %d\n", ret);
+		return ret;
+	}
 
-	return ret;
+	mem_info->wlan_owned = false;
+	ath10k_info(ar, "msa perm: returned to HLOS addr 0x%pa size 0x%x\n",
+		    &mem_info->addr, mem_info->size);
+
+	return 0;
 }
 
 static int ath10k_qmi_setup_msa_permissions(struct ath10k_qmi *qmi)
@@ -96,7 +114,7 @@ static int ath10k_qmi_setup_msa_permissions(struct ath10k_qmi *qmi)
 	int ret;
 	int i;
 
-	if (qmi->msa_fixed_perm)
+	if (qmi->msa_fixed_perm || qmi->msa_permissions_owned)
 		return 0;
 
 	for (i = 0; i < qmi->nr_mem_region; i++) {
@@ -105,6 +123,9 @@ static int ath10k_qmi_setup_msa_permissions(struct ath10k_qmi *qmi)
 			goto err_unmap;
 	}
 
+	qmi->msa_permissions_owned = true;
+	ath10k_info(qmi->ar, "msa perm: WLAN ownership active for %u region(s)\n",
+		    qmi->nr_mem_region);
 	return 0;
 
 err_unmap:
@@ -113,15 +134,30 @@ err_unmap:
 	return ret;
 }
 
-static void ath10k_qmi_remove_msa_permission(struct ath10k_qmi *qmi)
+static int ath10k_qmi_remove_msa_permission(struct ath10k_qmi *qmi)
 {
+	int first_err = 0;
+	int ret;
 	int i;
 
-	if (qmi->msa_fixed_perm)
-		return;
+	if (qmi->msa_fixed_perm || !qmi->msa_permissions_owned)
+		return 0;
 
-	for (i = 0; i < qmi->nr_mem_region; i++)
-		ath10k_qmi_unmap_msa_permission(qmi, &qmi->mem_region[i]);
+	for (i = 0; i < qmi->nr_mem_region; i++) {
+		ret = ath10k_qmi_unmap_msa_permission(qmi, &qmi->mem_region[i]);
+		if (ret && !first_err)
+			first_err = ret;
+	}
+
+	if (!first_err) {
+		qmi->msa_permissions_owned = false;
+		ath10k_info(qmi->ar, "msa perm: HLOS ownership restored\n");
+	} else {
+		ath10k_err(qmi->ar, "msa perm: HLOS restore incomplete: %d\n",
+			   first_err);
+	}
+
+	return first_err;
 }
 
 static int ath10k_qmi_msa_mem_info_send_sync_msg(struct ath10k_qmi *qmi)
@@ -864,11 +900,17 @@ static void ath10k_qmi_event_server_arrive(struct ath10k_qmi *qmi)
 	struct ath10k *ar = qmi->ar;
 	int ret;
 
+	ath10k_info(ar, "qmi server arrive: fw_ready=%d msa_owned=%d regions=%u\n",
+		    qmi->fw_ready, qmi->msa_permissions_owned,
+		    qmi->nr_mem_region);
+
 	ret = ath10k_qmi_ind_register_send_sync_msg(qmi);
 	if (ret)
 		return;
 
 	if (qmi->fw_ready) {
+		if (!qmi->msa_fixed_perm && !qmi->msa_permissions_owned)
+			ath10k_warn(ar, "qmi server arrive with fw_ready; MSA ownership is not tracked by this client\n");
 		ath10k_snoc_fw_indication(ar, ATH10K_QMI_EVENT_FW_READY_IND);
 		return;
 	}
@@ -951,12 +993,28 @@ static void ath10k_qmi_event_server_exit(struct ath10k_qmi *qmi)
 {
 	struct ath10k *ar = qmi->ar;
 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
+	bool dump = !test_bit(ATH10K_SNOC_FLAG_UNREGISTERING, &ar_snoc->flags) &&
+		    !test_bit(ATH10K_SNOC_FLAG_MODEM_STOPPED, &ar_snoc->flags);
+	int ret;
 
-	ath10k_qmi_remove_msa_permission(qmi);
+	ath10k_info(ar, "qmi server exit: fw_ready=%d msa_owned=%d dump=%d\n",
+		    qmi->fw_ready, qmi->msa_permissions_owned, dump);
+
 	ath10k_core_free_board_files(ar);
-	if (!test_bit(ATH10K_SNOC_FLAG_UNREGISTERING, &ar_snoc->flags) &&
-	    !test_bit(ATH10K_SNOC_FLAG_MODEM_STOPPED, &ar_snoc->flags))
+	if (dump) {
+		ret = ath10k_qmi_remove_msa_permission(qmi);
+		if (ret)
+			ath10k_warn(ar, "qmi server exit: continuing dump with partial HLOS ownership\n");
+
 		ath10k_snoc_fw_crashed_dump(ar);
+
+		ret = ath10k_qmi_setup_msa_permissions(qmi);
+		if (ret)
+			ath10k_err(ar, "qmi server exit: failed to restore WLAN MSA ownership: %d\n",
+				   ret);
+	} else {
+		ath10k_qmi_remove_msa_permission(qmi);
+	}
 
 	ath10k_snoc_fw_indication(ar, ATH10K_QMI_EVENT_FW_DOWN_IND);
 	ath10k_dbg(ar, ATH10K_DBG_QMI, "wifi fw qmi service disconnected\n");
