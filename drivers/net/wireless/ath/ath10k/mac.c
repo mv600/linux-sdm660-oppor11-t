@@ -4901,6 +4901,14 @@ static struct ieee80211_sta_vht_cap ath10k_create_vht_cap(struct ath10k *ar)
 	vht_cap.vht_supported = 1;
 	vht_cap.cap = ar->vht_cap_info;
 
+	/*
+	 * WCN3990 hardware is limited to 80 MHz. The firmware's
+	 * vht_cap_info contains 160/80+80 and extended-NSS fields that
+	 * mac80211 interprets as 160 MHz support. Clear both fields.
+	 */
+	vht_cap.cap &= ~(IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_MASK |
+			 IEEE80211_VHT_CAP_EXT_NSS_BW_MASK);
+
 	if (ar->vht_cap_info & (IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
 				IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE)) {
 		val = ath10k_mac_get_vht_cap_bf_sts(ar);
