@@ -37,7 +37,7 @@ EXPORT_SYMBOL(ath10k_debug_mask);
  * authentication after the current AP disappears when bundle TX completion
  * is enabled.  Keep the upstream default and allow a runtime A/B.
  */
-static bool ath10k_mgmt_bundle_tx_compl = true;
+bool ath10k_mgmt_bundle_tx_compl = true;
 
 static unsigned int ath10k_cryptmode_param;
 static bool uart_print;
