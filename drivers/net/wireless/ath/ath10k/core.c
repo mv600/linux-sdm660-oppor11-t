@@ -33,6 +33,12 @@
 unsigned int ath10k_debug_mask;
 EXPORT_SYMBOL(ath10k_debug_mask);
 
+/* WCN3990 firmware older than WLAN.HL.2.0 can stall management frame
+ * authentication after the current AP disappears when bundle TX completion
+ * is enabled.  Keep the upstream default and allow a runtime A/B.
+ */
+static bool ath10k_mgmt_bundle_tx_compl = true;
+
 static unsigned int ath10k_cryptmode_param;
 static bool uart_print;
 static bool skip_otp;
@@ -46,6 +52,7 @@ unsigned long ath10k_coredump_mask = BIT(ATH10K_FW_CRASH_DUMP_REGISTERS) |
 
 /* FIXME: most of these should be readonly */
 module_param_named(debug_mask, ath10k_debug_mask, uint, 0644);
+module_param_named(mgmt_bundle_tx_compl, ath10k_mgmt_bundle_tx_compl, bool, 0644);
 module_param_named(cryptmode, ath10k_cryptmode_param, uint, 0644);
 module_param(uart_print, bool, 0644);
 module_param(skip_otp, bool, 0644);
@@ -54,6 +61,8 @@ module_param_named(frame_mode, ath10k_frame_mode, uint, 0644);
 module_param_named(coredump_mask, ath10k_coredump_mask, ulong, 0444);
 
 MODULE_PARM_DESC(debug_mask, "Debugging mask");
+MODULE_PARM_DESC(mgmt_bundle_tx_compl,
+		 "Use bundled management TX completion (default: true)");
 MODULE_PARM_DESC(uart_print, "Uart target debugging");
 MODULE_PARM_DESC(skip_otp, "Skip otp failure for calibration in testmode");
 MODULE_PARM_DESC(cryptmode, "Crypto mode: 0-hardware, 1-software");

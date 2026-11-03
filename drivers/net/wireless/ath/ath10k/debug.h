@@ -76,6 +76,7 @@ struct ath10k_pktlog_hdr {
 #define ATH10K_TX_POWER_MIN_VAL 0
 
 extern unsigned int ath10k_debug_mask;
+extern bool ath10k_mgmt_bundle_tx_compl;
 
 __printf(2, 3) void ath10k_info(struct ath10k *ar, const char *fmt, ...);
 __printf(2, 3) void ath10k_err(struct ath10k *ar, const char *fmt, ...);
