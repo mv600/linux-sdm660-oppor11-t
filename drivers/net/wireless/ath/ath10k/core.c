@@ -50,6 +50,11 @@ unsigned int ath10k_frame_mode = ATH10K_HW_TXRX_NATIVE_WIFI;
 unsigned long ath10k_coredump_mask = BIT(ATH10K_FW_CRASH_DUMP_REGISTERS) |
 				     BIT(ATH10K_FW_CRASH_DUMP_CE_DATA);
 
+/* Restart firmware after consecutive authentication attempts receive no
+ * response.  A value of 0 disables the watchdog.
+ */
+unsigned int ath10k_conn_watchdog_fails = 1;
+
 /* FIXME: most of these should be readonly */
 module_param_named(debug_mask, ath10k_debug_mask, uint, 0644);
 module_param_named(mgmt_bundle_tx_compl, ath10k_mgmt_bundle_tx_compl, bool, 0644);
@@ -59,6 +64,7 @@ module_param(skip_otp, bool, 0644);
 module_param(fw_diag_log, bool, 0644);
 module_param_named(frame_mode, ath10k_frame_mode, uint, 0644);
 module_param_named(coredump_mask, ath10k_coredump_mask, ulong, 0444);
+module_param_named(conn_watchdog_fails, ath10k_conn_watchdog_fails, uint, 0644);
 
 MODULE_PARM_DESC(debug_mask, "Debugging mask");
 MODULE_PARM_DESC(mgmt_bundle_tx_compl,
@@ -70,6 +76,8 @@ MODULE_PARM_DESC(frame_mode,
 		 "Datapath frame mode (0: raw, 1: native wifi (default), 2: ethernet)");
 MODULE_PARM_DESC(coredump_mask, "Bitfield of what to include in firmware crash file");
 MODULE_PARM_DESC(fw_diag_log, "Diag based fw log debugging");
+MODULE_PARM_DESC(conn_watchdog_fails,
+		 "Restart firmware after this many unanswered authentication attempts (0 = disable)");
 
 static const struct ath10k_hw_params ath10k_hw_params_list[] = {
 	{
@@ -3740,6 +3748,7 @@ struct ath10k *ath10k_core_create(size_t priv_size, struct device *dev,
 	INIT_WORK(&ar->register_work, ath10k_core_register_work);
 	INIT_WORK(&ar->restart_work, ath10k_core_restart);
 	INIT_WORK(&ar->recovery_check_work, ath10k_core_recovery_check_work);
+	INIT_DELAYED_WORK(&ar->conn_watchdog_work, ath10k_conn_watchdog_work);
 	INIT_WORK(&ar->set_coverage_class_work,
 		  ath10k_core_set_coverage_class_work);
 
@@ -3776,6 +3785,8 @@ EXPORT_SYMBOL(ath10k_core_create);
 
 void ath10k_core_destroy(struct ath10k *ar)
 {
+	cancel_delayed_work_sync(&ar->conn_watchdog_work);
+
 	destroy_workqueue(ar->workqueue);
 
 	destroy_workqueue(ar->workqueue_aux);

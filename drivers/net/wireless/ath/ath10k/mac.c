@@ -5441,6 +5441,8 @@ err:
 	return ret;
 }
 
+static void ath10k_conn_watchdog_clear(struct ath10k *ar);
+
 static void ath10k_stop(struct ieee80211_hw *hw, bool suspend)
 {
 	struct ath10k *ar = hw->priv;
@@ -5475,6 +5477,8 @@ static void ath10k_stop(struct ieee80211_hw *hw, bool suspend)
 	cancel_delayed_work_sync(&ar->scan.timeout);
 	cancel_work_sync(&ar->restart_work);
 	cancel_work_sync(&ar->recovery_check_work);
+	cancel_delayed_work_sync(&ar->conn_watchdog_work);
+	ath10k_conn_watchdog_clear(ar);
 }
 
 static int ath10k_config_ps(struct ath10k *ar)
@@ -6151,6 +6155,122 @@ static void ath10k_recalculate_mgmt_rate(struct ath10k *ar,
 		ath10k_warn(ar, "failed to set mgmt tx rate %d\n", ret);
 }
 
+/* mac80211 calls mgd_prepare_tx() before each authentication transmission and
+ * mgd_complete_tx() only after the exchange ends.  A missing completion while
+ * disconnected therefore means that no authentication response was received.
+ * The WCN3990 firmware can remain in this state for every BSS until reloaded.
+ */
+
+#define ATH10K_CONN_WATCHDOG_WINDOW_MS	2500
+#define ATH10K_CONN_WATCHDOG_RETRY_MS	30000
+
+static void ath10k_conn_watchdog_clear(struct ath10k *ar)
+{
+	spin_lock_bh(&ar->data_lock);
+	ar->conn_watchdog_noresp = false;
+	ar->conn_watchdog_fails = 0;
+	spin_unlock_bh(&ar->data_lock);
+}
+
+static void ath10k_conn_watchdog_reset(struct ath10k *ar)
+{
+	spin_lock_bh(&ar->data_lock);
+	ar->conn_watchdog_noresp = false;
+	ar->conn_watchdog_fails = 0;
+	ar->conn_watchdog_last_recovery = 0;
+	spin_unlock_bh(&ar->data_lock);
+}
+
+static void ath10k_conn_watchdog_arm(struct ath10k *ar)
+{
+	spin_lock_bh(&ar->data_lock);
+	ar->conn_watchdog_noresp = true;
+	spin_unlock_bh(&ar->data_lock);
+
+	mod_delayed_work(ar->workqueue, &ar->conn_watchdog_work,
+			 msecs_to_jiffies(ATH10K_CONN_WATCHDOG_WINDOW_MS));
+}
+
+void ath10k_conn_watchdog_work(struct work_struct *work)
+{
+	struct ath10k *ar = container_of(work, struct ath10k,
+					 conn_watchdog_work.work);
+	unsigned int fails;
+	bool noresp, rate_limited;
+
+	if (!ath10k_conn_watchdog_fails)
+		return;
+
+	spin_lock_bh(&ar->data_lock);
+	noresp = ar->conn_watchdog_noresp;
+	ar->conn_watchdog_noresp = false;
+	if (noresp)
+		ar->conn_watchdog_fails++;
+	fails = ar->conn_watchdog_fails;
+	spin_unlock_bh(&ar->data_lock);
+
+	if (!noresp)
+		return;
+
+	ath10k_warn(ar, "auth attempt got no response (%u/%u consecutive)\n",
+		    fails, ath10k_conn_watchdog_fails);
+
+	if (fails < ath10k_conn_watchdog_fails)
+		return;
+
+	ath10k_conn_watchdog_clear(ar);
+
+	if (atomic_read(&ar->pending_recovery)) {
+		ath10k_dbg(ar, ATH10K_DBG_MAC,
+			   "conn watchdog: recovery already pending\n");
+		return;
+	}
+
+	spin_lock_bh(&ar->data_lock);
+	rate_limited = ar->conn_watchdog_last_recovery &&
+		time_before(jiffies, ar->conn_watchdog_last_recovery +
+			    msecs_to_jiffies(ATH10K_CONN_WATCHDOG_RETRY_MS));
+	if (!rate_limited)
+		ar->conn_watchdog_last_recovery = jiffies;
+	spin_unlock_bh(&ar->data_lock);
+
+	if (rate_limited) {
+		ath10k_dbg(ar, ATH10K_DBG_MAC,
+			   "conn watchdog: recovery rate limited\n");
+		return;
+	}
+
+	ath10k_warn(ar, "firmware auth engine not responding, restarting hardware\n");
+	ath10k_core_start_recovery(ar);
+}
+
+static void ath10k_mac_op_mgd_prepare_tx(struct ieee80211_hw *hw,
+					 struct ieee80211_vif *vif,
+					 struct ieee80211_prep_tx_info *info)
+{
+	struct ath10k *ar = hw->priv;
+
+	if (!ath10k_conn_watchdog_fails || info->subtype != IEEE80211_STYPE_AUTH)
+		return;
+
+	/* Do not count authentication exchanges during an established
+	 * association, such as normal roaming.
+	 */
+	if (vif->cfg.assoc)
+		return;
+
+	ath10k_conn_watchdog_arm(ar);
+}
+
+static void ath10k_mac_op_mgd_complete_tx(struct ieee80211_hw *hw,
+					  struct ieee80211_vif *vif,
+					  struct ieee80211_prep_tx_info *info)
+{
+	struct ath10k *ar = hw->priv;
+
+	ath10k_conn_watchdog_clear(ar);
+}
+
 static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
 				    struct ieee80211_vif *vif,
 				    struct ieee80211_bss_conf *info,
@@ -6321,6 +6441,8 @@ static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
 				ath10k_monitor_stop(ar);
 			ath10k_bss_assoc(hw, vif, info);
 			ath10k_monitor_recalc(ar);
+			cancel_delayed_work(&ar->conn_watchdog_work);
+			ath10k_conn_watchdog_reset(ar);
 		} else {
 			ath10k_bss_disassoc(hw, vif);
 		}
@@ -9527,6 +9649,8 @@ static const struct ieee80211_ops ath10k_ops = {
 	.remove_interface		= ath10k_remove_interface,
 	.configure_filter		= ath10k_configure_filter,
 	.bss_info_changed		= ath10k_bss_info_changed,
+	.mgd_prepare_tx			= ath10k_mac_op_mgd_prepare_tx,
+	.mgd_complete_tx		= ath10k_mac_op_mgd_complete_tx,
 	.set_coverage_class		= ath10k_mac_op_set_coverage_class,
 	.hw_scan			= ath10k_hw_scan,
 	.cancel_hw_scan			= ath10k_cancel_hw_scan,
