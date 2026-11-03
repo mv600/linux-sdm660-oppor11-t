@@ -2512,10 +2512,14 @@ int ath10k_wmi_event_mgmt_tx_bundle_compl(struct ath10k *ar, struct sk_buff *skb
 	for (i = 0; i < num_reports; i++) {
 		memset(&param, 0, sizeof(struct mgmt_tx_compl_params));
 		param.desc_id = __le32_to_cpu(arg.desc_ids[i]);
-		param.status = __le32_to_cpu(arg.desc_ids[i]);
+		param.status = __le32_to_cpu(arg.status[i]);
 
 		if (test_bit(WMI_SERVICE_TX_DATA_ACK_RSSI, ar->wmi.svc_map))
 			param.ack_rssi = __le32_to_cpu(arg.ack_rssi[i]);
+
+		ath10k_dbg(ar, ATH10K_DBG_WMI,
+			   "wmi tlv bundle mgmt tx completion: desc_id %u status %u\n",
+			   param.desc_id, param.status);
 		wmi_process_mgmt_tx_comp(ar, &param);
 	}
 
