@@ -367,6 +367,8 @@ struct osm_cluster {
 
 	struct osm_lut_entry lut[OSM_TABLE_SIZE];
 	unsigned int num_entries;
+	char lut_prop[40];
+	u32 speedbin;
 
 	struct cpufreq_frequency_table *freq_table;
 	unsigned int num_freqs;
@@ -386,6 +388,7 @@ struct osm_dev {
 	void __iomem *base;
 	phys_addr_t base_phys;
 	void __iomem *pll_base[R11T_NR_CLUSTERS];
+	void __iomem *efuse_base[R11T_NR_CLUSTERS];
 	/* Absolute register addresses CAF hands to the OSM sequencer
 	 * [caf:2273-2285].  Each entry is an address pair from DT, one
 	 * element per cluster.  READ ONLY for now -- nothing writes these.
@@ -1847,10 +1850,8 @@ static int osm_row_to_khz(struct osm_cluster *c, unsigned int row)
 /* DT parsing							      */
 /* ------------------------------------------------------------------ */
 
-static const char * const cluster_lut_prop[R11T_NR_CLUSTERS] = {
-	"qcom,pwrcl-speedbin0-v0",
-	"qcom,perfcl-speedbin0-v0",
-};
+#define R11T_SPEEDBIN_SHIFT	29
+#define R11T_SPEEDBIN_MASK	0x7
 static const char * const cluster_volt_prop[R11T_NR_CLUSTERS] = {
 	"qcom,pwrcl-open-loop-mv",
 	"qcom,perfcl-open-loop-mv",
@@ -1864,13 +1865,58 @@ static const char * const cluster_name[R11T_NR_CLUSTERS] = {
 };
 
 /*
- * Read one 5-tuple LUT and the per corner open loop voltages.
- * Speedbin is hard wired to 0: the R11 stock DTB's qcom,cpufreq-table-4 contains
- * 2457600 kHz, which only exists in qcom,perfcl-speedbin0-v0, and the vendor
- * governor target_loads for cpu4 references 2150400, also speedbin0 only.  CAF
- * normally derives the speedbin from the PTE efuse at 0x784130 bits 29..31
- * (PWRCL_EFUSE_SHIFT / PERFCL_EFUSE_SHIFT both 29) [caf:222-224, caf:3185-3211];
- * that needs the QFPMON RPM region, which is out of scope for the first cut.
+ * Map the cluster's PTE efuse and select its speed-bin table.  The stock DTB
+ * exposes the same 8-byte efuse window under both pwrcl_efuse and perfcl_efuse;
+ * CAF reads bits 31..29 from each and formats
+ * "qcom,{pwrcl,perfcl}-speedbin%d-v0" [caf:222-224, caf:3182-3218].
+ *
+ * A missing efuse resource or missing speed-bin table is fatal.  Falling back
+ * to speed-bin 0 would expose frequencies above the fused maximum on boards
+ * like this R11T, whose efuse selects speed-bin 1.
+ */
+static int osm_select_speedbin(struct platform_device *pdev, int index)
+{
+	static const char * const efuse_res_name[R11T_NR_CLUSTERS] = {
+		"pwrcl_efuse", "perfcl_efuse",
+	};
+	struct osm_dev *p = platform_get_drvdata(pdev);
+	struct osm_cluster *c = &p->cluster[index];
+	struct resource *res;
+	u32 raw;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+					   efuse_res_name[index]);
+	if (!res) {
+		dev_err(&pdev->dev, "missing %s resource\n",
+			efuse_res_name[index]);
+		return -EINVAL;
+	}
+	if (resource_size(res) < sizeof(raw)) {
+		dev_err(&pdev->dev, "%s resource is too small\n",
+			efuse_res_name[index]);
+		return -EINVAL;
+	}
+
+	p->efuse_base[index] = devm_ioremap(&pdev->dev, res->start,
+					     resource_size(res));
+	if (!p->efuse_base[index]) {
+		dev_err(&pdev->dev, "cannot map %s\n", efuse_res_name[index]);
+		return -ENOMEM;
+	}
+
+	raw = readl_relaxed(p->efuse_base[index]);
+	c->speedbin = (raw >> R11T_SPEEDBIN_SHIFT) & R11T_SPEEDBIN_MASK;
+	snprintf(c->lut_prop, sizeof(c->lut_prop),
+		 "qcom,%s-speedbin%u-v0", cluster_name[index], c->speedbin);
+
+	dev_info(&pdev->dev, "%s: efuse=0x%08x speedbin=%u table=%s\n",
+		 cluster_name[index], raw, c->speedbin, c->lut_prop);
+	return 0;
+}
+
+/*
+ * Read one 5-tuple LUT and the per corner open loop voltages.  The property
+ * name was selected from the fused speed-bin by osm_select_speedbin().
  */
 static int osm_parse_lut(struct device *dev, struct osm_cluster *c)
 {
@@ -1896,21 +1942,21 @@ static int osm_parse_lut(struct device *dev, struct osm_cluster *c)
 	 *     probe with driver ... failed with error -22      (-EINVAL)
 	 * 属性在 DT 里是全的（pwrcl 8 行 x 5、perfcl 7 行 x 5），别再去查 DTS。
 	 */
-	ret = of_property_count_u32_elems(np, cluster_lut_prop[c->num]);
+	ret = of_property_count_u32_elems(np, c->lut_prop);
 	if (ret <= 0) {
-		dev_err(dev, "missing %s\n", cluster_lut_prop[c->num]);
+		dev_err(dev, "missing %s\n", c->lut_prop);
 		return ret < 0 ? ret : -EINVAL;
 	}
 	total = ret;
 	prop_len = total * sizeof(u32);
 	if (!total || total % OSM_LUT_NFIELDS) {
 		dev_err(dev, "%s: bad length %u bytes\n",
-			cluster_lut_prop[c->num], prop_len);
+			c->lut_prop, prop_len);
 		return -EINVAL;
 	}
 	if (total / OSM_LUT_NFIELDS > OSM_TABLE_SIZE) {
 		dev_err(dev, "%s: %u rows exceed OSM_TABLE_SIZE %d\n",
-			cluster_lut_prop[c->num],
+			c->lut_prop,
 			total / OSM_LUT_NFIELDS, OSM_TABLE_SIZE);
 		return -EINVAL;
 	}
@@ -1919,7 +1965,7 @@ static int osm_parse_lut(struct device *dev, struct osm_cluster *c)
 	if (!raw)
 		return -ENOMEM;
 
-	ret = of_property_read_u32_array(np, cluster_lut_prop[c->num],
+	ret = of_property_read_u32_array(np, c->lut_prop,
 					 raw, total);
 	if (ret)
 		return ret;
@@ -1957,7 +2003,7 @@ static int osm_parse_lut(struct device *dev, struct osm_cluster *c)
 		if (!vc || vc > n_mv) {
 			dev_err(dev,
 				"%s row %u: virtual corner %u outside 1..%u from %s\n",
-				cluster_lut_prop[c->num], row, vc, n_mv,
+				c->lut_prop, row, vc, n_mv,
 				cluster_volt_prop[c->num]);
 			return -EINVAL;
 		}
@@ -1982,7 +2028,7 @@ static int osm_parse_lut(struct device *dev, struct osm_cluster *c)
 	for (i = 1; i < c->num_entries; i++) {
 		if (c->lut[i].frequency <= c->lut[i - 1].frequency) {
 			dev_err(dev, "%s: frequencies not increasing at row %u (%u <= %u)\n",
-				cluster_lut_prop[c->num], i,
+				c->lut_prop, i,
 				c->lut[i].frequency, c->lut[i - 1].frequency);
 			return -EINVAL;
 		}
@@ -2609,6 +2655,8 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		}
 	}
 
+	platform_set_drvdata(pdev, p);
+
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		struct osm_cluster *c = &p->cluster[i];
 
@@ -2643,6 +2691,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		 * LUT shared.
 		 */
 		c->base = p->base + (unsigned long)i * OSM_CORE_TABLE_SIZE;
+
+		ret = osm_select_speedbin(pdev, i);
+		if (ret)
+			return ret;
 	}
 
 	p->per_policy_governor =
