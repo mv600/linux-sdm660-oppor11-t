@@ -82,6 +82,9 @@
 #define BM(msb, lsb)		((((u32)-1) << (31 - (msb))) >> (31 - (msb) + (lsb))) << (lsb)
 #define BVAL(msb, lsb, val)	(((val) << (lsb)) & BM(msb, lsb))
 #define OSM_DCVS_PERF_STATE_DESIRED	0x1F10	/* [caf:98] */
+#define OSM_CYCLE_COUNTER_CTRL		0x1F00	/* [caf:96] */
+#define OSM_CYCLE_COUNTER_STATUS	0x1F04	/* [caf:97] */
+#define OSM_CYCLE_COUNTER_USE_XO_EDGE	BIT(8)	/* [caf:114] */
 
 /*
  * Per cluster slot size INSIDE the single "osm" reg region.
@@ -128,6 +131,7 @@
 #define PLL_USER_CTRL         0x0C  /* caf:119 */
 #define PLL_CONFIG_CTL_LO     0x10  /* caf:120 */
 #define PLL_STATUS            0x2C  /* caf:121 */
+#define PLL_LOCK_DET_MASK     BIT(16) /* caf:122 */
 #define PLL_MODE_MAIN         0x07  /* caf:131 */
 #define PLL_WAIT_LOCK_TIME_US 5
 /* --------------------------------------------------------------- */
@@ -248,7 +252,14 @@
 #define PLL_MIN_LVAL			43	/* caf:125 */
 
 /* SPM / APM constants [caf:130, 144-148] */
+#define CC_ZERO_BEHAV_CTRL		0x100C	/* caf:128 */
+#define SPM_CC_HYSTERESIS		0x101C	/* caf:131 */
+#define SPM_CC_DCVS_DISABLE		0x1020	/* caf:129 */
+#define SPM_CORE_RET_MAPPING		0x1024	/* caf:132 */
 #define SPM_CC_CTRL			0x1028	/* caf:130 */
+#define LLM_FREQ_VOTE_HYSTERESIS	0x102C	/* caf:135 */
+#define LLM_VOLT_VOTE_HYSTERESIS	0x1030	/* caf:136 */
+#define LLM_INTF_DCVS_DISABLE		0x1034	/* caf:137 */
 #define APM_MX_MODE			0	/* caf:144 */
 #define APM_APC_MODE			BIT(1)	/* caf:145 */
 #define APM_MODE_SWITCH_MASK		(BVAL(4, 2, 7) | BVAL(1, 0, 3)) /* caf:146 */
@@ -878,6 +889,137 @@ static void osm_dump_rcgr(struct osm_dev *p)
 		for (off = 0; off < 0x70; off += 4)
 			dev_info(p->dev, "  +0x%03x = 0x%08x\n", off,
 				 readl_relaxed(p->rcgr_base[i] + off));
+	}
+}
+
+/*
+ * CAF clk_osm_setup_cycle_counters() [caf:2105-2122].  The counter is part
+ * of the OSM clock/DVCS policy, not merely a debug feature.  Its control
+ * value also encodes the OSM-to-XO ratio used by the hardware timers.
+ */
+static int osm_setup_cycle_counters(struct osm_dev *p)
+{
+	unsigned int i;
+	u32 ratio = p->osm_clk_rate;
+
+	do_div(ratio, p->xo_clk_rate);
+	if (!ratio || ratio > 32) {
+		dev_err(p->dev, "invalid OSM/XO ratio %u (%u/%u)\n",
+			ratio, p->osm_clk_rate, p->xo_clk_rate);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 val = BIT(0) | OSM_CYCLE_COUNTER_USE_XO_EDGE |
+			  BVAL(5, 1, ratio - 1);
+
+		osm_write(c, val, OSM_CYCLE_COUNTER_CTRL);
+		osm_mb(c);
+		dev_info(p->dev, "%s: cycle counter ctrl=0x%08x (OSM/XO=%u)\n",
+			 c->name, val, ratio);
+	}
+	return 0;
+}
+
+/*
+ * CAF clk_osm_set_cc_policy() [caf:1705-1794].  The stock node supplies
+ * qcom,up-timer/down-timer and qcom,set-ret-inactive.  The latter is
+ * important: the bootloader's value is not necessarily the vendor policy.
+ */
+static void osm_setup_cc_policy(struct osm_dev *p)
+{
+	struct device_node *np = p->dev->of_node;
+	u32 up[R11T_NR_CLUSTERS], down[R11T_NR_CLUSTERS];
+	bool has_up, has_down, ret_inactive;
+	unsigned int i;
+
+	has_up = !of_property_read_u32_array(np, "qcom,up-timer", up,
+					      R11T_NR_CLUSTERS);
+	has_down = !of_property_read_u32_array(np, "qcom,down-timer", down,
+						R11T_NR_CLUSTERS);
+	ret_inactive = of_property_read_bool(np, "qcom,set-ret-inactive");
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 val;
+
+		if (has_up || has_down) {
+			val = osm_read(c, SPM_CC_HYSTERESIS);
+			if (has_up)
+				val |= BVAL(31, 16, osm_count_ns(p, up[i]));
+			if (has_down)
+				val |= BVAL(15, 0, osm_count_ns(p, down[i]));
+			osm_write(c, val, SPM_CC_HYSTERESIS);
+		}
+
+		/* No qcom,pc-override-index in the stock R11T node. */
+		osm_write(c, 0, CC_ZERO_BEHAV_CTRL);
+		osm_write(c, ret_inactive ? 0 : 1, SPM_CORE_RET_MAPPING);
+		osm_write(c,
+			  of_property_read_bool(np, "qcom,disable-cc-dvcs") ? 1 : 0,
+			  SPM_CC_DCVS_DISABLE);
+		osm_mb(c);
+	}
+}
+
+/*
+ * CAF clk_osm_set_llm_freq_policy()/clk_osm_set_llm_volt_policy()
+ * [caf:1815-1964].  The stock R11T node enables both vote paths.
+ */
+static void osm_setup_llm_policy(struct osm_dev *p)
+{
+	struct device_node *np = p->dev->of_node;
+	u32 freq_up[R11T_NR_CLUSTERS], freq_down[R11T_NR_CLUSTERS];
+	u32 volt_up[R11T_NR_CLUSTERS], volt_down[R11T_NR_CLUSTERS];
+	bool has_freq_up, has_freq_down, has_volt_up, has_volt_down;
+	bool enable_freq, enable_volt;
+	unsigned int i;
+
+	has_freq_up = !of_property_read_u32_array(np, "qcom,llm-freq-up-timer",
+						  freq_up, R11T_NR_CLUSTERS);
+	has_freq_down = !of_property_read_u32_array(np,
+					    "qcom,llm-freq-down-timer",
+					    freq_down, R11T_NR_CLUSTERS);
+	has_volt_up = !of_property_read_u32_array(np, "qcom,llm-volt-up-timer",
+						  volt_up, R11T_NR_CLUSTERS);
+	has_volt_down = !of_property_read_u32_array(np,
+					    "qcom,llm-volt-down-timer",
+					    volt_down, R11T_NR_CLUSTERS);
+	enable_freq = of_property_read_bool(np, "qcom,enable-llm-freq-vote");
+	enable_volt = of_property_read_bool(np, "qcom,enable-llm-volt-vote");
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 val;
+
+		if (has_freq_up || has_freq_down) {
+			val = osm_read(c, LLM_FREQ_VOTE_HYSTERESIS);
+			if (has_freq_up)
+				val |= BVAL(31, 16,
+					    osm_count_ns(p, freq_up[i]));
+			if (has_freq_down)
+				val |= BVAL(15, 0,
+					    osm_count_ns(p, freq_down[i]));
+			osm_write(c, val, LLM_FREQ_VOTE_HYSTERESIS);
+		}
+
+		if (has_volt_up || has_volt_down) {
+			val = osm_read(c, LLM_VOLT_VOTE_HYSTERESIS);
+			if (has_volt_up)
+				val |= BVAL(31, 16,
+					    osm_count_ns(p, volt_up[i]));
+			if (has_volt_down)
+				val |= BVAL(15, 0,
+					    osm_count_ns(p, volt_down[i]));
+			osm_write(c, val, LLM_VOLT_VOTE_HYSTERESIS);
+		}
+
+		val = osm_read(c, LLM_INTF_DCVS_DISABLE);
+		val |= enable_freq ? 0 : BIT(0);
+		val |= enable_volt ? 0 : BIT(1);
+		osm_write(c, val, LLM_INTF_DCVS_DISABLE);
+		osm_mb(c);
 	}
 }
 
@@ -2481,6 +2623,55 @@ static const struct file_operations osm_seq_fops = {
 	.release = osm_lut_release,
 };
 
+static void osm_state_show_one(struct seq_file *m, struct osm_dev *p, int cl)
+{
+	struct osm_cluster *c = &p->cluster[cl];
+	u32 row = osm_get_row(c);
+	u32 pll_mode = 0, pll_lval = 0, pll_status = 0;
+	u32 rcgr_cfg = 0, clk_src = 0;
+
+	if (p->pll_base[cl]) {
+		pll_mode = readl_relaxed(p->pll_base[cl] + PLL_MODE);
+		pll_lval = readl_relaxed(p->pll_base[cl] + PLL_L_VAL);
+		pll_status = readl_relaxed(p->pll_base[cl] + PLL_STATUS);
+	}
+	if (p->rcgr_base[cl]) {
+		rcgr_cfg = readl_relaxed(p->rcgr_base[cl] + RCGR_CFG);
+		clk_src = rcgr_cfg & 0xFFFF;
+	}
+
+	seq_printf(m,
+		   "%s: speedbin=%u row=%u requested=%u kHz pll_lval=0x%02x pll_mode=0x%x pll_status=0x%08x lock=%u rcgr_cfg=0x%08x clk_src=0x%x cc=0x%08x cc_status=0x%08x\n",
+		   c->name, c->speedbin, row, osm_row_to_khz(c, row),
+		   pll_lval & 0xff, pll_mode, pll_status,
+		   !!(pll_status & PLL_LOCK_DET_MASK), rcgr_cfg, clk_src,
+		   osm_read(c, OSM_CYCLE_COUNTER_CTRL),
+		   osm_read(c, OSM_CYCLE_COUNTER_STATUS));
+}
+
+static int osm_state_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	if (!osmdev)
+		return -ENODEV;
+	for (i = 0; i < R11T_NR_CLUSTERS; i++)
+		osm_state_show_one(m, osmdev, i);
+	return 0;
+}
+
+static int osm_state_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, osm_state_show, NULL);
+}
+
+static const struct file_operations osm_state_fops = {
+	.open	= osm_state_open,
+	.read	= seq_read,
+	.llseek	= seq_lseek,
+	.release = osm_lut_release,
+};
+
 static int osm_regs_show(struct seq_file *m, void *v)
 {
 	unsigned int i, j;
@@ -2554,6 +2745,7 @@ static void osm_debugfs_init(struct device *dev)
 	debugfs_create_file("lut", 0444, osm_dbg_dir, NULL, &osm_lut_fops);
 	debugfs_create_file("regs", 0444, osm_dbg_dir, NULL, &osm_regs_fops);
 	debugfs_create_file("seq", 0444, osm_dbg_dir, NULL, &osm_seq_fops);
+	debugfs_create_file("state", 0444, osm_dbg_dir, NULL, &osm_state_fops);
 	debugfs_create_file("dryrun", 0644, osm_dbg_dir, NULL, &dryrun_fops);
 }
 
@@ -2813,6 +3005,13 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		}
 
 		osm_setup_fsms(p);
+		osm_setup_cc_policy(p);
+		osm_setup_llm_policy(p);
+		ret = osm_setup_cycle_counters(p);
+		if (ret) {
+			osmdev = NULL;
+			return ret;
+		}
 
 		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 			struct osm_cluster *c = &p->cluster[i];

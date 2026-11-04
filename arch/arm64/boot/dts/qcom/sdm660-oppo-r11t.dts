@@ -367,6 +367,19 @@
 		qcom,wfx-fsm-en;
 		qcom,pc-fsm-en;
 
+		/* Complete stock OSM policy, verbatim from the R11T DTB
+		 * [stock-r11t.dts:4549-4560].
+		 */
+		qcom,set-ret-inactive;
+		qcom,up-timer = <0x3e8 0x3e8>;
+		qcom,down-timer = <0x3e8 0x3e8>;
+		qcom,enable-llm-freq-vote;
+		qcom,llm-freq-up-timer = <0x4fffb 0x4fffb>;
+		qcom,llm-freq-down-timer = <0x4fffb 0x4fffb>;
+		qcom,enable-llm-volt-vote;
+		qcom,llm-volt-up-timer = <0x4fffb 0x4fffb>;
+		qcom,llm-volt-down-timer = <0x4fffb 0x4fffb>;
+
 		/* Logical CPU ids per cluster -- NOT the DT reg values.
 		 *
 		 * The DT blob lists big cores first (cpu@100..103 occupy blob
