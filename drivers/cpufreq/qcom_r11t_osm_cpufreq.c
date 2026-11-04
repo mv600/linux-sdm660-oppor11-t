@@ -474,6 +474,29 @@ MODULE_PARM_DESC(lval_force_full,
 		 "When lval_test=true, also run CAF's full MODE sequence (riskier).");
 
 /*
+ * One-shot PLL bring-up test.  This is deliberately separate from lval_test:
+ * lval_test writes a caller-supplied divider and can run while the OSM is
+ * live, whereas this path proves that the PLL can lock at a frequency taken
+ * from the selected LUT row.  It is only allowed while the OSM is still in
+ * dryrun and the CPU root clock generator is sourced from GPLL0, so the CPUs
+ * do not depend on the PLL being reprogrammed.
+ */
+static bool pll_bringup_test = false;
+module_param(pll_bringup_test, bool, 0444);
+MODULE_PARM_DESC(pll_bringup_test,
+		 "Default false. Test-only: program one cluster PLL from one LUT row and poll PLL_STATUS for lock. Requires dryrun=1 and an RCGR still sourced from GPLL0; writes no RCGR or OSM table registers.");
+
+static int pll_bringup_cl = R11T_CLUSTER_PWRCL;
+module_param(pll_bringup_cl, int, 0444);
+MODULE_PARM_DESC(pll_bringup_cl,
+		 "Cluster for pll_bringup_test: 0 = pwrcl (A53), 1 = perfcl (A73). Default 0. Only one cluster may be tested per boot.");
+
+static int pll_bringup_row = 1;
+module_param(pll_bringup_row, int, 0444);
+MODULE_PARM_DESC(pll_bringup_row,
+		 "LUT row for pll_bringup_test. Default 1 (633.6 MHz on pwrcl). Row 0 is GPLL0 and is rejected.");
+
+/*
  * apm: gate the Array Power Mux programming.  DEFAULT OFF, deliberately.
  *
  * CAF runs clk_osm_program_apm_regs() [caf:2282] immediately followed by
@@ -1976,6 +1999,117 @@ static void osm_lval_experiment(struct osm_dev *p)
 		 "=== L_VAL EXPERIMENT DONE — now run the md5 benchmark ===\n");
 }
 
+static int osm_pll_wait_lock(struct osm_dev *p, int cl)
+{
+	void __iomem *b = p->pll_base[cl];
+	unsigned int waited;
+	u32 status;
+
+	/* CAF only waits a fixed 10 us.  A real PLL lock can take longer on a
+	 * cold divider change, so poll the documented lock bit instead of
+	 * treating the delay itself as proof of success.
+	 */
+	for (waited = 0; waited < 1000; waited += 10) {
+		status = readl_relaxed(b + PLL_STATUS);
+		if (status & PLL_LOCK_DET_MASK)
+			return 0;
+		usleep_range(10, 20);
+	}
+
+	dev_err(p->dev, "%s PLL did not lock: STATUS=0x%08x after %u us\n",
+		p->cluster[cl].name, readl_relaxed(b + PLL_STATUS), waited);
+	return -ETIMEDOUT;
+}
+
+static int osm_pll_bringup(struct osm_dev *p, int cl, unsigned int row)
+{
+	struct osm_cluster *c = &p->cluster[cl];
+	void __iomem *b = p->pll_base[cl];
+	u32 want_lval;
+	int ret;
+
+	if (cl < 0 || cl >= R11T_NR_CLUSTERS)
+		return -EINVAL;
+	if (!b) {
+		dev_err(p->dev, "%s: PLL resource is not mapped\n", c->name);
+		return -ENODEV;
+	}
+	if (row == 0 || row >= c->num_entries) {
+		dev_err(p->dev, "%s: PLL test row %u is outside 1..%u\n",
+			c->name, row, c->num_entries - 1);
+		return -EINVAL;
+	}
+	if (dryrun == false) {
+		dev_err(p->dev, "%s: PLL bring-up requires dryrun=1\n", c->name);
+		return -EPERM;
+	}
+	if (!p->rcgr_base[cl]) {
+		dev_err(p->dev, "%s: RCGR is not mapped; cannot prove GPLL0 is active\n",
+			c->name);
+		return -ENODEV;
+	}
+
+	/* Row 0 is the GPLL0 entry.  If CFG_RCGR still selects it, taking the
+	 * APCS PLL through MODE 0/2/6/7 cannot stop the CPUs.  Require that
+	 * exact state rather than assuming it from the bootloader.
+	 */
+	if ((readl_relaxed(p->rcgr_base[cl] + RCGR_CFG) & 0xffff) !=
+	    (GPLL_SEL & 0xffff)) {
+		dev_err(p->dev,
+			"%s: RCGR CLK_SRC=0x%04x is not GPLL0 (0x%04x); refusing live PLL test\n",
+			c->name, readl_relaxed(p->rcgr_base[cl] + RCGR_CFG) & 0xffff,
+			GPLL_SEL & 0xffff);
+		return -EPERM;
+	}
+
+	want_lval = R11T_L_VAL(c->lut[row].freq_data);
+	if (!want_lval) {
+		dev_err(p->dev, "%s: row %u has an empty L_VAL\n", c->name, row);
+		return -EINVAL;
+	}
+
+	dev_warn(p->dev,
+		 "=== PLL BRING-UP TEST: %s row %u (%u kHz), L_VAL %u ===\n",
+		 c->name, row, div_u64(c->lut[row].frequency, 1000), want_lval);
+	osm_lval_dump(p, cl, "before");
+	dev_info(p->dev, "%s: RCGR before CFG=0x%08x CMD=0x%08x\n",
+		 c->name, readl_relaxed(p->rcgr_base[cl] + RCGR_CFG),
+		 readl_relaxed(p->rcgr_base[cl] + RCGR_CMD));
+
+	/* Exact CAF clk_osm_setup_cluster_pll() order [caf:1510-1531],
+	 * with a lock poll after the main-mode transition.
+	 */
+	writel_relaxed(PLL_MODE_OFF, b + PLL_MODE);
+	writel_relaxed(want_lval, b + PLL_L_VAL);
+	writel_relaxed(PLL_USER_CTRL_VAL, b + PLL_USER_CTRL);
+	writel_relaxed(PLL_CONFIG_CTL_LO_VAL, b + PLL_CONFIG_CTL_LO);
+	writel_relaxed(PLL_MODE_MUX, b + PLL_MODE);
+	readl_relaxed(b + PLL_MODE);
+	udelay(PLL_WAIT_LOCK_TIME_US);
+
+	writel_relaxed(PLL_MODE_RESET, b + PLL_MODE);
+	readl_relaxed(b + PLL_MODE);
+	usleep_range(50, 75);
+
+	writel_relaxed(PLL_MODE_MAIN, b + PLL_MODE);
+	ret = osm_pll_wait_lock(p, cl);
+	osm_lval_dump(p, cl, ret ? "failed" : "locked");
+	if (ret)
+		return ret;
+
+	/* A lock bit alone does not prove that the root clock is consuming this
+	 * PLL.  Leave RCGR untouched and report it so the caller can see that
+	 * this test covers PLL bring-up only, not the OSM handoff.
+	 */
+	dev_warn(p->dev,
+		 "%s: PLL locked at row %u; RCGR after CFG=0x%08x CMD=0x%08x (not changed)\n",
+		 c->name, row, readl_relaxed(p->rcgr_base[cl] + RCGR_CFG),
+		 readl_relaxed(p->rcgr_base[cl] + RCGR_CMD));
+	dev_warn(p->dev,
+		 "=== PLL BRING-UP TEST DONE: reboot before any further PLL experiment ===\n");
+	return 0;
+}
+
 static unsigned int osm_get_row(struct osm_cluster *c)
 {
 	return osm_read(c, OSM_DCVS_PERF_STATE_DESIRED);
@@ -2769,6 +2903,11 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	if (osmdev)
 		return -EBUSY;
 
+	if (lval_test && pll_bringup_test) {
+		dev_err(dev, "lval_test and pll_bringup_test are mutually exclusive\n");
+		return -EINVAL;
+	}
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
 		dev_err(dev, "no reg resource\n");
@@ -3061,6 +3200,15 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	 */
 	if (lval_test)
 		osm_lval_experiment(p);
+
+	if (pll_bringup_test) {
+		ret = osm_pll_bringup(p, pll_bringup_cl, pll_bringup_row);
+		if (ret) {
+			dev_err(dev, "PLL bring-up test failed: %d\n", ret);
+			osmdev = NULL;
+			return ret;
+		}
+	}
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		int cap = i == R11T_CLUSTER_PWRCL ? pwrcl_max_row :
