@@ -892,6 +892,12 @@ static void osm_dump_rcgr(struct osm_dev *p)
 	}
 }
 
+static u32 osm_count_ns(struct osm_dev *p, u32 nsec)
+{
+	/* caf:589-597: count_ns = osm_clk_rate * nsec / 1e9 */
+	return div_u64((u64)p->osm_clk_rate * nsec, 1000000000ULL);
+}
+
 /*
  * CAF clk_osm_setup_cycle_counters() [caf:2105-2122].  The counter is part
  * of the OSM clock/DVCS policy, not merely a debug feature.  Its control
@@ -1032,12 +1038,6 @@ static void osm_setup_llm_policy(struct osm_dev *p)
 /* writes both the timers and the enable bits, so this port follows that  */
 /* order.  Timing and enable changes are applied only when dryrun=0.      */
 /* ------------------------------------------------------------------ */
-static u32 osm_count_ns(struct osm_dev *p, u32 nsec)
-{
-	/* caf:589-597: count_ns = osm_clk_rate * nsec / 1e9 */
-	return div_u64((u64)p->osm_clk_rate * nsec, 1000000000ULL);
-}
-
 static void osm_write_orm(struct osm_cluster *c, u32 val, u32 offset)
 {
 	u32 tmp = osm_read(c, offset);
