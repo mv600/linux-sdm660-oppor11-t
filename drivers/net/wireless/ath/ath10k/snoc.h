@@ -84,6 +84,7 @@ struct ath10k_snoc {
 	struct notifier_block nb;
 	void *notifier;
 	unsigned long flags;
+	bool ce_irqs_enabled;
 	bool xo_cal_supported;
 	u32 xo_cal_data;
 	DECLARE_BITMAP(pending_ce_irqs, CE_COUNT_MAX);

@@ -834,8 +834,13 @@ static inline void ath10k_snoc_irq_disable(struct ath10k *ar)
 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
 	int id;
 
+	if (!ar_snoc->ce_irqs_enabled)
+		return;
+
 	for (id = 0; id < CE_COUNT_MAX; id++)
 		disable_irq(ar_snoc->ce_irqs[id].irq_line);
+
+	ar_snoc->ce_irqs_enabled = false;
 }
 
 static inline void ath10k_snoc_irq_enable(struct ath10k *ar)
@@ -843,8 +848,13 @@ static inline void ath10k_snoc_irq_enable(struct ath10k *ar)
 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
 	int id;
 
+	if (ar_snoc->ce_irqs_enabled)
+		return;
+
 	for (id = 0; id < CE_COUNT_MAX; id++)
 		enable_irq(ar_snoc->ce_irqs[id].irq_line);
+
+	ar_snoc->ce_irqs_enabled = true;
 }
 
 static void ath10k_snoc_rx_pipe_cleanup(struct ath10k_snoc_pipe *snoc_pipe)
