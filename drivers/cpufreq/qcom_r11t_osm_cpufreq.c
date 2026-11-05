@@ -2246,6 +2246,24 @@ static int osm_rcgr_handoff(struct osm_dev *p, int cl, unsigned int row)
 	if (ret)
 		goto restore;
 
+	/*
+	 * Bootloader traces from the early bring-up show pwrcl at CFG_RCGR=0x501
+	 * and perfcl at 0x401: the hardware uses the PLL early output before
+	 * the main output.  Follow the same two-step path instead of asking the
+	 * RCG to jump directly from GPLL0 to the main APCS PLL.
+	 */
+	ret = osm_rcgr_set_source(p, cl, PLL_EARLY_SEL);
+	if (ret)
+		goto restore;
+
+	udelay(10);
+	if (!(readl_relaxed(p->pll_base[cl] + PLL_STATUS) & PLL_LOCK_DET_MASK)) {
+		dev_err(p->dev, "%s: PLL lost lock after early-source handoff\n",
+			c->name);
+		ret = -EIO;
+		goto restore;
+	}
+
 	ret = osm_rcgr_set_source(p, cl, PLL_MAIN_SEL);
 	if (ret)
 		goto restore;
@@ -2255,7 +2273,7 @@ static int osm_rcgr_handoff(struct osm_dev *p, int cl, unsigned int row)
 	 */
 	udelay(10);
 	if (!(readl_relaxed(p->pll_base[cl] + PLL_STATUS) & PLL_LOCK_DET_MASK)) {
-		dev_err(p->dev, "%s: PLL lost lock after RCGR handoff\n",
+		dev_err(p->dev, "%s: PLL lost lock after main-source handoff\n",
 			c->name);
 		ret = -EIO;
 		goto restore;
