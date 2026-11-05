@@ -135,6 +135,8 @@
 #define PLL_LOCK_DET_MASK     BIT(16) /* caf:122 */
 #define PLL_MODE_MAIN         0x07  /* caf:131 */
 #define PLL_WAIT_LOCK_TIME_US 5
+/* PLL_USER_CTL output gates, from Qualcomm HALclkFabiaPLL.h. */
+#define PLL_USER_CTRL_MAIN_OUT  BIT(0)
 /* --------------------------------------------------------------- */
 /* Sequencer registers.  These are offsets into the OSM window     */
 /* (OSM_BASE), NOT into the PLL window -- caf:414-417 writes them   */
@@ -2095,6 +2097,47 @@ static int osm_pll_lock_row(struct osm_dev *p, int cl, unsigned int row)
 	return osm_pll_wait_lock(p, cl);
 }
 
+/*
+ * CAF's clk_osm_setup_cluster_pll() writes USER_CTRL=0x01000008 while it
+ * brings the APCS PLL up.  The low output bits are PLLOUT_MAIN=BIT(0),
+ * PLLOUT_AUX=BIT(1), PLLOUT_AUX2=BIT(2) and PLLOUT_EARLY=BIT(3), so that
+ * literal deliberately leaves only the early output enabled.  The early
+ * source can therefore be selected, but a subsequent switch to the main
+ * source has no main clock to consume and the RCG update never completes.
+ *
+ * Restore only the main-output gate, preserving every other USER_CTRL bit,
+ * after the early source has taken over and the PLL has stayed locked.
+ */
+static int osm_pll_enable_main_output(struct osm_dev *p, int cl)
+{
+	void __iomem *b = p->pll_base[cl];
+	u32 ctl, old;
+
+	if (!b)
+		return -ENODEV;
+
+	old = readl_relaxed(b + PLL_USER_CTRL);
+	ctl = old | PLL_USER_CTRL_MAIN_OUT;
+	if (ctl != old) {
+		writel_relaxed(ctl, b + PLL_USER_CTRL);
+		readl_relaxed(b + PLL_USER_CTRL);
+		udelay(10);
+		ctl = readl_relaxed(b + PLL_USER_CTRL);
+	}
+
+	dev_info(p->dev,
+		 "%s: PLL USER_CTRL main output %s: 0x%08x -> 0x%08x\n",
+		 p->cluster[cl].name, (ctl & PLL_USER_CTRL_MAIN_OUT) ?
+		 "enabled" : "MISSING", old, ctl);
+
+	if (!(ctl & PLL_USER_CTRL_MAIN_OUT)) {
+		dev_err(p->dev, "%s: PLL main output did not enable\n",
+			p->cluster[cl].name);
+		return -EIO;
+	}
+	return 0;
+}
+
 static int osm_rcgr_update(struct osm_dev *p, int cl)
 {
 	void __iomem *b = p->rcgr_base[cl];
@@ -2263,6 +2306,14 @@ static int osm_rcgr_handoff(struct osm_dev *p, int cl, unsigned int row)
 		ret = -EIO;
 		goto restore;
 	}
+
+	/* The CAF PLL bring-up literal leaves PLLOUT_MAIN disabled.  Enable it
+	 * while the early source is active, then verify it before asking RCGR
+	 * to consume the main output.
+	 */
+	ret = osm_pll_enable_main_output(p, cl);
+	if (ret)
+		goto restore;
 
 	ret = osm_rcgr_set_source(p, cl, PLL_MAIN_SEL);
 	if (ret)
