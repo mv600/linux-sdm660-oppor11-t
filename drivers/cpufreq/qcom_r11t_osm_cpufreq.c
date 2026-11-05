@@ -64,6 +64,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/reboot.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
 
@@ -247,6 +248,10 @@
 #define PLL_EARLY_SEL			0x500
 #define RCG_UPDATE			0x3	/* caf:153 */
 #define RCG_UPDATE_SUCCESS		0x2	/* caf:154 */
+
+/* Standard RCG command/config fields, as used by drivers/clk/qcom/clk-rcg2.c. */
+#define RCGR_CMD_UPDATE			BIT(0)
+#define RCGR_CFG_SRC_MASK		GENMASK(10, 8)
 #define PLL_POST_DIV1			0x1F	/* caf:155 */
 #define PLL_POST_DIV2			0x11F	/* caf:156 */
 #define PLL_MIN_LVAL			43	/* caf:125 */
@@ -495,6 +500,28 @@ static int pll_bringup_row = 1;
 module_param(pll_bringup_row, int, 0444);
 MODULE_PARM_DESC(pll_bringup_row,
 		 "LUT row for pll_bringup_test. Default 1 (633.6 MHz on pwrcl). Row 0 is GPLL0 and is rejected.");
+
+/*
+ * One-shot RCGR source handoff test.  This is the next step after proving that
+ * both APCS PLLs can lock: lock one cluster's PLL at one LUT row, then move
+ * only that cluster's root clock generator from GPLL0 to the APCS PLL.  It
+ * deliberately stays in dryrun mode, so the OSM table and cpufreq requests are
+ * untouched; the RCGR source is the only variable.
+ */
+static bool rcgr_handoff_test = false;
+module_param(rcgr_handoff_test, bool, 0444);
+MODULE_PARM_DESC(rcgr_handoff_test,
+		 "Default false. Test-only: lock one cluster PLL at one LUT row, switch its CFG_RCGR source from GPLL0 (0x400) to the APCS PLL (0x300), and wait for CMD_RCGR update completion. Requires dryrun=1 and one cluster per boot. Restores GPLL0 on any failed verification.");
+
+static int rcgr_handoff_cl = R11T_CLUSTER_PWRCL;
+module_param(rcgr_handoff_cl, int, 0444);
+MODULE_PARM_DESC(rcgr_handoff_cl,
+		 "Cluster for rcgr_handoff_test: 0 = pwrcl (A53), 1 = perfcl (A73). Default 0. Only one cluster may be tested per boot.");
+
+static int rcgr_handoff_row = 1;
+module_param(rcgr_handoff_row, int, 0444);
+MODULE_PARM_DESC(rcgr_handoff_row,
+		 "LUT row for rcgr_handoff_test. Default 1 (633.6 MHz on pwrcl). Row 0 is GPLL0 and is rejected.");
 
 /*
  * apm: gate the Array Power Mux programming.  DEFAULT OFF, deliberately.
@@ -2021,12 +2048,11 @@ static int osm_pll_wait_lock(struct osm_dev *p, int cl)
 	return -ETIMEDOUT;
 }
 
-static int osm_pll_bringup(struct osm_dev *p, int cl, unsigned int row)
+static int osm_pll_lock_row(struct osm_dev *p, int cl, unsigned int row)
 {
 	struct osm_cluster *c = &p->cluster[cl];
 	void __iomem *b = p->pll_base[cl];
 	u32 want_lval;
-	int ret;
 
 	if (cl < 0 || cl >= R11T_NR_CLUSTERS)
 		return -EINVAL;
@@ -2039,6 +2065,93 @@ static int osm_pll_bringup(struct osm_dev *p, int cl, unsigned int row)
 			c->name, row, c->num_entries - 1);
 		return -EINVAL;
 	}
+
+	want_lval = R11T_L_VAL(c->lut[row].freq_data);
+	if (!want_lval) {
+		dev_err(p->dev, "%s: row %u has an empty L_VAL\n", c->name, row);
+		return -EINVAL;
+	}
+
+	dev_info(p->dev, "%s: locking PLL at row %u (%u kHz), L_VAL %u\n",
+		 c->name, row, div_u64(c->lut[row].frequency, 1000), want_lval);
+	osm_lval_dump(p, cl, "before");
+
+	/* Exact CAF clk_osm_setup_cluster_pll() order [caf:1510-1531],
+	 * with a lock poll after the main-mode transition.
+	 */
+	writel_relaxed(PLL_MODE_OFF, b + PLL_MODE);
+	writel_relaxed(want_lval, b + PLL_L_VAL);
+	writel_relaxed(PLL_USER_CTRL_VAL, b + PLL_USER_CTRL);
+	writel_relaxed(PLL_CONFIG_CTL_LO_VAL, b + PLL_CONFIG_CTL_LO);
+	writel_relaxed(PLL_MODE_MUX, b + PLL_MODE);
+	readl_relaxed(b + PLL_MODE);
+	udelay(PLL_WAIT_LOCK_TIME_US);
+
+	writel_relaxed(PLL_MODE_RESET, b + PLL_MODE);
+	readl_relaxed(b + PLL_MODE);
+	usleep_range(50, 75);
+
+	writel_relaxed(PLL_MODE_MAIN, b + PLL_MODE);
+	return osm_pll_wait_lock(p, cl);
+}
+
+static int osm_rcgr_update(struct osm_dev *p, int cl)
+{
+	void __iomem *b = p->rcgr_base[cl];
+	unsigned int waited;
+	u32 cmd;
+
+	cmd = readl_relaxed(b + RCGR_CMD);
+	writel_relaxed(cmd | RCGR_CMD_UPDATE, b + RCGR_CMD);
+	readl_relaxed(b + RCGR_CMD);
+
+	for (waited = 0; waited < 500; waited++) {
+		cmd = readl_relaxed(b + RCGR_CMD);
+		if (!(cmd & RCGR_CMD_UPDATE))
+			return 0;
+		udelay(1);
+	}
+
+	dev_err(p->dev, "%s: RCGR update did not complete: CMD=0x%08x\n",
+		p->cluster[cl].name, readl_relaxed(b + RCGR_CMD));
+	return -ETIMEDOUT;
+}
+
+static int osm_rcgr_set_source(struct osm_dev *p, int cl, u32 source)
+{
+	void __iomem *b = p->rcgr_base[cl];
+	u32 cfg, old_cfg, want_cfg;
+
+	old_cfg = readl_relaxed(b + RCGR_CFG);
+	want_cfg = (old_cfg & ~RCGR_CFG_SRC_MASK) |
+		   FIELD_PREP(RCGR_CFG_SRC_MASK, source >> 8);
+
+	dev_info(p->dev,
+		 "%s: RCGR source 0x%03x -> 0x%03x, CFG 0x%08x -> 0x%08x\n",
+		 p->cluster[cl].name, old_cfg & RCGR_CFG_SRC_MASK,
+		 source & RCGR_CFG_SRC_MASK, old_cfg, want_cfg);
+	writel_relaxed(want_cfg, b + RCGR_CFG);
+	readl_relaxed(b + RCGR_CFG);
+
+	if (osm_rcgr_update(p, cl))
+		return -ETIMEDOUT;
+
+	cfg = readl_relaxed(b + RCGR_CFG);
+	if ((cfg & RCGR_CFG_SRC_MASK) != (want_cfg & RCGR_CFG_SRC_MASK)) {
+		dev_err(p->dev,
+			"%s: RCGR source readback 0x%03x, expected 0x%03x\n",
+			p->cluster[cl].name, cfg & RCGR_CFG_SRC_MASK,
+			want_cfg & RCGR_CFG_SRC_MASK);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int osm_pll_bringup(struct osm_dev *p, int cl, unsigned int row)
+{
+	struct osm_cluster *c = &p->cluster[cl];
+	int ret;
+
 	if (dryrun == false) {
 		dev_err(p->dev, "%s: PLL bring-up requires dryrun=1\n", c->name);
 		return -EPERM;
@@ -2062,37 +2175,14 @@ static int osm_pll_bringup(struct osm_dev *p, int cl, unsigned int row)
 		return -EPERM;
 	}
 
-	want_lval = R11T_L_VAL(c->lut[row].freq_data);
-	if (!want_lval) {
-		dev_err(p->dev, "%s: row %u has an empty L_VAL\n", c->name, row);
-		return -EINVAL;
-	}
-
 	dev_warn(p->dev,
-		 "=== PLL BRING-UP TEST: %s row %u (%u kHz), L_VAL %u ===\n",
-		 c->name, row, div_u64(c->lut[row].frequency, 1000), want_lval);
-	osm_lval_dump(p, cl, "before");
+		 "=== PLL BRING-UP TEST: %s row %u (%u kHz) ===\n",
+		 c->name, row, div_u64(c->lut[row].frequency, 1000));
 	dev_info(p->dev, "%s: RCGR before CFG=0x%08x CMD=0x%08x\n",
 		 c->name, readl_relaxed(p->rcgr_base[cl] + RCGR_CFG),
 		 readl_relaxed(p->rcgr_base[cl] + RCGR_CMD));
 
-	/* Exact CAF clk_osm_setup_cluster_pll() order [caf:1510-1531],
-	 * with a lock poll after the main-mode transition.
-	 */
-	writel_relaxed(PLL_MODE_OFF, b + PLL_MODE);
-	writel_relaxed(want_lval, b + PLL_L_VAL);
-	writel_relaxed(PLL_USER_CTRL_VAL, b + PLL_USER_CTRL);
-	writel_relaxed(PLL_CONFIG_CTL_LO_VAL, b + PLL_CONFIG_CTL_LO);
-	writel_relaxed(PLL_MODE_MUX, b + PLL_MODE);
-	readl_relaxed(b + PLL_MODE);
-	udelay(PLL_WAIT_LOCK_TIME_US);
-
-	writel_relaxed(PLL_MODE_RESET, b + PLL_MODE);
-	readl_relaxed(b + PLL_MODE);
-	usleep_range(50, 75);
-
-	writel_relaxed(PLL_MODE_MAIN, b + PLL_MODE);
-	ret = osm_pll_wait_lock(p, cl);
+	ret = osm_pll_lock_row(p, cl, row);
 	osm_lval_dump(p, cl, ret ? "failed" : "locked");
 	if (ret)
 		return ret;
@@ -2108,6 +2198,89 @@ static int osm_pll_bringup(struct osm_dev *p, int cl, unsigned int row)
 	dev_warn(p->dev,
 		 "=== PLL BRING-UP TEST DONE: reboot before any further PLL experiment ===\n");
 	return 0;
+}
+
+static int osm_rcgr_handoff(struct osm_dev *p, int cl, unsigned int row)
+{
+	struct osm_cluster *c;
+	void __iomem *rcgr;
+	int ret;
+
+	if (cl < 0 || cl >= R11T_NR_CLUSTERS)
+		return -EINVAL;
+	c = &p->cluster[cl];
+
+	if (dryrun == false) {
+		dev_err(p->dev, "%s: RCGR handoff requires dryrun=1\n", c->name);
+		return -EPERM;
+	}
+	if (row == 0 || row >= c->num_entries) {
+		dev_err(p->dev, "%s: RCGR test row %u is outside 1..%u\n",
+			c->name, row, c->num_entries - 1);
+		return -EINVAL;
+	}
+	rcgr = p->rcgr_base[cl];
+	if (!rcgr || !p->pll_base[cl]) {
+		dev_err(p->dev, "%s: RCGR or PLL resource is not mapped\n",
+			c->name);
+		return -ENODEV;
+	}
+	if ((readl_relaxed(rcgr + RCGR_CFG) & RCGR_CFG_SRC_MASK) !=
+	    (GPLL_SEL & RCGR_CFG_SRC_MASK)) {
+		dev_err(p->dev,
+			"%s: RCGR source is not GPLL0; refusing handoff test\n",
+			c->name);
+		return -EPERM;
+	}
+
+	dev_warn(p->dev,
+		 "=== RCGR HANDOFF TEST: %s row %u (%u kHz) ===\n",
+		 c->name, row, div_u64(c->lut[row].frequency, 1000));
+	dev_info(p->dev, "%s: before CFG=0x%08x CMD=0x%08x PLL_STATUS=0x%08x\n",
+		 c->name, readl_relaxed(rcgr + RCGR_CFG),
+		 readl_relaxed(rcgr + RCGR_CMD),
+		 readl_relaxed(p->pll_base[cl] + PLL_STATUS));
+
+	ret = osm_pll_lock_row(p, cl, row);
+	osm_lval_dump(p, cl, ret ? "failed" : "locked");
+	if (ret)
+		goto restore;
+
+	ret = osm_rcgr_set_source(p, cl, PLL_MAIN_SEL);
+	if (ret)
+		goto restore;
+
+	/* Give the root clock a few cycles to settle before trusting the source
+	 * readback and the PLL lock bit together.
+	 */
+	udelay(10);
+	if (!(readl_relaxed(p->pll_base[cl] + PLL_STATUS) & PLL_LOCK_DET_MASK)) {
+		dev_err(p->dev, "%s: PLL lost lock after RCGR handoff\n",
+			c->name);
+		ret = -EIO;
+		goto restore;
+	}
+
+	dev_warn(p->dev,
+		 "%s: RCGR handoff OK: CFG=0x%08x CMD=0x%08x source=0x%03x PLL_STATUS=0x%08x\n",
+		 c->name, readl_relaxed(rcgr + RCGR_CFG),
+		 readl_relaxed(rcgr + RCGR_CMD),
+		 readl_relaxed(rcgr + RCGR_CFG) & RCGR_CFG_SRC_MASK,
+		 readl_relaxed(p->pll_base[cl] + PLL_STATUS));
+	dev_warn(p->dev,
+		 "=== RCGR HANDOFF TEST DONE: verify CPU frequency, then reboot ===\n");
+	return 0;
+
+restore:
+	dev_err(p->dev, "%s: handoff failed (%d), restoring GPLL0\n",
+		c->name, ret);
+	if (osm_rcgr_set_source(p, cl, GPLL_SEL)) {
+		dev_emerg(p->dev,
+			  "%s: GPLL0 restore failed; restarting to recover\n",
+			  c->name);
+		emergency_restart();
+	}
+	return ret;
 }
 
 static unsigned int osm_get_row(struct osm_cluster *c)
@@ -2907,6 +3080,14 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		dev_err(dev, "lval_test and pll_bringup_test are mutually exclusive\n");
 		return -EINVAL;
 	}
+	if (lval_test && rcgr_handoff_test) {
+		dev_err(dev, "lval_test and rcgr_handoff_test are mutually exclusive\n");
+		return -EINVAL;
+	}
+	if (pll_bringup_test && rcgr_handoff_test) {
+		dev_err(dev, "pll_bringup_test and rcgr_handoff_test are mutually exclusive\n");
+		return -EINVAL;
+	}
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
@@ -3205,6 +3386,15 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		ret = osm_pll_bringup(p, pll_bringup_cl, pll_bringup_row);
 		if (ret) {
 			dev_err(dev, "PLL bring-up test failed: %d\n", ret);
+			osmdev = NULL;
+			return ret;
+		}
+	}
+
+	if (rcgr_handoff_test) {
+		ret = osm_rcgr_handoff(p, rcgr_handoff_cl, rcgr_handoff_row);
+		if (ret) {
+			dev_err(dev, "RCGR handoff test failed: %d\n", ret);
 			osmdev = NULL;
 			return ret;
 		}
