@@ -360,6 +360,15 @@
 		 * trustzone driver instead, so a mainline kernel has to carry them
 		 * in DT itself.
 		 */
+		/* CAF probe gates PLL bring-up on this bool [caf:3311];
+		 * without it the cluster never leaves GPLL0 and the CPU
+		 * runs at 300 MHz regardless of DCVS requests. */
+		qcom,osm-pll-setup;
+		/* No trustzone on mainline: the APM/MEM-ACC/sequencer
+		 * register block must be programmed by the driver itself
+		 * (CAF [caf:2264] early-returns without this). */
+		qcom,osm-no-tz;
+
 		qcom,boost-fsm-en;
 		qcom,safe-fsm-en;
 		qcom,ps-fsm-en;

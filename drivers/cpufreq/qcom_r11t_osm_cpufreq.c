@@ -427,6 +427,8 @@ struct osm_dev {
 	 * the block base is the containing 4 KiB page.
 	 */
 	void __iomem *rcgr_base[R11T_NR_CLUSTERS];
+	/* apcs_common window (resource "apcs_common") for ITM/APM debug. */
+	void __iomem *apcs_common;
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
 	bool per_policy_governor;
 	u32 osm_clk_rate;
@@ -2370,6 +2372,111 @@ restore:
 	return ret;
 }
 
+/*
+ * Production PLL bring-up + RCGR handoff.  Port of CAF's
+ * clk_osm_setup_cluster_pll() [caf:1508-1531] plus the early->main
+ * two-step source switch, adapted for the live path:
+ *
+ *   - Refuses unless RCGR still sources GPLL0 (row 0), so the CPUs do
+ *     not depend on the PLL while it is reprogrammed.
+ *   - Locks the PLL at `row` (boot rate row), switches GPLL0 -> EARLY
+ *     -> enable MAIN -> MAIN via osm_rcgr_set_source(), verifying the
+ *     lock bit and the source readback at each step.
+ *   - On any failure restores GPLL0; if that restore also fails it
+ *     emergency_restarts rather than leave the CPU on a dead clock.
+ *   - Never fails probe: a failed handoff leaves the cluster on GPLL0
+ *     at 300 MHz (slow but bootable) and the caller logs + continues.
+ *     cpufreq will still work -- the OSM FSM will re-drive L_VAL once
+ *     the sequencer program runs, or the user can retry with the
+ *     test-only rcgr_handoff_test path after a reboot.
+ *
+ * CAF runs this from probe() before clk_prepare_enable /
+ * clk_set_rate(boot_rate).  Our probe runs osm_enable_hw() first
+ * (ENABLE_REG=1) and then calls this before cpufreq_register_driver(),
+ * so the first target_index() already sees the PLL as the root clock.
+ */
+static int osm_pll_handoff_prod(struct osm_dev *p, int cl, unsigned int row)
+{
+	struct osm_cluster *c = &p->cluster[cl];
+	void __iomem *rcgr;
+	int ret;
+
+	if (cl < 0 || cl >= R11T_NR_CLUSTERS)
+		return -EINVAL;
+	if (row == 0 || row >= c->num_entries) {
+		dev_err(p->dev, "%s: handoff row %u outside 1..%u\n",
+			c->name, row, c->num_entries - 1);
+		return -EINVAL;
+	}
+	rcgr = p->rcgr_base[cl];
+	if (!rcgr || !p->pll_base[cl]) {
+		dev_err(p->dev, "%s: RCGR or PLL not mapped, skipping PLL handoff\n",
+			c->name);
+		return -ENODEV;
+	}
+	if ((readl_relaxed(rcgr + RCGR_CFG) & RCGR_CFG_SRC_MASK) !=
+	    (GPLL_SEL & RCGR_CFG_SRC_MASK)) {
+		dev_err(p->dev,
+			"%s: RCGR CLK_SRC=0x%03x is not GPLL0 (0x%03x), skipping PLL handoff\n",
+			c->name,
+			readl_relaxed(rcgr + RCGR_CFG) & RCGR_CFG_SRC_MASK,
+			GPLL_SEL & RCGR_CFG_SRC_MASK);
+		return -EPERM;
+	}
+
+	dev_info(p->dev, "%s: PLL handoff to row %u (%u kHz)\n",
+		 c->name, row, div_u64(c->lut[row].frequency, 1000));
+
+	ret = osm_pll_lock_row(p, cl, row);
+	osm_lval_dump(p, cl, ret ? "handoff-failed" : "handoff-locked");
+	if (ret)
+		goto restore;
+
+	ret = osm_rcgr_set_source(p, cl, PLL_EARLY_SEL);
+	if (ret)
+		goto restore;
+
+	udelay(10);
+	if (!(readl_relaxed(p->pll_base[cl] + PLL_STATUS) &
+	      PLL_LOCK_DET_MASK)) {
+		dev_err(p->dev, "%s: PLL lost lock after early handoff\n", c->name);
+		ret = -EIO;
+		goto restore;
+	}
+
+	ret = osm_pll_enable_main_output(p, cl);
+	if (ret)
+		goto restore;
+
+	ret = osm_rcgr_set_source(p, cl, PLL_MAIN_SEL);
+	if (ret)
+		goto restore;
+
+	udelay(10);
+	if (!(readl_relaxed(p->pll_base[cl] + PLL_STATUS) &
+	      PLL_LOCK_DET_MASK)) {
+		dev_err(p->dev, "%s: PLL lost lock after main handoff\n", c->name);
+		ret = -EIO;
+		goto restore;
+	}
+
+	dev_info(p->dev,
+		 "%s: PLL handoff OK: CFG=0x%08x source=0x%03x PLL_STATUS=0x%08x\n",
+		 c->name, readl_relaxed(rcgr + RCGR_CFG),
+		 readl_relaxed(rcgr + RCGR_CFG) & RCGR_CFG_SRC_MASK,
+		 readl_relaxed(p->pll_base[cl] + PLL_STATUS));
+	return 0;
+
+restore:
+	dev_err(p->dev, "%s: PLL handoff failed (%d), restoring GPLL0\n",
+		c->name, ret);
+	if (osm_rcgr_set_source(p, cl, GPLL_SEL)) {
+		dev_emerg(p->dev, "%s: GPLL0 restore failed; restarting\n", c->name);
+		emergency_restart();
+	}
+	return ret;
+}
+
 static unsigned int osm_get_row(struct osm_cluster *c)
 {
 	return osm_read(c, OSM_DCVS_PERF_STATE_DESIRED);
@@ -3253,6 +3360,16 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		}
 	}
 
+	/* apcs_common: diagnostic only -- RCGR windows live in their own
+	 * pages (page-masked above), not here, so this map is read-only
+	 * context for the ITM/APM register debug dumps. */
+	{
+		struct resource *r = platform_get_resource_byname(pdev,
+							IORESOURCE_MEM, "apcs_common");
+		if (r)
+			p->apcs_common = devm_ioremap_resource(dev, r);
+	}
+
 	platform_set_drvdata(pdev, p);
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
@@ -3437,6 +3554,8 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		}
 		osm_setup_itm(p);
 		osm_setup_sequencer(p);
+		if (!apm && memacc == 0)
+			dev_warn(dev, "apm=0 and memacc=0: SEQ slots 1/2/3/8/15/31/72/73/76 (APM VC) and 55-58/32/49/51-54/59 (MEM-ACC) are all zero; the sequencer microcode may skip the PLL switch step. See 完善计划.md CLK-4.\n");
 		if (memacc == 2)
 			osm_setup_memacc(p);
 
@@ -3453,6 +3572,36 @@ static int r11t_osm_probe(struct platform_device *pdev)
 				osmdev = NULL;
 				return ret;
 				}
+		}
+		/* CAF PLL bring-up + RCGR handoff (CLK-2/CLK-3).  Runs only when
+		 * the DTS carries qcom,osm-pll-setup (CAF probe gates on the
+		 * same bool [caf:3311]).  Each cluster is handed off to its
+		 * boot-rate row (pwrcl row 4 = 1401.6 MHz, perfcl row 4 =
+		 * 1958.4 MHz on speed-bin 1), then a DCVS row request lands
+		 * the OSM at that row -- the equivalent of CAF's
+		 * clk_set_rate(boot_rate) pair [caf:3395-3404].  A failed
+		 * handoff leaves the cluster on GPLL0; probe continues. */
+		if (of_property_read_bool(dev->of_node, "qcom,osm-pll-setup")) {
+			static const unsigned int boot_rows[R11T_NR_CLUSTERS] = { 4, 4 };
+			for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+				unsigned int row = boot_rows[i];
+				if (row >= p->cluster[i].num_entries) row = p->cluster[i].num_entries - 1;
+				ret = osm_pll_handoff_prod(p, i, row);
+				if (ret)
+					dev_warn(dev, "%s: PLL handoff failed (%d), cluster stays on GPLL0\n", p->cluster[i].name, ret);
+				else {
+					/* Land the OSM on the boot row so the FSM
+					 * immediately drives the matching L_VAL.
+					 * A sequencing/stale-seq quirk may still
+					 * hold L_VAL; the state debugfs row
+					 * (clk_src + L_VAL readback) is the
+					 * verdict, not this write. */
+					{
+						int w = osm_set_row(&p->cluster[i], row);
+						dev_info(dev, "%s: DCVS kick row %u -> %d\n", p->cluster[i].name, row, w);
+					}
+				}
+			}
 		}
 	} else {
 		dev_warn(dev,
