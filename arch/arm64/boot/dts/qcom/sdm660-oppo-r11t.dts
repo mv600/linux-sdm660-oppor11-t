@@ -317,6 +317,13 @@
 		clocks = <&gcc HMSS_GPLL0_CLK_SRC>;
 		clock-names = "aux_clk";
 
+		/* Stock OSM debug IRQs.  They report deviation/corrected/met
+		 * status from the hardware state machine; without them the only
+		 * visible fact is that a row number was accepted. */
+		interrupts = <GIC_SPI 35 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 36 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "pwrcl-irq", "perfcl-irq";
+
 		/*
 		 * Address pairs CAF needs to let the OSM state machine actually
 		 * re-program the PLL [caf:2273-2285].  Without these the OSM

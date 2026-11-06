@@ -59,6 +59,7 @@
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/err.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/math64.h>
@@ -68,6 +69,7 @@
 #include <linux/reboot.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
+#include <linux/spinlock.h>
 
 /*
  * OSM (One Speed Manager) register map, offsets inside the "osm" reg region.
@@ -84,9 +86,22 @@
 #define BM(msb, lsb)		((((u32)-1) << (31 - (msb))) >> (31 - (msb) + (lsb))) << (lsb)
 #define BVAL(msb, lsb, val)	(((val) << (lsb)) & BM(msb, lsb))
 #define OSM_DCVS_PERF_STATE_DESIRED	0x1F10	/* [caf:98] */
+#define OSM_DCVS_DEVIATION_STAT		0x1F14	/* [caf:99] */
+#define OSM_DCVS_DEVIATION_EN		0x1F18	/* [caf:100] */
+#define OSM_DCVS_DEVIATION_CLEAR	0x1F1C	/* [caf:101] */
+#define OSM_DCVS_CORRECTED_STAT		0x1F20	/* [caf:102] */
+#define OSM_DCVS_CORRECTED_EN		0x1F24	/* [caf:103] */
+#define OSM_DCVS_CORRECTED_CLEAR	0x1F28	/* [caf:104] */
+#define OSM_DCVS_MET_STAT		0x1F2C	/* [caf:105] */
+#define OSM_DCVS_MET_EN			0x1F30	/* [caf:106] */
+#define OSM_DCVS_MET_CLEAR		0x1F34	/* [caf:107] */
+#define OSM_WDOG_DOMAIN_PSTATE		0x1C00	/* [caf:111] */
+#define OSM_WDOG_PROGRAM_COUNTER	0x1C74	/* [caf:112] */
 #define OSM_CYCLE_COUNTER_CTRL		0x1F00	/* [caf:96] */
 #define OSM_CYCLE_COUNTER_STATUS	0x1F04	/* [caf:97] */
 #define OSM_CYCLE_COUNTER_USE_XO_EDGE	BIT(8)	/* [caf:114] */
+#define OSM_LLM_SW_OVERRIDE		0x1038	/* [caf:158] */
+#define OSM_SEQ_REG1_OFFSET		0x1048	/* [caf:76] */
 
 /*
  * Per cluster slot size INSIDE the single "osm" reg region.
@@ -400,6 +415,18 @@ struct osm_cluster {
 	bool droop_fsm_en;
 	bool wfx_fsm_en;
 	bool pc_fsm_en;
+
+	/* CAF debug IRQ: deviation/corrected/met status is W1C. */
+	int irq;
+	spinlock_t irq_lock;
+	u32 irq_count;
+	u32 irq_deviation_count;
+	u32 irq_corrected_count;
+	u32 irq_met_count;
+	u32 irq_last_deviation;
+	u32 irq_last_corrected;
+	u32 irq_last_met;
+	unsigned long irq_last_jiffies;
 };
 
 struct osm_dev {
@@ -428,6 +455,8 @@ struct osm_dev {
 	 * the block base is the containing 4 KiB page.
 	 */
 	void __iomem *rcgr_base[R11T_NR_CLUSTERS];
+	/* Read-only APM control/status pages used by the snapshot. */
+	void __iomem *apm_base[R11T_NR_CLUSTERS];
 	/* apcs_common window (resource "apcs_common") for ITM/APM debug. */
 	void __iomem *apcs_common;
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
@@ -1868,6 +1897,77 @@ static void osm_setup_seq(struct osm_dev *p)
 	}
 }
 
+/*
+ * CAF's debug IRQ callback [caf:2347-2391].  The three status registers are
+ * documented as W1C and CAF requests SPI 35/36 as rising-edge shared IRQs.
+ * Keeping the counters is important: a "deviation" means the OSM observed a
+ * row request but could not meet it, while "met" is the only direct hardware
+ * acknowledgement that the requested operating point was reached.
+ */
+static irqreturn_t osm_debug_irq(int irq, void *data)
+{
+	struct osm_cluster *c = data;
+	unsigned long flags;
+	u32 deviation, corrected, met;
+	bool handled = false;
+
+	deviation = osm_read(c, OSM_DCVS_DEVIATION_STAT);
+	corrected = osm_read(c, OSM_DCVS_CORRECTED_STAT);
+	met = osm_read(c, OSM_DCVS_MET_STAT);
+
+	if (deviation & BIT(0)) {
+		osm_write(c, BIT(0), OSM_DCVS_DEVIATION_CLEAR);
+		handled = true;
+	}
+	if (corrected & BIT(0)) {
+		osm_write(c, BIT(0), OSM_DCVS_CORRECTED_CLEAR);
+		handled = true;
+	}
+	if (met & BIT(0)) {
+		osm_write(c, BIT(0), OSM_DCVS_MET_CLEAR);
+		handled = true;
+	}
+	osm_mb(c);
+
+	spin_lock_irqsave(&c->irq_lock, flags);
+	c->irq_count++;
+	c->irq_deviation_count += !!(deviation & BIT(0));
+	c->irq_corrected_count += !!(corrected & BIT(0));
+	c->irq_met_count += !!(met & BIT(0));
+	c->irq_last_deviation = deviation;
+	c->irq_last_corrected = corrected;
+	c->irq_last_met = met;
+	c->irq_last_jiffies = jiffies;
+	spin_unlock_irqrestore(&c->irq_lock, flags);
+
+	return handled ? IRQ_HANDLED : IRQ_NONE;
+}
+
+static int osm_setup_irq(struct platform_device *pdev, struct osm_cluster *c)
+{
+	char name[16];
+	int ret;
+
+	scnprintf(name, sizeof(name), "%s-irq", c->name);
+	c->irq = platform_get_irq_byname(pdev, name);
+	if (c->irq < 0) {
+		dev_warn(c->dev, "%s not specified (%d); OSM status IRQs unavailable\n",
+			 name, c->irq);
+		return c->irq;
+	}
+
+	ret = devm_request_irq(c->dev, c->irq, osm_debug_irq,
+			       IRQF_TRIGGER_RISING | IRQF_SHARED,
+			       "OSM IRQ", c);
+	if (ret) {
+		dev_err(c->dev, "cannot request %s (%d)\n", name, ret);
+		return ret;
+	}
+
+	dev_info(c->dev, "%s: requested IRQ %d\n", c->name, c->irq);
+	return 0;
+}
+
 static int osm_enable_hw(struct osm_cluster *c)
 {
 	udelay(5);
@@ -3279,6 +3379,129 @@ static int osm_state_open(struct inode *inode, struct file *file)
 	return single_open(file, osm_state_show, NULL);
 }
 
+/*
+ * One-shot forensic view for the case where the OSM accepts a row request
+ * but the CPU root clock never follows it.  The sequencer window is
+ * write-only (reads return 0x2), so this deliberately reports the watchdog
+ * PC/pstate and the W1C interrupt status instead of pretending that the
+ * instruction stream can be read back.
+ *
+ * Each cluster is sampled twice around a short delay.  A changing watchdog
+ * PC proves that the sequencer is executing; a stable PC narrows the failure
+ * to "stopped before/inside this instruction".  Nothing here writes the OSM
+ * or PLL except clearing the three documented W1C status bits.
+ */
+static void osm_snapshot_cluster(struct seq_file *m, struct osm_dev *p, int cl)
+{
+	struct osm_cluster *c = &p->cluster[cl];
+	u32 pstate1, pc1, pstate2, pc2;
+	u32 pll_mode = 0, pll_lval = 0, pll_user = 0, pll_status = 0;
+	u32 rcgr_cmd = 0, rcgr_cfg = 0, apm_mode = 0, apm_status = 0;
+	unsigned long flags;
+	u32 dev, corrected, met;
+	u32 irq_count, irq_deviation_count, irq_corrected_count, irq_met_count;
+	unsigned long irq_last_jiffies;
+
+	pstate1 = osm_read(c, OSM_WDOG_DOMAIN_PSTATE);
+	pc1 = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
+	udelay(20);
+	pstate2 = osm_read(c, OSM_WDOG_DOMAIN_PSTATE);
+	pc2 = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
+
+	if (p->pll_base[cl]) {
+		pll_mode = readl_relaxed(p->pll_base[cl] + PLL_MODE);
+		pll_lval = readl_relaxed(p->pll_base[cl] + PLL_L_VAL);
+		pll_user = readl_relaxed(p->pll_base[cl] + PLL_USER_CTRL);
+		pll_status = readl_relaxed(p->pll_base[cl] + PLL_STATUS);
+	}
+	if (p->rcgr_base[cl]) {
+		rcgr_cmd = readl_relaxed(p->rcgr_base[cl] + RCGR_CMD);
+		rcgr_cfg = readl_relaxed(p->rcgr_base[cl] + RCGR_CFG);
+	}
+	if (p->apm_base[cl]) {
+		phys_addr_t page = p->apm_mode_ctl[cl] & ~0xFFFULL;
+
+		apm_mode = readl_relaxed(p->apm_base[cl] +
+					 (p->apm_mode_ctl[cl] - page));
+		apm_status = readl_relaxed(p->apm_base[cl] +
+					   (p->apm_ctrl_status[cl] - page));
+	}
+
+	dev = osm_read(c, OSM_DCVS_DEVIATION_STAT);
+	corrected = osm_read(c, OSM_DCVS_CORRECTED_STAT);
+	met = osm_read(c, OSM_DCVS_MET_STAT);
+
+	spin_lock_irqsave(&c->irq_lock, flags);
+	irq_count = c->irq_count;
+	irq_deviation_count = c->irq_deviation_count;
+	irq_corrected_count = c->irq_corrected_count;
+	irq_met_count = c->irq_met_count;
+	irq_last_jiffies = c->irq_last_jiffies;
+	spin_unlock_irqrestore(&c->irq_lock, flags);
+
+	seq_printf(m, "=== %s (irq %d) ===\n", c->name, c->irq);
+	seq_printf(m,
+		   "  wdog_pstate=%#010x/%#010x pc=%#010x/%#010x changed=%u\n",
+		   pstate1, pstate2, pc1, pc2, pstate1 != pstate2 || pc1 != pc2);
+	seq_printf(m,
+		   "  desired_row=%u enable=%#x llm_override=%#010x seq_reg1=%#010x\n",
+		   osm_read(c, OSM_DCVS_PERF_STATE_DESIRED),
+		   osm_read(c, OSM_ENABLE_REG),
+		   osm_read(c, OSM_LLM_SW_OVERRIDE),
+		   osm_read(c, OSM_SEQ_REG1_OFFSET));
+	seq_printf(m,
+		   "  deviation=%#010x en=%#010x corrected=%#010x en=%#010x met=%#010x en=%#010x\n",
+		   dev, osm_read(c, OSM_DCVS_DEVIATION_EN),
+		   corrected, osm_read(c, OSM_DCVS_CORRECTED_EN),
+		   met, osm_read(c, OSM_DCVS_MET_EN));
+	seq_printf(m,
+		   "  irq_count=%u dev=%u corrected=%u met=%u last_jiffies=%lu\n",
+		   irq_count, irq_deviation_count,
+		   irq_corrected_count, irq_met_count,
+		   irq_last_jiffies);
+	seq_printf(m,
+		   "  pll_mode=%#x lval=%#04x user=%#010x status=%#010x lock=%u\n",
+		   pll_mode, pll_lval, pll_user, pll_status,
+		   !!(pll_status & PLL_LOCK_DET_MASK));
+	seq_printf(m,
+		   "  rcgr_cmd=%#010x cfg=%#010x src=%#x apm_mode=%#010x apm_status=%#010x\n",
+		   rcgr_cmd, rcgr_cfg, rcgr_cfg & RCGR_CFG_SRC_MASK,
+		   apm_mode, apm_status);
+	seq_printf(m,
+		   "  slots lval=%#010x cfg_rcgr=%#010x pll_user=%#010x cmd_rcgr=%#010x\n",
+		   osm_read(c, SEQ_REG(SEQ_SLOT_L_VAL_BASE)),
+		   osm_read(c, SEQ_REG(SEQ_SLOT_CFG_RCGR)),
+		   osm_read(c, SEQ_REG(SEQ_SLOT_PLL_USER_CTL)),
+		   osm_read(c, SEQ_REG(SEQ_SLOT_CMD_RCGR)));
+	seq_puts(m, "\n");
+}
+
+static int osm_snapshot_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	if (!osmdev)
+		return -ENODEV;
+
+	seq_printf(m, "osm base=%pa seq_window=write-only(read alias)\n\n",
+		   &osmdev->base_phys);
+	for (i = 0; i < R11T_NR_CLUSTERS; i++)
+		osm_snapshot_cluster(m, osmdev, i);
+	return 0;
+}
+
+static int osm_snapshot_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, osm_snapshot_show, NULL);
+}
+
+static const struct file_operations osm_snapshot_fops = {
+	.open	= osm_snapshot_open,
+	.read	= seq_read,
+	.llseek	= seq_lseek,
+	.release = osm_lut_release,
+};
+
 static const struct file_operations osm_state_fops = {
 	.open	= osm_state_open,
 	.read	= seq_read,
@@ -3377,6 +3600,8 @@ static void osm_debugfs_init(struct device *dev)
 	debugfs_create_file("regs", 0444, osm_dbg_dir, NULL, &osm_regs_fops);
 	debugfs_create_file("seq", 0444, osm_dbg_dir, NULL, &osm_seq_fops);
 	debugfs_create_file("state", 0444, osm_dbg_dir, NULL, &osm_state_fops);
+	debugfs_create_file("snapshot", 0444, osm_dbg_dir, NULL,
+			    &osm_snapshot_fops);
 	debugfs_create_file("dryrun", 0444, osm_dbg_dir, NULL, &dryrun_fops);
 }
 
@@ -3494,6 +3719,20 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		}
 	}
 
+	/* Map the APM control/status pages read-only for osm_snapshot(). */
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		phys_addr_t addr;
+
+		if (!p->apm_mode_ctl[i] && !p->apm_ctrl_status[i])
+			continue;
+		addr = (p->apm_mode_ctl[i] ? p->apm_mode_ctl[i] :
+			p->apm_ctrl_status[i]) & ~0xFFFULL;
+		p->apm_base[i] = devm_ioremap(dev, addr, 4096);
+		if (!p->apm_base[i])
+			dev_warn(dev, "cluster%d: cannot map APM @0x%llx\n",
+				 i, (unsigned long long)addr);
+	}
+
 	/* apcs_common: RCGR windows live in their own pages (page-masked
 	 * above), so this is read-only context for the OSM clock snapshot.
 	 */
@@ -3531,6 +3770,8 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		c->num = i;
 		c->name = cluster_name[i];
 		c->dev = dev;
+		c->irq = -ENXIO;
+		spin_lock_init(&c->irq_lock);
 		/*
 		 * One reg window, TWO independent 8 KiB slots -- one per cluster.
 		 *
@@ -3709,8 +3950,18 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		}
 		osm_setup_itm(p);
 		osm_setup_sequencer(p);
-		if (!apm && memacc == 0)
-			dev_warn(dev, "apm=0 and memacc=0: SEQ slots 1/2/3/8/15/31/72/73/76 (APM VC) and 55-58/32/49/51-54/59 (MEM-ACC) are all zero; the sequencer microcode may skip the PLL switch step. See 完善计划.md CLK-4.\n");
+
+		/* CAF requests the two OSM debug IRQs before PLL setup and OSM
+		 * enable.  They expose deviation/corrected/met status, which is
+		 * the only direct acknowledgement that a requested row was
+		 * actually reached.  IRQ failure is diagnostic-only, like CAF.
+		 */
+		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+			ret = osm_setup_irq(pdev, &p->cluster[i]);
+			if (ret)
+				dev_warn(dev, "%s: OSM debug IRQ unavailable (%d)\n",
+					 p->cluster[i].name, ret);
+		}
 		if (memacc == 2)
 			osm_setup_memacc(p);
 
