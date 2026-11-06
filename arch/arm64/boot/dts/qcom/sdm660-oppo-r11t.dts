@@ -309,6 +309,13 @@
 		       0x179d1000 0x1000  0x784130 0x08  0x784130 0x08>;
 		reg-names = "osm", "pwrcl_pll", "perfcl_pll",
 			    "apcs_common", "pwrcl_efuse", "perfcl_efuse";
+		/* Functional parent of CAF's osm_clk_src.  The mainline GCC
+		 * provider registers hmss_gpll0_clk_src but not the APCS LMH RCG,
+		 * so the OSM driver sets this parent to 300 MHz and programs the
+		 * 2/3 divider directly to establish the specified 200 MHz clock.
+		 */
+		clocks = <&gcc HMSS_GPLL0_CLK_SRC>;
+		clock-names = "aux_clk";
 
 		/*
 		 * Address pairs CAF needs to let the OSM state machine actually
@@ -416,7 +423,7 @@
 		 * governor, like the factory Android build. */
 		qcom,governor-per-policy;
 
-		/* Reference only, not used by the driver. */
+		/* Must match the OSM functional clock established at probe. */
 		qcom,osm-clk-rate = <0xbebc200>;   /* 200000000 Hz */
 		qcom,xo-clk-rate = <0x124f800>;   /* 19200000 Hz */
 		qcom,apm-threshold-voltage = <0xd4e40>;
