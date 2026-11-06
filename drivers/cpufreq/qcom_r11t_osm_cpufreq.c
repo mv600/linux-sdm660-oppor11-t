@@ -3234,7 +3234,8 @@ static int dryrun_get(void *data, u64 *val)
  * it when dryrun==0 at load time). Keep the writer removed; changing
  * dryrun still requires module reload, as documented in MODULE_PARM_DESC.
  */
-DEFINE_DEBUGFS_ATTRIBUTE_RO(dryrun_fops, dryrun_get);
+/* This kernel's debugfs predates DEFINE_DEBUGFS_ATTRIBUTE_RO. */
+DEFINE_DEBUGFS_ATTRIBUTE(dryrun_fops, dryrun_get, NULL, "%llu\n");
 
 static void osm_debugfs_init(struct device *dev)
 {
