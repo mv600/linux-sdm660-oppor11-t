@@ -913,9 +913,8 @@ static void osm_dump_rcgr(struct osm_dev *p)
 			continue;
 		}
 
-		dev_info(p->dev, "RCGR: cluster%d window @0x%llx\n", i,
-			 (unsigned long long)(resource_size(p->rcgr_base[i]) ?
-						  0 : 0));
+		dev_info(p->dev, "RCGR: cluster%d window cfg_dt=0x%x\n", i,
+			 p->cfg_rcgr[i]);
 
 		/* Find the CMD/CFG pair by scanning the page for the known
 		 * cmd_rcgr offset, then read the matching cfg.
@@ -1475,11 +1474,18 @@ static int osm_memacc_derive(struct osm_cluster *c, struct osm_memacc_cfg *cfg)
 
 		if (c->lut[j].spare_data != curr_level) {
 			if (map_idx < MAX_MEM_ACC_LEVELS) {
-				/* Match CAF exactly: osm_parse_lut() stored a
-				 * 0-based corner, then CAF subtracts one here.
+				/* CAF clk_osm_program_mem_acc_regs() does a
+				 * second -1 on its 0-based osm_table[] VC:
+				 * level_map = VC-1, so threshold pairs become
+				 * (VC-1, VC). Keep that arithmetic verbatim;
+				 * clamp the VC=1 case (map=-1) to 0 instead
+				 * of letting (u32)-1 == 0xffffffff land in
+				 * SEQ_REG(55/57) via osm_write_seq().
 				 */
-				cfg->level_map[map_idx] =
-					(int)c->lut[j].virtual_corner - 1;
+				{
+					int vc = (int)c->lut[j].virtual_corner - 1;
+					cfg->level_map[map_idx] = vc < 0 ? 0 : vc;
+				}
 				map_idx++;
 			}
 			curr_level = c->lut[j].spare_data;
@@ -1716,6 +1722,17 @@ static void osm_setup_apm_vc(struct osm_dev *p)
 {
 	unsigned long osm_base;
 	unsigned int i;
+
+	/* CAF clk_osm_apm_vc_setup() [caf:2303-2336] has two branches:
+	 * secure_init writes SEQ_REG(1,72,8,15,31,73,76) via clk_osm_write_reg;
+	 * !secure_init writes SEQ_REG1_OFFSET(0x1048) via clk_osm_write_reg and
+	 * SEQ_REG(72,15,31,76) via scm_io_write(). This driver has no TZ/SCM,
+	 * so it can only reproduce the secure_init branch writes. Keep them,
+	 * but say so: on a no-TZ boot the slot values are the secure-path
+	 * values, not the !secure_init values CAF would have produced.
+	 */
+	dev_warn(p->dev, "apm=1: writing secure_init APM VC slots (SEQ_REG 1/72/8/15/31/73/76); "
+			 "CAF !secure_init path (SEQ_REG1_OFFSET 0x1048 + SCM) is not reproduced\n");
 
 	osm_base = p->base_phys;
 
@@ -2209,12 +2226,13 @@ static int osm_pll_bringup(struct osm_dev *p, int cl, unsigned int row)
 	 * APCS PLL through MODE 0/2/6/7 cannot stop the CPUs.  Require that
 	 * exact state rather than assuming it from the bootloader.
 	 */
-	if ((readl_relaxed(p->rcgr_base[cl] + RCGR_CFG) & 0xffff) !=
-	    (GPLL_SEL & 0xffff)) {
+	if ((readl_relaxed(p->rcgr_base[cl] + RCGR_CFG) & RCGR_CFG_SRC_MASK) !=
+	    (GPLL_SEL & RCGR_CFG_SRC_MASK)) {
 		dev_err(p->dev,
-			"%s: RCGR CLK_SRC=0x%04x is not GPLL0 (0x%04x); refusing live PLL test\n",
-			c->name, readl_relaxed(p->rcgr_base[cl] + RCGR_CFG) & 0xffff,
-			GPLL_SEL & 0xffff);
+			"%s: RCGR CLK_SRC=0x%03x is not GPLL0 (0x%03x); refusing live PLL test\n",
+			c->name,
+			readl_relaxed(p->rcgr_base[cl] + RCGR_CFG) & RCGR_CFG_SRC_MASK,
+			GPLL_SEL & RCGR_CFG_SRC_MASK);
 		return -EPERM;
 	}
 
@@ -2692,20 +2710,18 @@ static struct osm_cluster *cpu_to_cluster(unsigned int cpu)
 
 static unsigned int r11t_osm_get(unsigned int cpu)
 {
-	struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
 	struct osm_cluster *c;
 	unsigned int row, khz;
 
-	if (!policy)
+	c = cpu_to_cluster(cpu);
+	if (!c)
 		return 0;
 
-	c = cpu_to_cluster(policy->cpu);
-	if (!c) {
-		cpufreq_cpu_put(policy);
-		return 0;
-	}
-
-	/* CAF reads the live row back out of DCVS. [caf:760] */
+	/* CAF reads the live row back out of DCVS. [caf:760]
+	 * Like cpufreq_generic_get() (drivers/cpufreq/cpufreq.c),
+	 * do not take a second policy reference here: the cpufreq
+	 * core already holds the policy while calling ->get().
+	 */
 	row = osm_get_row(c);
 	khz = osm_row_to_khz(c, row);
 	if (!khz) {
@@ -2715,7 +2731,6 @@ static unsigned int r11t_osm_get(unsigned int cpu)
 		khz = osm_row_to_khz(c, 0);
 	}
 
-	cpufreq_cpu_put(policy);
 	return khz;
 }
 
@@ -3088,13 +3103,14 @@ static int osm_regs_show(struct seq_file *m, void *v)
 			   osm_read(c, OSM_DCVS_PERF_STATE_DESIRED));
 		/* FSM / control region 0x1000-0x10E0 (partial) */
 		seq_printf(m, "  --- FSM (0x1000+) ---\n");
-		for (j = 0x1000; j < 0x10E0; j += 0x10) {
-			int k;
-			seq_printf(m, "  0x%04x:", j);
-			for (k = 0; k < 4; k++)
-				seq_printf(m, " %08x", osm_read(c, j + k * 4));
-			seq_puts(m, "\n");
+		for (j = 0x1000; j < 0x10E0; j += 4) {
+			if ((j - 0x1000) % 16 == 0)
+				seq_printf(m, "  0x%04x:", j);
+			seq_printf(m, " %08x", osm_read(c, j));
+			if ((j - 0x1000) % 16 == 12)
+				seq_puts(m, "\n");
 		}
+		seq_puts(m, "\n");
 	}
 	return 0;
 }
@@ -3106,14 +3122,12 @@ static int dryrun_get(void *data, u64 *val)
 	return 0;
 }
 
-static int dryrun_set(void *data, u64 val)
-{
-	dryrun = !!val;
-	pr_warn("dryrun=%s\n", dryrun ? "yes (frequency frozen)" :
-		"NO - writes to DCVS_PERF_STATE_DESIRED are live");
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(dryrun_fops, dryrun_get, dryrun_set, "%llu\n");
+/* Read-only: runtime flip to dryrun=0 would enable target_index() writes
+ * against a hardware table that was never programmed (probe only programs
+ * it when dryrun==0 at load time). Keep the writer removed; changing
+ * dryrun still requires module reload, as documented in MODULE_PARM_DESC.
+ */
+DEFINE_DEBUGFS_ATTRIBUTE_RO(dryrun_fops, dryrun_get);
 
 static void osm_debugfs_init(struct device *dev)
 {
@@ -3122,7 +3136,7 @@ static void osm_debugfs_init(struct device *dev)
 	debugfs_create_file("regs", 0444, osm_dbg_dir, NULL, &osm_regs_fops);
 	debugfs_create_file("seq", 0444, osm_dbg_dir, NULL, &osm_seq_fops);
 	debugfs_create_file("state", 0444, osm_dbg_dir, NULL, &osm_state_fops);
-	debugfs_create_file("dryrun", 0644, osm_dbg_dir, NULL, &dryrun_fops);
+	debugfs_create_file("dryrun", 0444, osm_dbg_dir, NULL, &dryrun_fops);
 }
 
 static void osm_debugfs_exit(void)
@@ -3207,11 +3221,14 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		{
 			phys_addr_t addr = p->cfg_rcgr[i] & ~0xFFFULL;
 
-			p->rcgr_base[i] = devm_ioremap(dev, addr, 4096);
-			if (IS_ERR(p->rcgr_base[i])) {
+			if (!p->cfg_rcgr[i]) {
+				dev_warn(dev, "cluster%d: no qcom,apcs-cfg-rcgr, RCGR unmapped\n", i);
 				p->rcgr_base[i] = NULL;
-				dev_warn(dev, "cluster%d: cannot map RCGR @0x%llx\n",
-					i, (unsigned long long)addr);
+			} else {
+				p->rcgr_base[i] = devm_ioremap(dev, addr, 4096);
+				if (!p->rcgr_base[i])
+					dev_warn(dev, "cluster%d: cannot map RCGR @0x%llx\n",
+						i, (unsigned long long)addr);
 			}
 		}
 	}
