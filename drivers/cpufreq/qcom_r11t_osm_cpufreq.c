@@ -2511,11 +2511,37 @@ static int osm_clk_prepare_prod(struct osm_dev *p)
  *
  * A failed PLL bring-up leaves the cluster on GPLL0 and never fails probe.
  */
+static int osm_rcgr_force_gpll(struct osm_dev *p, int cl)
+{
+	struct osm_cluster *c = &p->cluster[cl];
+	void __iomem *rcgr = p->rcgr_base[cl];
+	u32 cfg;
+	int ret;
+
+	if (!rcgr)
+		return -ENODEV;
+
+	cfg = readl_relaxed(rcgr + RCGR_CFG);
+	if ((cfg & RCGR_CFG_SRC_MASK) == (GPLL_SEL & RCGR_CFG_SRC_MASK))
+		return 0;
+
+	dev_info(p->dev,
+		 "%s: normalizing RCGR source 0x%03x -> GPLL0 before PLL setup\n",
+		 c->name, cfg & RCGR_CFG_SRC_MASK);
+	ret = osm_rcgr_set_source(p, cl, GPLL_SEL);
+	if (ret) {
+		dev_err(p->dev,
+			"%s: cannot normalize RCGR to GPLL0 (%d); leaving PLL alone\n",
+			c->name, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
 static int osm_pll_prepare_prod(struct osm_dev *p, int cl, unsigned int row)
 {
 	struct osm_cluster *c = &p->cluster[cl];
-	void __iomem *rcgr;
-	u32 cfg;
 	int ret;
 
 	if (cl < 0 || cl >= R11T_NR_CLUSTERS)
@@ -2525,21 +2551,20 @@ static int osm_pll_prepare_prod(struct osm_dev *p, int cl, unsigned int row)
 			c->name, row, c->num_entries - 1);
 		return -EINVAL;
 	}
-	rcgr = p->rcgr_base[cl];
-	if (!rcgr || !p->pll_base[cl]) {
+	if (!p->rcgr_base[cl] || !p->pll_base[cl]) {
 		dev_err(p->dev, "%s: RCGR or PLL not mapped, skipping PLL setup\n",
 			c->name);
 		return -ENODEV;
 	}
 
-	cfg = readl_relaxed(rcgr + RCGR_CFG);
-	if ((cfg & RCGR_CFG_SRC_MASK) != (GPLL_SEL & RCGR_CFG_SRC_MASK)) {
-		dev_err(p->dev,
-			"%s: RCGR CLK_SRC=0x%03x is not GPLL0 (0x%03x), skipping PLL setup\n",
-			c->name, cfg & RCGR_CFG_SRC_MASK,
-			GPLL_SEL & RCGR_CFG_SRC_MASK);
-		return -EPERM;
-	}
+	/* The bootloader may hand over with either cluster already on the
+	 * APCS PLL (pwrcl has been observed at 0x500).  Reconfiguring that PLL
+	 * while it is the live root is unsafe, so move the root back to GPLL0
+	 * first and verify the RCGR update completed.
+	 */
+	ret = osm_rcgr_force_gpll(p, cl);
+	if (ret)
+		return ret;
 
 	dev_info(p->dev, "%s: PLL setup for boot row %u (%u kHz)\n",
 		 c->name, row, div_u64(c->lut[row].frequency, 1000));
@@ -2553,8 +2578,17 @@ static int osm_pll_prepare_prod(struct osm_dev *p, int cl, unsigned int row)
 	if (ret)
 		return ret;
 
+	/* CAF's setup literal leaves only PLLOUT_EARLY enabled.  The OSM
+	 * sequencer must be able to select the main output when it moves the
+	 * root from GPLL0 to the APCS PLL, so restore MAIN before enabling the
+	 * OSM.  Preserve the other output gates.
+	 */
+	ret = osm_pll_enable_main_output(p, cl);
+	if (ret)
+		return ret;
+
 	dev_info(p->dev,
-		 "%s: PLL ready on early output; RCGR remains on GPLL0 until sequencer handoff\n",
+		 "%s: PLL ready with main output; RCGR remains on GPLL0 until sequencer handoff\n",
 		 c->name);
 	return 0;
 }
