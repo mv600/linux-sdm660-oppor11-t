@@ -460,6 +460,7 @@ struct osm_dev {
 	u32 memacc_val[R11T_NR_CLUSTERS][MAX_MEM_ACC_VALUES];
 	bool memacc_cfg_valid[R11T_NR_CLUSTERS];
 	bool memacc_val_valid[R11T_NR_CLUSTERS];
+	bool mem_acc_threshold_prop;
 	/* RCGR window (READ ONLY).  Derived from cfg_rcgr/cmd_rcgr by masking
 	 * off the register offset -- those two DT addresses are the CMD_RCGR
 	 * (+0x50) and CFG_RCGR (+0x54) halves of one root clock generator, so
@@ -1607,18 +1608,18 @@ static int osm_memacc_derive(struct osm_cluster *c, struct osm_memacc_cfg *cfg)
 
 		if (c->lut[j].spare_data != curr_level) {
 			if (map_idx < MAX_MEM_ACC_LEVELS) {
-				/* CAF clk_osm_program_mem_acc_regs() does a
-				 * second -1 on its 0-based osm_table[] VC:
-				 * level_map = VC-1, so threshold pairs become
-				 * (VC-1, VC). Keep that arithmetic verbatim;
-				 * clamp the VC=1 case (map=-1) to 0 instead
-				 * of letting (u32)-1 == 0xffffffff land in
-				 * SEQ_REG(55/57) via osm_write_seq().
+				int vc;
+
+				/* CAF subtracts one more from its already 0-based
+				 * virtual_corner [caf:2010].  Keep that arithmetic
+				 * verbatim.  A negative value cannot be encoded in
+				 * the sequencer slot, so mark the table unusable
+				 * instead of clamping it to corner 0.
 				 */
-				{
-					int vc = (int)c->lut[j].virtual_corner - 1;
-					cfg->level_map[map_idx] = vc < 0 ? 0 : vc;
-				}
+				vc = (int)c->lut[j].virtual_corner - 1;
+				if (vc < 0)
+					return -ERANGE;
+				cfg->level_map[map_idx] = vc;
 				map_idx++;
 			}
 			curr_level = c->lut[j].spare_data;
@@ -1657,10 +1658,8 @@ static int osm_memacc_derive(struct osm_cluster *c, struct osm_memacc_cfg *cfg)
 static void osm_preview_memacc(struct osm_dev *p)
 {
 	unsigned int i, j;
-	bool secure_no_tz = of_find_property(p->dev->of_node, "qcom,osm-no-tz", NULL);
-	bool has_mem_acc_threshold_prop =
-		of_find_property(p->dev->of_node,
-				 "qcom,perfcl-apcs-mem-acc-threshold-voltage", NULL);
+	bool secure_no_tz = p->no_tz;
+	bool has_mem_acc_threshold_prop = p->mem_acc_threshold_prop;
 	bool has_cfg_val =
 		of_find_property(p->dev->of_node, "qcom,pwrcl-apcs-mem-acc-cfg", NULL) ||
 		of_find_property(p->dev->of_node, "qcom,perfcl-apcs-mem-acc-cfg", NULL) ||
@@ -1715,6 +1714,9 @@ static void osm_preview_memacc(struct osm_dev *p)
 			dev_info(p->dev,
 				 "  TZ-retained SEQ_REG(49)=0x%08x SEQ_REG(51-54)=1,2,3,4 SEQ_REG(59)=0x%02x\n",
 				 (u32)seq28_addr, MEM_ACC_APM_READ_MASK);
+		if (has_mem_acc_threshold_prop)
+			dev_warn(p->dev,
+				 "  DT has qcom,perfcl-apcs-mem-acc-threshold-voltage, but no CPRh voltage table; memacc=2 will refuse to guess threshold_vc[0..3]\n");
 	}
 	dev_info(p->dev,
 		 "memacc=%d preview: derived values come from the LUT; "
@@ -1800,6 +1802,13 @@ static int osm_validate_memacc(struct osm_dev *p,
 			dev_err(p->dev,
 				"%s: qcom,osm-no-tz requires qcom,%scl-apcs-mem-acc-{cfg,val}; refusing partial MEM-ACC setup\n",
 				c->name, i == R11T_CLUSTER_PWRCL ? "pwr" : "perf");
+			return -EINVAL;
+		}
+
+		if (p->mem_acc_threshold_prop) {
+			dev_err(p->dev,
+				"%s: qcom,perfcl-apcs-mem-acc-threshold-voltage needs the CPRh voltage table and both MEM-ACC arrays; this DT cannot resolve it, refusing guessed thresholds\n",
+				c->name);
 			return -EINVAL;
 		}
 
@@ -4105,6 +4114,9 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	}
 
 	p->no_tz = of_property_read_bool(dev->of_node, "qcom,osm-no-tz");
+	p->mem_acc_threshold_prop =
+		of_property_read_bool(dev->of_node,
+				      "qcom,perfcl-apcs-mem-acc-threshold-voltage");
 
 	platform_set_drvdata(pdev, p);
 
@@ -4398,6 +4410,13 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			 */
 			if (memacc == 2) {
 				struct osm_memacc_cfg memacc_cfg[R11T_NR_CLUSTERS];
+
+				if (p->mem_acc_threshold_prop) {
+					dev_err(dev,
+						"qcom,perfcl-apcs-mem-acc-threshold-voltage needs the CPRh voltage table and both MEM-ACC arrays; this stock DT cannot resolve it, refusing guessed thresholds\n");
+					ret = -EINVAL;
+					goto stock_fail;
+				}
 
 				for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 					ret = osm_memacc_derive(&p->cluster[i],
