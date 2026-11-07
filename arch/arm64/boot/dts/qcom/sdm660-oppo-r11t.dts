@@ -314,8 +314,9 @@
 		 * so the OSM driver sets this parent to 300 MHz and programs the
 		 * 2/3 divider directly to establish the specified 200 MHz clock.
 		 */
-		clocks = <&gcc HMSS_GPLL0_CLK_SRC>;
-		clock-names = "aux_clk";
+		clocks = <&gcc HMSS_GPLL0_CLK_SRC>,
+			 <&rpmcc RPM_SMD_XO_A_CLK_SRC>;
+		clock-names = "aux_clk", "xo_a";
 
 		/* Stock OSM debug IRQs.  They report deviation/corrected/met
 		 * status from the hardware state machine; without them the only
@@ -374,14 +375,12 @@
 		 * trustzone driver instead, so a mainline kernel has to carry them
 		 * in DT itself.
 		 */
-		/* CAF probe gates PLL bring-up on this bool [caf:3311];
-		 * without it the cluster never leaves GPLL0 and the CPU
-		 * runs at 300 MHz regardless of DCVS requests. */
-		qcom,osm-pll-setup;
-		/* No trustzone on mainline: the APM/MEM-ACC/sequencer
-		 * register block must be programmed by the driver itself
-		 * (CAF [caf:2264] early-returns without this). */
-		qcom,osm-no-tz;
+		/* Stock R11T does not declare either property.  The bootloader
+		 * and secure monitor initialize the sequencer, ITM, APM and
+		 * MEM-ACC slots; Linux must preserve that state.  Add
+		 * qcom,osm-no-tz only for a deliberate no-TZ experiment, and
+		 * qcom,osm-pll-setup only when Linux should bring the PLLs up.
+		 */
 
 		qcom,boost-fsm-en;
 		qcom,safe-fsm-en;
@@ -402,6 +401,9 @@
 		qcom,enable-llm-volt-vote;
 		qcom,llm-volt-up-timer = <0x4fffb 0x4fffb>;
 		qcom,llm-volt-down-timer = <0x4fffb 0x4fffb>;
+		qcom,cc-reads = <0x0a>;
+		qcom,cc-delay = <0x05>;
+		qcom,cc-factor = <0x64>;
 
 		/* Logical CPU ids per cluster -- NOT the DT reg values.
 		 *

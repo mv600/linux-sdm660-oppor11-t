@@ -100,6 +100,8 @@
 #define OSM_CYCLE_COUNTER_CTRL		0x1F00	/* [caf:96] */
 #define OSM_CYCLE_COUNTER_STATUS	0x1F04	/* [caf:97] */
 #define OSM_CYCLE_COUNTER_USE_XO_EDGE	BIT(8)	/* [caf:114] */
+#define OSM_TRACE_CTRL			0x1F38	/* [caf:203] */
+#define OSM_TRACE_WDOG_STATUS		BIT(30)	/* [caf:207] */
 #define OSM_LLM_SW_OVERRIDE		0x1038	/* [caf:158] */
 #define OSM_SEQ_REG1_OFFSET		0x1048	/* [caf:76] */
 
@@ -461,9 +463,19 @@ struct osm_dev {
 	void __iomem *apcs_common;
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
 	bool per_policy_governor;
+	/* CAF calls this secure_init, but the property means the opposite:
+	 * qcom,osm-no-tz asks Linux to perform the initialization that the
+	 * secure monitor otherwise owns.  Keep the CAF name at the write
+	 * sites and parse the DT property exactly once.
+	 */
+	bool secure_init;
 	u32 osm_clk_rate;
 	u32 xo_clk_rate;
+	u32 cc_reads;
+	u32 cc_delay;
+	u32 cc_factor;
 	struct clk *hmss_gpll0_clk;
+	struct clk *xo_clk;
 };
 
 static struct osm_dev *osmdev;
@@ -487,6 +499,11 @@ static bool pll_probe = true;
 module_param(pll_probe, bool, 0644);
 MODULE_PARM_DESC(pll_probe,
 		 "Probe-only: dump OSM + PLL registers to dmesg/debugfs without writing PLL.");
+
+static bool wdog_trace;
+module_param(wdog_trace, bool, 0644);
+MODULE_PARM_DESC(wdog_trace,
+		 "Enable OSM TRACE_CTRL bit 30 after the sequencer is loaded so the watchdog snapshot is meaningful. Default false: this changes one documented trace-control bit and is diagnostic-only.");
 
 static bool lval_test = false;
 module_param(lval_test, bool, 0644);
@@ -1843,7 +1860,25 @@ static void osm_setup_sequencer(struct osm_dev *p)
 	}
 }
 
-static void osm_setup_seq(struct osm_dev *p)
+static void osm_setup_wdog_trace(struct osm_dev *p)
+{
+	unsigned int i;
+
+	if (!wdog_trace)
+		return;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 val = osm_read(c, OSM_TRACE_CTRL);
+
+		osm_write(c, val | OSM_TRACE_WDOG_STATUS, OSM_TRACE_CTRL);
+		osm_mb(c);
+		dev_info(p->dev, "%s: watchdog trace enabled, TRACE_CTRL=%#010x\n",
+			 c->name, osm_read(c, OSM_TRACE_CTRL));
+	}
+}
+
+static int osm_setup_seq(struct osm_dev *p)
 {
 	int i;
 
@@ -1852,7 +1887,7 @@ static void osm_setup_seq(struct osm_dev *p)
 			dev_err(p->dev,
 				"cluster%d: qcom,l-val-base missing, skipping seq setup\n",
 				i);
-			continue;
+			return -EINVAL;
 		}
 
 		osm_write_seq(p, i, SEQ_SLOT_L_VAL_BASE, p->l_val_base[i],
@@ -1895,6 +1930,8 @@ static void osm_setup_seq(struct osm_dev *p)
 		osm_write_seq(p, i, SEQ_SLOT_RCG_UPDATE2, RCG_UPDATE,
 			      "RCG_UPDATE(2)");
 	}
+
+	return 0;
 }
 
 /*
@@ -3395,8 +3432,10 @@ static void osm_snapshot_cluster(struct seq_file *m, struct osm_dev *p, int cl)
 {
 	struct osm_cluster *c = &p->cluster[cl];
 	u32 pstate1, pc1, pstate2, pc2;
+	u32 cc1, cc2;
 	u32 pll_mode = 0, pll_lval = 0, pll_user = 0, pll_status = 0;
 	u32 rcgr_cmd = 0, rcgr_cfg = 0, apm_mode = 0, apm_status = 0;
+	u32 trace_ctrl;
 	unsigned long flags;
 	u32 dev, corrected, met;
 	u32 irq_count, irq_deviation_count, irq_corrected_count, irq_met_count;
@@ -3404,9 +3443,12 @@ static void osm_snapshot_cluster(struct seq_file *m, struct osm_dev *p, int cl)
 
 	pstate1 = osm_read(c, OSM_WDOG_DOMAIN_PSTATE);
 	pc1 = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
-	udelay(20);
+	cc1 = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+	udelay(p->cc_delay ? p->cc_delay : 5);
 	pstate2 = osm_read(c, OSM_WDOG_DOMAIN_PSTATE);
 	pc2 = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
+	cc2 = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+	trace_ctrl = osm_read(c, OSM_TRACE_CTRL);
 
 	if (p->pll_base[cl]) {
 		pll_mode = readl_relaxed(p->pll_base[cl] + PLL_MODE);
@@ -3443,6 +3485,14 @@ static void osm_snapshot_cluster(struct seq_file *m, struct osm_dev *p, int cl)
 	seq_printf(m,
 		   "  wdog_pstate=%#010x/%#010x pc=%#010x/%#010x changed=%u\n",
 		   pstate1, pstate2, pc1, pc2, pstate1 != pstate2 || pc1 != pc2);
+	seq_printf(m,
+		   "  cycle_counter=%u/%u delta=%u ctrl=%#010x reads=%u delay=%u factor=%u\n",
+		   cc1, cc2, cc2 - cc1,
+		   osm_read(c, OSM_CYCLE_COUNTER_CTRL),
+		   p->cc_reads, p->cc_delay, p->cc_factor);
+	seq_printf(m,
+		   "  trace_ctrl=%#010x wdog_trace=%u\n",
+		   trace_ctrl, !!(trace_ctrl & OSM_TRACE_WDOG_STATUS));
 	seq_printf(m,
 		   "  desired_row=%u enable=%#x llm_override=%#010x seq_reg1=%#010x\n",
 		   osm_read(c, OSM_DCVS_PERF_STATE_DESIRED),
@@ -3575,6 +3625,8 @@ static int osm_regs_show(struct seq_file *m, void *v)
 	if (osmdev->hmss_gpll0_clk)
 		seq_printf(m, "hmss_gpll0_clk_src rate: %lu Hz\n",
 			   clk_get_rate(osmdev->hmss_gpll0_clk));
+	if (osmdev->xo_clk)
+		seq_printf(m, "xo_a rate: %lu Hz\n", clk_get_rate(osmdev->xo_clk));
 	return 0;
 }
 
@@ -3762,6 +3814,21 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		p->hmss_gpll0_clk = NULL;
 	}
 
+	/* Stock R11T supplies xo_a alongside aux_clk.  The OSM timing
+	 * registers use this rate directly, so expose what the clock
+	 * framework actually resolved instead of trusting DT alone.
+	 */
+	p->xo_clk = devm_clk_get_optional(dev, "xo_a");
+	if (IS_ERR(p->xo_clk)) {
+		ret = PTR_ERR(p->xo_clk);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+		dev_warn(dev, "xo_a unavailable (%d)\n", ret);
+		p->xo_clk = NULL;
+	}
+
+	p->secure_init = of_property_read_bool(dev->of_node, "qcom,osm-no-tz");
+
 	platform_set_drvdata(pdev, p);
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
@@ -3818,6 +3885,29 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		p->osm_clk_rate = 200000000; /* 200 MHz */
 	if (!p->xo_clk_rate)
 		p->xo_clk_rate = 19200000;  /* 19.2 MHz */
+	of_property_read_u32(dev->of_node, "qcom,cc-reads", &p->cc_reads);
+	of_property_read_u32(dev->of_node, "qcom,cc-delay", &p->cc_delay);
+	of_property_read_u32(dev->of_node, "qcom,cc-factor", &p->cc_factor);
+	if (!p->cc_reads)
+		p->cc_reads = 10;
+	if (!p->cc_factor)
+		p->cc_factor = 100;
+	dev_info(dev, "cycle counter: reads=%u delay=%u factor=%u\n",
+		 p->cc_reads, p->cc_delay, p->cc_factor);
+	if (p->xo_clk) {
+		unsigned long rate = clk_get_rate(p->xo_clk);
+
+		if (rate) {
+			p->xo_clk_rate = rate;
+			dev_info(dev, "xo_a rate: %lu Hz\n", rate);
+		} else {
+			dev_warn(dev, "xo_a rate readback is zero; using %u Hz\n",
+				 p->xo_clk_rate);
+		}
+	} else {
+		dev_warn(dev, "xo_a clock unavailable; using DT XO rate %u Hz\n",
+			 p->xo_clk_rate);
+	}
 
 	/* Parse FSM enable flags from DT [caf:2124-2135] */
 	{
@@ -3932,24 +4022,43 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			return ret;
 		}
 
-		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
-			struct osm_cluster *c = &p->cluster[i];
+		/* CAF gates the sequencer/ITM/APM setup on secure_init, which is
+		 * true only when qcom,osm-no-tz is present.  On a stock boot TZ
+		 * has already loaded the microcode and programmed these slots;
+		 * overwriting only part of them leaves the OSM with inconsistent
+		 * operands.  Keep that state intact unless the DT explicitly asks
+		 * Linux to take ownership.
+		 */
+		if (p->secure_init) {
+			for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+				struct osm_cluster *c = &p->cluster[i];
 
-			osm_write(c, BVAL(23, 16, 0xF), SPM_CC_CTRL);
-		}
+				osm_write(c, BVAL(23, 16, 0xF), SPM_CC_CTRL);
+			}
 
-		osm_setup_seq(p);
-		if (apm == 1) {
-			osm_setup_apm(p);
-			osm_setup_apm_vc(p);
-			for (i = 0; i < R11T_NR_CLUSTERS; i++)
-				osm_mb(&p->cluster[i]);
-		} else if (!apm && p->apm_mode_ctl[0] && p->apm_ctrl_status[0]) {
-			dev_warn(dev,
-				 "qcom,apm-mode-ctl / qcom,apm-ctrl-status present in DT but apm=0, leaving the Array Power Mux alone. CAF also fills slots 1/8/15/31/72/73/76 with CPRh virtual-corner voltages that mainline cannot produce; without them the sequencer would switch the CPU power mux on every DVFS step. Enable with modprobe ... apm=1 only once those corners are known good.\n");
+			ret = osm_setup_seq(p);
+			if (ret) {
+				dev_err(dev,
+					"qcom,osm-no-tz set but sequencer operands are incomplete (%d); refusing partial OSM initialization\n",
+					ret);
+				osmdev = NULL;
+				return ret;
+			}
+			if (apm == 1) {
+				osm_setup_apm(p);
+				osm_setup_apm_vc(p);
+				for (i = 0; i < R11T_NR_CLUSTERS; i++)
+					osm_mb(&p->cluster[i]);
+			} else if (!apm && p->apm_mode_ctl[0] && p->apm_ctrl_status[0]) {
+				dev_warn(dev,
+					 "qcom,osm-no-tz set but apm=0: leaving the Array Power Mux slots to the no-TZ path. CAF also fills slots 1/8/15/31/72/73/76; enable apm=1 only after preview.\n");
+			}
+			osm_setup_itm(p);
+			osm_setup_sequencer(p);
+		} else {
+			dev_info(dev,
+				 "stock secure-init mode: preserving TZ-owned OSM sequencer/ITM/APM/MEM-ACC state; only LUT, policy, row and PLL handoff are managed here\n");
 		}
-		osm_setup_itm(p);
-		osm_setup_sequencer(p);
 
 		/* CAF requests the two OSM debug IRQs before PLL setup and OSM
 		 * enable.  They expose deviation/corrected/met status, which is
@@ -3962,8 +4071,11 @@ static int r11t_osm_probe(struct platform_device *pdev)
 				dev_warn(dev, "%s: OSM debug IRQ unavailable (%d)\n",
 					 p->cluster[i].name, ret);
 		}
-		if (memacc == 2)
+		if (p->secure_init && memacc == 2)
 			osm_setup_memacc(p);
+		else if (!p->secure_init && memacc == 2)
+			dev_warn(dev,
+				 "memacc=2 ignored in stock secure-init mode: CAF's non-secure MEM-ACC writes require SCM, and TZ owns those slots\n");
 
 		/* CAF order: bring the PLL up first, select LUT row 0, then
 		 * enable the OSM, then request the boot row.  CAF's
@@ -4030,23 +4142,29 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			}
 		}
 
+		osm_setup_wdog_trace(p);
+
 		/* CAF's clk_set_rate(boot_rate): row 4 for pwrcl (1401.6 MHz)
-		 * and row 3 for perfcl (1747.2 MHz) on speed-bin 1.
+		 * and row 3 for perfcl (1747.2 MHz) on speed-bin 1.  This is
+		 * independent of qcom,osm-pll-setup in CAF: the property gates
+		 * PLL bring-up, not the boot row request.  On a stock boot TZ has
+		 * already prepared the PLL, so skipping this request would leave
+		 * both clusters parked on row 0 / GPLL0.
 		 */
-		if (of_property_read_bool(dev->of_node, "qcom,osm-pll-setup")) {
+		{
 			static const unsigned int boot_rows[R11T_NR_CLUSTERS] = { 4, 3 };
 
 			for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 				unsigned int row = boot_rows[i];
 				int w;
 
-				if (!pll_ready[i]) {
-					dev_warn(dev, "%s: PLL not ready, leaving row 0\n",
-						 p->cluster[i].name);
-					continue;
-				}
 				if (row >= p->cluster[i].num_entries)
 					row = p->cluster[i].num_entries - 1;
+				if (of_property_read_bool(dev->of_node, "qcom,osm-pll-setup") &&
+				    !pll_ready[i])
+					dev_warn(dev,
+						 "%s: Linux PLL bring-up failed; requesting CAF boot row %u anyway\n",
+						 p->cluster[i].name, row);
 				w = osm_set_row(&p->cluster[i], row);
 				dev_info(dev, "%s: DCVS boot row %u -> %d\n",
 					 p->cluster[i].name, row, w);
