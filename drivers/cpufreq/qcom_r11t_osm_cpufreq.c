@@ -59,6 +59,7 @@
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/err.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -504,6 +505,11 @@ static bool wdog_trace;
 module_param(wdog_trace, bool, 0644);
 MODULE_PARM_DESC(wdog_trace,
 		 "Enable OSM TRACE_CTRL bit 30 after the sequencer is loaded so the watchdog snapshot is meaningful. Default false: this changes one documented trace-control bit and is diagnostic-only.");
+
+static bool scm_probe;
+module_param(scm_probe, bool, 0444);
+MODULE_PARM_DESC(scm_probe,
+		 "Diagnostic-only: after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. Default false. This is strictly read-only and proves whether the secure monitor permits OSM-slot access before any secure write path is enabled.");
 
 static bool lval_test = false;
 module_param(lval_test, bool, 0644);
@@ -1876,6 +1882,33 @@ static void osm_setup_wdog_trace(struct osm_dev *p)
 		dev_info(p->dev, "%s: watchdog trace enabled, TRACE_CTRL=%#010x\n",
 			 c->name, osm_read(c, OSM_TRACE_CTRL));
 	}
+}
+
+static void osm_probe_scm_slot(struct osm_dev *p)
+{
+	struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
+	phys_addr_t addr;
+	unsigned int mmio_val, scm_val = 0;
+	int ret;
+
+	if (!scm_probe)
+		return;
+
+	addr = p->base_phys + SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC);
+	mmio_val = osm_read(c, SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC));
+
+	if (!qcom_scm_is_available()) {
+		dev_warn(p->dev,
+			 "scm_probe: qcom_scm unavailable, addr=%pa mmio=%#010x\n",
+			 &addr, mmio_val);
+		return;
+	}
+
+	ret = qcom_scm_io_readl(addr, &scm_val);
+	dev_info(p->dev,
+		 "scm_probe: read-only addr=%pa mmio=%#010x scm_ret=%d scm=%#010x valid=%d\n",
+		 &addr, mmio_val, ret, scm_val,
+		 !ret && scm_val != 0 && scm_val != U32_MAX);
 }
 
 static int osm_setup_seq(struct osm_dev *p)
@@ -4143,6 +4176,7 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		}
 
 		osm_setup_wdog_trace(p);
+		osm_probe_scm_slot(p);
 
 		/* CAF's clk_set_rate(boot_rate): row 4 for pwrcl (1401.6 MHz)
 		 * and row 3 for perfcl (1747.2 MHz) on speed-bin 1.  This is
