@@ -611,6 +611,20 @@ module_param(apm, int, 0644);
 MODULE_PARM_DESC(apm,
 		 "0 (default) = do not touch the Array Power Mux slots. 1 = program them for real. 2 = read-only preview: print every value mode 1 would write, next to a current sequencer-slot readback, and write nothing. The readback can be zero or stale, so use preview to validate targets before opting into apm=1; it is not a safety proof.");
 
+/*
+ * Linux clock-only OSM bring-up.  The stock DT describes a secure-world
+ * initialized OSM, but the SCM snapshot on R11T shows the sequencer and
+ * branch tables are all zero.  This mode lets Linux load the microcode and
+ * the PLL/GFMUX/ITM operands needed for a clock transition while leaving
+ * MEM-ACC and APM untouched.  It is deliberately opt-in and default-off:
+ * frequency scaling without the vendor voltage path is a diagnostic step,
+ * not a claim that the CPU supply is safe at every LUT row.
+ */
+static bool clock_only;
+module_param(clock_only, bool, 0444);
+MODULE_PARM_DESC(clock_only,
+		 "Default false. Diagnostic: load the OSM sequencer, PLL/GFMUX and ITM operands on a stock DT, but do not program MEM-ACC or APM. Requires dryrun=0 and qcom,osm-pll-setup. This proves the clock path independently of the voltage path; do not use it as a production power policy.");
+
 static int memacc;
 module_param(memacc, int, 0644);
 MODULE_PARM_DESC(memacc,
@@ -4020,6 +4034,14 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		dev_err(dev, "pll_bringup_test and rcgr_handoff_test are mutually exclusive\n");
 		return -EINVAL;
 	}
+	if (clock_only && dryrun) {
+		dev_err(dev, "clock_only requires dryrun=0; it must not run behind the table-write gate\n");
+		return -EINVAL;
+	}
+	if (clock_only && (apm || memacc)) {
+		dev_err(dev, "clock_only is mutually exclusive with apm/memacc writes\n");
+		return -EINVAL;
+	}
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
@@ -4395,21 +4417,23 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		 * and APM VC for both modes [caf:3295-3301], using SCM on the
 		 * stock path.  Those two updates are handled separately below.
 		 */
-		if (p->no_tz) {
+		if (p->no_tz || clock_only) {
 			struct osm_memacc_cfg memacc_cfg[R11T_NR_CLUSTERS];
+			bool clock_only_stock = clock_only && !p->no_tz;
 
-			/* No-TZ means Linux owns the entire initialization.  CAF's
+			/*
+			 * No-TZ means Linux owns the entire initialization.  CAF's
 			 * no-TZ path always programs APM and MEM-ACC; the module
 			 * parameters may only preview, never silently skip a half.
 			 */
-			if (apm != 1) {
+			if (!clock_only_stock && apm != 1) {
 				dev_err(dev,
 					"qcom,osm-no-tz requires apm=1, not apm=%d; refusing half-initialized OSM\n",
 					apm);
 				osmdev = NULL;
 				return -EINVAL;
 			}
-			if (memacc != 2) {
+			if (!clock_only_stock && memacc != 2) {
 				dev_err(dev,
 					"qcom,osm-no-tz requires memacc=2, not memacc=%d; refusing half-initialized OSM\n",
 					memacc);
@@ -4419,7 +4443,7 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			if (!of_property_read_bool(dev->of_node,
 						   "qcom,osm-pll-setup")) {
 				dev_err(dev,
-					"qcom,osm-no-tz requires qcom,osm-pll-setup; sequencer cannot hand off to an unprepared PLL\n");
+					"qcom,osm-no-tz/clock_only requires qcom,osm-pll-setup; sequencer cannot hand off to an unprepared PLL\n");
 				osmdev = NULL;
 				return -EINVAL;
 			}
@@ -4447,9 +4471,11 @@ static int r11t_osm_probe(struct platform_device *pdev)
 					goto no_tz_fail;
 				}
 			}
-			ret = osm_validate_memacc(p, memacc_cfg);
-			if (ret)
-				goto no_tz_fail;
+			if (!clock_only_stock) {
+				ret = osm_validate_memacc(p, memacc_cfg);
+				if (ret)
+					goto no_tz_fail;
+			}
 
 			for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 				struct osm_cluster *c = &p->cluster[i];
@@ -4461,18 +4487,25 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			ret = osm_setup_itm(p);
 			if (ret)
 				goto no_tz_fail;
-			ret = osm_setup_apm(p);
-			if (ret)
-				goto no_tz_fail;
+			if (!clock_only_stock) {
+				ret = osm_setup_apm(p);
+				if (ret)
+					goto no_tz_fail;
+			}
 			/* Deliberate safety deviation from CAF: CAF loads the
 			 * microcode inside do_additional_setup() before MEM-ACC
 			 * and APM VC [caf:3292-3301]; here every operand is
 			 * installed first and the microcode is loaded last.
 			 */
-			osm_setup_memacc(p, memacc_cfg);
-			ret = osm_setup_apm_vc(p);
-			if (ret)
-				goto no_tz_fail;
+			if (!clock_only_stock) {
+				osm_setup_memacc(p, memacc_cfg);
+				ret = osm_setup_apm_vc(p);
+				if (ret)
+					goto no_tz_fail;
+			} else {
+				dev_info(dev,
+					 "clock_only: MEM-ACC and APM left untouched; loading sequencer for clock-path validation only\n");
+			}
 			osm_setup_sequencer(p);
 		} else {
 			dev_info(dev,
