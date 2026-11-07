@@ -452,6 +452,14 @@ struct osm_dev {
 	u32 itm_present[R11T_NR_CLUSTERS];
 	u32 apm_mode_ctl[R11T_NR_CLUSTERS];
 	u32 apm_ctrl_status[R11T_NR_CLUSTERS];
+	/* CAF requires these arrays on the qcom,osm-no-tz path.  They are
+	 * copied verbatim from qcom,{pwrcl,perfcl}-apcs-mem-acc-{cfg,val};
+	 * they cannot be derived from the LUT or guessed.
+	 */
+	u32 memacc_cfg[R11T_NR_CLUSTERS][MAX_MEM_ACC_VAL_PER_LEVEL];
+	u32 memacc_val[R11T_NR_CLUSTERS][MAX_MEM_ACC_VALUES];
+	bool memacc_cfg_valid[R11T_NR_CLUSTERS];
+	bool memacc_val_valid[R11T_NR_CLUSTERS];
 	/* RCGR window (READ ONLY).  Derived from cfg_rcgr/cmd_rcgr by masking
 	 * off the register offset -- those two DT addresses are the CMD_RCGR
 	 * (+0x50) and CFG_RCGR (+0x54) halves of one root clock generator, so
@@ -464,12 +472,11 @@ struct osm_dev {
 	void __iomem *apcs_common;
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
 	bool per_policy_governor;
-	/* CAF calls this secure_init, but the property means the opposite:
-	 * qcom,osm-no-tz asks Linux to perform the initialization that the
-	 * secure monitor otherwise owns.  Keep the CAF name at the write
-	 * sites and parse the DT property exactly once.
+	/* qcom,osm-no-tz asks Linux to perform the initialization that the
+	 * secure monitor otherwise owns.  CAF calls this flag secure_init,
+	 * which is easy to read backwards; keep the meaning explicit here.
 	 */
-	bool secure_init;
+	bool no_tz;
 	u32 osm_clk_rate;
 	u32 xo_clk_rate;
 	u32 cc_reads;
@@ -482,7 +489,7 @@ struct osm_dev {
 static struct osm_dev *osmdev;
 
 static bool dryrun = true;
-module_param(dryrun, bool, 0644);
+module_param(dryrun, bool, 0444);
 MODULE_PARM_DESC(dryrun,
 		 "Default true: OSM table is not written, the frequency stays wherever the bootloader left it, and nothing can overclock the silicon. To go live you must reload the module with dryrun=0 (modprobe qcom_r11t_osm_cpufreq dryrun=0); writing 0 to /sys/module/qcom_r11t_osm_cpufreq/parameters/dryrun is WRONG because that only flips the bool and never builds the table, leaving the hardware indexing rows of an all-zero table. Note dryrun=0 is not a revert: it does not clear the table, so reboot to get back to the bootloader's clean state.");
 
@@ -1318,20 +1325,22 @@ static void osm_setup_fsms(struct osm_dev *p)
  * qcom,apcs-itm-present comes from stock R11T [stock-r11t.dts:4564]:
  * the SAME address for both clusters.
  */
-static void osm_setup_itm(struct osm_dev *p)
+static int osm_setup_itm(struct osm_dev *p)
 {
 	unsigned int i;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
-		u32 payload = (i == 0) ? ITM_CL0_DISABLE_CL1_ENABLED :
-					  ITM_CL0_ENABLED_CL1_DISABLE;
-
 		if (!p->itm_present[i]) {
 			dev_err(p->dev,
-				"cluster%u: qcom,apcs-itm-present missing, skipping ITM handoff\n",
+				"cluster%u: qcom,apcs-itm-present missing; refusing partial ITM handoff\n",
 				i);
-			continue;
+			return -EINVAL;
 		}
+	}
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		u32 payload = (i == 0) ? ITM_CL0_DISABLE_CL1_ENABLED :
+					  ITM_CL0_ENABLED_CL1_DISABLE;
 
 		osm_write_seq(p, i, SEQ_SLOT_ITM_PRESENT,
 			      p->itm_present[i], "apcs_itm_present");
@@ -1339,6 +1348,7 @@ static void osm_setup_itm(struct osm_dev *p)
 		osm_write_seq(p, i, SEQ_SLOT_ITM_DATA, payload,
 			      "itm_handover");
 	}
+	return 0;
 }
 
 /*
@@ -1395,14 +1405,14 @@ static const struct apm_preview r11t_apm_preview[] = {
 	{ SEQ_SLOT_APM_CTRL_STATUS,    "apm_ctrl_status",     1, 0 },
 	{ SEQ_SLOT_APM_MX_MODE,        "APM_MX_MODE",         0, APM_MX_MODE },
 	{ SEQ_SLOT_APM_MX_MODE_VAL,    "APM_MX_MODE_VAL",     0, APM_MX_MODE_VAL },
-	{ SEQ_SLOT_APM_SWITCH_MASK,    "APM_MODE_SWITCH_MASK",0, APM_MODE_SWITCH_MASK },
+	{ SEQ_SLOT_APM_SWITCH_MASK,    "APM_MODE_SWITCH_MASK", 0, APM_MODE_SWITCH_MASK },
 	{ SEQ_SLOT_APM_APC_MODE,       "APM_APC_MODE",        0, APM_APC_MODE },
 	{ SEQ_SLOT_APM_APC_MODE_VAL,   "APM_APC_MODE_VAL",    0, APM_APC_MODE_VAL },
 	/* osm_setup_apm_vc(): "when" -- the CPRh corners */
 	{ SEQ_SLOT_APM_THRESHOLD_VC,   "apm_threshold_vc",    1, 0 },
 	{ SEQ_SLOT_APM_CROSSOVER_VC,   "apm_crossover_vc",    1, 0 },
 	{ SEQ_SLOT_APM_THRESHOLD2,      "apm_threshold_vc(2)", 1, 0 },
-	{ SEQ_SLOT_APM_THRESHOLD_PRE,   "apm_threshold_pre_vc",1, 0 },
+	{ SEQ_SLOT_APM_THRESHOLD_PRE,   "apm_threshold_pre_vc", 1, 0 },
 	{ SEQ_SLOT_APM_THRESHOLD_MODE,  "apm_threshold_mode",  1, 0 },
 	{ SEQ_SLOT_APM_CROSSOVER_MODE,  "apm_crossover_mode",  1, 0 },
 };
@@ -1706,67 +1716,95 @@ static void osm_preview_memacc(struct osm_dev *p)
  * there is no readback verification.  Verification must be by behaviour
  * (DVFS still scales, no crash, no hang across the MEM-ACC threshold).
  *
- * CAF calls this right after clk_osm_do_additional_setup() and before
- * clk_osm_apm_vc_setup() [caf:3296-3301]; it lands here after
- * osm_setup_sequencer() and before osm_enable_hw().  APM VC and MEM-ACC
- * touch disjoint slots, so the local ordering does not matter.
+ * CAF calls this after clk_osm_do_additional_setup() (which already loaded
+ * the microcode) and before clk_osm_apm_vc_setup() [caf:3292-3301].  This
+ * port deliberately deviates from that global order: it writes MEM-ACC and
+ * APM VC first, then loads the microcode last.  That keeps a failed
+ * initialization from leaving an executing sequencer with operands that
+ * were never installed.  The slot contents themselves match CAF.
  */
-static void osm_setup_memacc(struct osm_dev *p)
+static int osm_validate_memacc(struct osm_dev *p,
+			       struct osm_memacc_cfg cfg[R11T_NR_CLUSTERS])
+{
+	unsigned int i;
+
+	/* Validate the whole cluster set before writing either one.  The slot
+	 * window has no readback, so a half-programmed MEM-ACC state cannot be
+	 * detected afterwards.
+	 */
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		int rc;
+
+		if (!p->memacc_cfg_valid[i] || !p->memacc_val_valid[i]) {
+			dev_err(p->dev,
+				"%s: qcom,osm-no-tz requires qcom,%scl-apcs-mem-acc-{cfg,val}; refusing partial MEM-ACC setup\n",
+				c->name, i == R11T_CLUSTER_PWRCL ? "pwr" : "perf");
+			return -EINVAL;
+		}
+
+		rc = osm_memacc_derive(c, &cfg[i]);
+		if (rc) {
+			dev_err(p->dev,
+				"%s: MEM-ACC thresholds not derivable (%d); refusing partial MEM-ACC setup\n",
+				c->name, rc);
+			return rc;
+		}
+	}
+
+	return 0;
+}
+
+static void osm_setup_memacc(struct osm_dev *p,
+			     const struct osm_memacc_cfg cfg[R11T_NR_CLUSTERS])
 {
 	unsigned int i, j;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		struct osm_cluster *c = &p->cluster[i];
-		struct osm_memacc_cfg cfg;
-		phys_addr_t seq28_addr;
-		int rc = osm_memacc_derive(c, &cfg);
+		phys_addr_t seq28_addr =
+			p->base_phys + (unsigned long)i * OSM_CORE_TABLE_SIZE;
 
-		if (rc) {
-			dev_err(p->dev,
-				 "%s: MEM-ACC thresholds not derivable (%d); refusing to program MEM-ACC slots\n",
-				 c->name, rc);
-			continue;
-		}
-
-		seq28_addr = p->base_phys + (unsigned long)i * OSM_CORE_TABLE_SIZE;
 		for (j = 0; j < 4; j++)
-			osm_write_seq(p, i, 55 + j, (u32)cfg.threshold_vc[j],
+			osm_write_seq(p, i, 55 + j,
+				      (u32)cfg[i].threshold_vc[j],
 				      "memacc_threshold_vc");
-		osm_write_seq(p, i, 32, cfg.lval, "memacc_lval");
+		osm_write_seq(p, i, 32, cfg[i].lval, "memacc_lval");
 		osm_write_seq(p, i, 49, (u32)(seq28_addr + SEQ_REG(28)),
 			      "memacc_seq28_addr");
 		for (j = 0; j < 4; j++)
-			osm_write_seq(p, i, 51 + j, (u32)(j + 1),
+			osm_write_seq(p, i, 51 + j, MEM_ACC_SEQ_CONST(j + 1),
 				      "memacc_seq_const");
 		osm_write_seq(p, i, 59, MEM_ACC_APM_READ_MASK,
 			      "memacc_apm_mask");
+		for (j = 0; j < MAX_MEM_ACC_VALUES; j++)
+			osm_write_seq(p, i, 60 + j, p->memacc_val[i][j],
+				      "memacc_val");
+		for (j = 0; j < MAX_MEM_ACC_VAL_PER_LEVEL; j++)
+			osm_write_seq(p, i, 12 + j, p->memacc_cfg[i][j],
+				      "memacc_cfg");
 		osm_mb(c);
 
-		/* Slot window is write-only so nothing is read back; the
-		 * write log above plus the behavioural check are the only
-		 * verification that exists.
-		 */
 		dev_info(p->dev,
-			 "memacc=2 cluster%u (%s): programmed SEQ_REG(55-58,32,49,51-54,59). "
-			 "88/12-14/60-68 left 0: stock DTS has no crossover and no "
-			 "qcom,*-apcs-mem-acc-{cfg,val}.  Experimental, not "
-			 "stock-TZ-equivalent; slot window is write-only, no readback.\n",
+			 "memacc=2 cluster%u (%s): programmed CAF no-TZ MEM-ACC slot set (55-58,32,49,51-54,59,60-68,12-14); slot window is write-only\n",
 			 i, c->name);
 	}
 }
 
-static void osm_setup_apm(struct osm_dev *p)
+static int osm_setup_apm(struct osm_dev *p)
 {
 	unsigned int i;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		if (!p->apm_mode_ctl[i] || !p->apm_ctrl_status[i]) {
 			dev_err(p->dev,
-				"cluster%u: qcom,apm-mode-ctl / qcom,apm-ctrl-status missing, skipping APM setup\n",
+				"cluster%u: qcom,apm-mode-ctl / qcom,apm-ctrl-status missing; refusing partial APM setup\n",
 				i);
-			continue;
+			return -EINVAL;
 		}
+	}
 
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		osm_write_seq(p, i, SEQ_SLOT_APM_MODE_CTL,
 			      p->apm_mode_ctl[i], "apm_mode_ctl");
 		osm_write_seq(p, i, SEQ_SLOT_APM_CTRL_STATUS,
@@ -1782,27 +1820,27 @@ static void osm_setup_apm(struct osm_dev *p)
 		osm_write_seq(p, i, SEQ_SLOT_APM_APC_MODE_VAL,
 			      APM_APC_MODE_VAL, "APM_APC_MODE_VAL");
 	}
+	return 0;
 }
 
 /*
  * APM crossover / threshold slots -- the missing half of osm_setup_apm().
  * Port of clk_osm_apm_vc_setup() [caf:2303-2325].
  */
-static void osm_setup_apm_vc(struct osm_dev *p)
+static int osm_setup_apm_vc(struct osm_dev *p)
 {
 	unsigned long osm_base;
 	unsigned int i;
 
 	/* CAF clk_osm_apm_vc_setup() [caf:2303-2336] has two branches:
-	 * secure_init writes SEQ_REG(1,72,8,15,31,73,76) via clk_osm_write_reg;
-	 * !secure_init writes SEQ_REG1_OFFSET(0x1048) via clk_osm_write_reg and
-	 * SEQ_REG(72,15,31,76) via scm_io_write(). This driver has no TZ/SCM,
-	 * so it can only reproduce the secure_init branch writes. Keep them,
-	 * but say so: on a no-TZ boot the slot values are the secure-path
-	 * values, not the !secure_init values CAF would have produced.
+	 * qcom,osm-no-tz (CAF's secure_init == true) writes
+	 * SEQ_REG(1,72,8,15,31,73,76) via normal MMIO; the TZ-owned branch
+	 * writes SEQ_REG1_OFFSET(0x1048) and hands the remaining slots to
+	 * scm_io_write().  This driver only takes ownership when the DT
+	 * explicitly says qcom,osm-no-tz, so it reproduces the former branch
+	 * and never pretends to have the SCM write path.
 	 */
-	dev_warn(p->dev, "apm=1: writing secure_init APM VC slots (SEQ_REG 1/72/8/15/31/73/76); "
-			 "CAF !secure_init path (SEQ_REG1_OFFSET 0x1048 + SCM) is not reproduced\n");
+	dev_info(p->dev, "apm=1: writing qcom,osm-no-tz APM VC slots (SEQ_REG 1/72/8/15/31/73/76) via MMIO\n");
 
 	osm_base = p->base_phys;
 
@@ -1827,6 +1865,7 @@ static void osm_setup_apm_vc(struct osm_dev *p)
 		osm_write_seq(p, i, SEQ_SLOT_APM_CROSSOVER_MODE,
 			      0x39 | (thr << 6), "apm_crossover_mode");
 	}
+	return 0;
 }
 
 /*
@@ -1911,18 +1950,44 @@ static void osm_probe_scm_slot(struct osm_dev *p)
 		 !ret && scm_val != 0 && scm_val != U32_MAX);
 }
 
-static int osm_setup_seq(struct osm_dev *p)
+static int osm_validate_seq(struct osm_dev *p)
+{
+	int i;
+
+	/* Every slot below is an address or selector consumed by the
+	 * sequencer.  Validate the complete set first: the OSM slot window has
+	 * no reliable readback, and a zero address would make the microcode
+	 * dereference address 0.
+	 */
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		if (!p->l_val_base[i]) {
+			dev_err(p->dev,
+				"cluster%d: qcom,l-val-base missing; refusing partial sequencer setup\n",
+				i);
+			return -EINVAL;
+		}
+		if (!p->pll_user_ctl[i]) {
+			dev_err(p->dev,
+				"cluster%d: qcom,apcs-pll-user-ctl missing; refusing partial sequencer setup\n",
+				i);
+			return -EINVAL;
+		}
+		if (!p->cfg_rcgr[i] || !p->cmd_rcgr[i]) {
+			dev_err(p->dev,
+				"cluster%d: qcom,apcs-{cfg,cmd}-rcgr missing; refusing partial sequencer setup\n",
+				i);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static void osm_setup_seq(struct osm_dev *p)
 {
 	int i;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
-		if (!p->l_val_base[i]) {
-			dev_err(p->dev,
-				"cluster%d: qcom,l-val-base missing, skipping seq setup\n",
-				i);
-			return -EINVAL;
-		}
-
 		osm_write_seq(p, i, SEQ_SLOT_L_VAL_BASE, p->l_val_base[i],
 			      "l_val_base");
 		osm_write_seq(p, i, SEQ_SLOT_CFG_RCGR, p->cfg_rcgr[i],
@@ -1963,8 +2028,6 @@ static int osm_setup_seq(struct osm_dev *p)
 		osm_write_seq(p, i, SEQ_SLOT_RCG_UPDATE2, RCG_UPDATE,
 			      "RCG_UPDATE(2)");
 	}
-
-	return 0;
 }
 
 /*
@@ -3670,10 +3733,10 @@ static int dryrun_get(void *data, u64 *val)
 	return 0;
 }
 
-/* Read-only: runtime flip to dryrun=0 would enable target_index() writes
- * against a hardware table that was never programmed (probe only programs
- * it when dryrun==0 at load time). Keep the writer removed; changing
- * dryrun still requires module reload, as documented in MODULE_PARM_DESC.
+/* The module parameter and debugfs file are both read-only.  A runtime
+ * flip to dryrun=0 would enable target_index() writes against a hardware
+ * table that was never programmed (probe only programs it when dryrun==0
+ * at load time).  Changing dryrun requires a module reload.
  */
 /* This kernel's debugfs predates DEFINE_DEBUGFS_ATTRIBUTE_RO. */
 DEFINE_DEBUGFS_ATTRIBUTE(dryrun_fops, dryrun_get, NULL, "%llu\n");
@@ -3784,6 +3847,37 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		}
 	}
 
+	/* MEM-ACC arrays are required by CAF's qcom,osm-no-tz path.  Parse
+	 * them unconditionally so the DT contract is validated even in stock
+	 * mode; only no-TZ consumes them.  Do not infer these values.
+	 */
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		static const char * const cfg_props[R11T_NR_CLUSTERS] = {
+			"qcom,pwrcl-apcs-mem-acc-cfg",
+			"qcom,perfcl-apcs-mem-acc-cfg",
+		};
+		static const char * const val_props[R11T_NR_CLUSTERS] = {
+			"qcom,pwrcl-apcs-mem-acc-val",
+			"qcom,perfcl-apcs-mem-acc-val",
+		};
+		int n;
+
+		n = of_property_count_u32_elems(dev->of_node, cfg_props[i]);
+		if (n == MAX_MEM_ACC_VAL_PER_LEVEL) {
+			ret = of_property_read_u32_array(dev->of_node, cfg_props[i],
+							 p->memacc_cfg[i], n);
+			if (!ret)
+				p->memacc_cfg_valid[i] = true;
+		}
+		n = of_property_count_u32_elems(dev->of_node, val_props[i]);
+		if (n == MAX_MEM_ACC_VALUES) {
+			ret = of_property_read_u32_array(dev->of_node, val_props[i],
+							 p->memacc_val[i], n);
+			if (!ret)
+				p->memacc_val_valid[i] = true;
+		}
+	}
+
 	/* Map PLL resources (READ ONLY -- we never write these) */
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		static const char * const pll_res_name[R11T_NR_CLUSTERS] = {
@@ -3860,7 +3954,7 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		p->xo_clk = NULL;
 	}
 
-	p->secure_init = of_property_read_bool(dev->of_node, "qcom,osm-no-tz");
+	p->no_tz = of_property_read_bool(dev->of_node, "qcom,osm-no-tz");
 
 	platform_set_drvdata(pdev, p);
 
@@ -4062,37 +4156,97 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		 * operands.  Keep that state intact unless the DT explicitly asks
 		 * Linux to take ownership.
 		 */
-		if (p->secure_init) {
+		if (p->no_tz) {
+			struct osm_memacc_cfg memacc_cfg[R11T_NR_CLUSTERS];
+
+			/* No-TZ means Linux owns the entire initialization.  CAF's
+			 * no-TZ path always programs APM and MEM-ACC; the module
+			 * parameters may only preview, never silently skip a half.
+			 */
+			if (apm != 1) {
+				dev_err(dev,
+					"qcom,osm-no-tz requires apm=1, not apm=%d; refusing half-initialized OSM\n",
+					apm);
+				osmdev = NULL;
+				return -EINVAL;
+			}
+			if (memacc != 2) {
+				dev_err(dev,
+					"qcom,osm-no-tz requires memacc=2, not memacc=%d; refusing half-initialized OSM\n",
+					memacc);
+				osmdev = NULL;
+				return -EINVAL;
+			}
+			if (!of_property_read_bool(dev->of_node,
+						   "qcom,osm-pll-setup")) {
+				dev_err(dev,
+					"qcom,osm-no-tz requires qcom,osm-pll-setup; sequencer cannot hand off to an unprepared PLL\n");
+				osmdev = NULL;
+				return -EINVAL;
+			}
+
+			/* Validate every operand before touching hardware, then
+			 * write once in CAF order: SPM_CC_CTRL, PLL/GFMUX,
+			 * ITM, APM, MEM-ACC, APM VC, microcode LAST.
+			 */
+			ret = osm_validate_seq(p);
+			if (ret)
+				goto no_tz_fail;
+			for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+				if (!p->itm_present[i]) {
+					dev_err(dev,
+						"cluster%d: qcom,apcs-itm-present missing; refusing partial OSM initialization\n",
+						i);
+					ret = -EINVAL;
+					goto no_tz_fail;
+				}
+				if (!p->apm_mode_ctl[i] || !p->apm_ctrl_status[i]) {
+					dev_err(dev,
+						"cluster%d: qcom,apm-mode-ctl/qcom,apm-ctrl-status missing; refusing partial OSM initialization\n",
+						i);
+					ret = -EINVAL;
+					goto no_tz_fail;
+				}
+			}
+			ret = osm_validate_memacc(p, memacc_cfg);
+			if (ret)
+				goto no_tz_fail;
+
 			for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 				struct osm_cluster *c = &p->cluster[i];
 
 				osm_write(c, BVAL(23, 16, 0xF), SPM_CC_CTRL);
+				osm_mb(c);
 			}
-
-			ret = osm_setup_seq(p);
-			if (ret) {
-				dev_err(dev,
-					"qcom,osm-no-tz set but sequencer operands are incomplete (%d); refusing partial OSM initialization\n",
-					ret);
-				osmdev = NULL;
-				return ret;
-			}
-			if (apm == 1) {
-				osm_setup_apm(p);
-				osm_setup_apm_vc(p);
-				for (i = 0; i < R11T_NR_CLUSTERS; i++)
-					osm_mb(&p->cluster[i]);
-			} else if (!apm && p->apm_mode_ctl[0] && p->apm_ctrl_status[0]) {
-				dev_warn(dev,
-					 "qcom,osm-no-tz set but apm=0: leaving the Array Power Mux slots to the no-TZ path. CAF also fills slots 1/8/15/31/72/73/76; enable apm=1 only after preview.\n");
-			}
-			osm_setup_itm(p);
+			osm_setup_seq(p);
+			ret = osm_setup_itm(p);
+			if (ret)
+				goto no_tz_fail;
+			ret = osm_setup_apm(p);
+			if (ret)
+				goto no_tz_fail;
+			/* Deliberate safety deviation from CAF: CAF loads the
+			 * microcode inside do_additional_setup() before MEM-ACC
+			 * and APM VC [caf:3292-3301]; here every operand is
+			 * installed first and the microcode is loaded last.
+			 */
+			osm_setup_memacc(p, memacc_cfg);
+			ret = osm_setup_apm_vc(p);
+			if (ret)
+				goto no_tz_fail;
 			osm_setup_sequencer(p);
 		} else {
 			dev_info(dev,
 				 "stock secure-init mode: preserving TZ-owned OSM sequencer/ITM/APM/MEM-ACC state; only LUT, policy, row and PLL handoff are managed here\n");
 		}
 
+		goto no_tz_done;
+no_tz_fail:
+		dev_err(dev, "qcom,osm-no-tz initialization failed (%d); refusing to enable OSM\n",
+			ret);
+		osmdev = NULL;
+		return ret;
+no_tz_done:
 		/* CAF requests the two OSM debug IRQs before PLL setup and OSM
 		 * enable.  They expose deviation/corrected/met status, which is
 		 * the only direct acknowledgement that a requested row was
@@ -4104,9 +4258,7 @@ static int r11t_osm_probe(struct platform_device *pdev)
 				dev_warn(dev, "%s: OSM debug IRQ unavailable (%d)\n",
 					 p->cluster[i].name, ret);
 		}
-		if (p->secure_init && memacc == 2)
-			osm_setup_memacc(p);
-		else if (!p->secure_init && memacc == 2)
+		if (!p->no_tz && memacc == 2)
 			dev_warn(dev,
 				 "memacc=2 ignored in stock secure-init mode: CAF's non-secure MEM-ACC writes require SCM, and TZ owns those slots\n");
 
