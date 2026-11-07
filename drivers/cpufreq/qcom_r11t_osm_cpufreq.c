@@ -3629,6 +3629,81 @@ static const struct file_operations osm_seq_fops = {
 	.release = osm_lut_release,
 };
 
+/*
+ * Read-only SCM view of the sequencer.  The normal OSM alias for the
+ * branch table, slots and microcode is write-only (reads return 0x2), so
+ * an MMIO dump cannot distinguish "TZ never loaded the program" from
+ * "the program is present but stopped".  qcom_scm_io_readl() reads the
+ * same physical window through the secure monitor.  This file issues
+ * reads only; it never writes a slot or changes the OSM state.
+ */
+static void osm_dump_scm_range(struct seq_file *m, struct osm_dev *p,
+			       int cl, const char *name, unsigned int off,
+			       unsigned int n)
+{
+	phys_addr_t base = p->base_phys +
+		(phys_addr_t)cl * OSM_CORE_TABLE_SIZE;
+	unsigned int i;
+	u32 val;
+	int ret;
+
+	seq_printf(m, "  -- %s (off 0x%03x, %u entries) --\n", name, off, n);
+	for (i = 0; i < n; i++) {
+		phys_addr_t addr = base + off + (phys_addr_t)i * 4;
+
+		ret = qcom_scm_io_readl(addr, &val);
+		if (ret) {
+			seq_printf(m,
+				   "    [%3u] @%pa: read failed (%d)\n",
+				   i, &addr, ret);
+			return;
+		}
+		seq_printf(m, "    [%3u] @%pa = %08x\n", i, &addr, val);
+	}
+	seq_puts(m, "\n");
+}
+
+static int osm_scm_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	if (!osmdev)
+		return -ENODEV;
+
+	seq_puts(m, "SCM read-only OSM snapshot; no writes are issued.\n\n");
+	if (!qcom_scm_is_available()) {
+		seq_puts(m, "qcom_scm is unavailable; no secure reads issued.\n");
+		return 0;
+	}
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		phys_addr_t base = osmdev->base_phys +
+			(phys_addr_t)i * OSM_CORE_TABLE_SIZE;
+
+		seq_printf(m, "=== cluster %d (%s) base=%pa ===\n",
+			   i, osmdev->cluster[i].name, &base);
+		osm_dump_scm_range(m, osmdev, i, "BRANCH TABLE",
+				   R11T_SEQ_BR_OFF, R11T_SEQ_BR_N);
+		osm_dump_scm_range(m, osmdev, i, "SLOTS",
+				   R11T_SEQ_SLOT_OFF, R11T_SEQ_SLOT_N);
+		osm_dump_scm_range(m, osmdev, i, "MICROCODE",
+				   R11T_SEQ_MC_OFF, R11T_SEQ_MC_N);
+	}
+	return 0;
+}
+
+static int osm_scm_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, osm_scm_show, NULL);
+}
+
+static const struct file_operations osm_scm_fops = {
+	.open	= osm_scm_open,
+	.read	= seq_read,
+	.llseek	= seq_lseek,
+	.release = osm_lut_release,
+};
+
 static void osm_state_show_one(struct seq_file *m, struct osm_dev *p, int cl)
 {
 	struct osm_cluster *c = &p->cluster[cl];
@@ -3906,6 +3981,7 @@ static void osm_debugfs_init(struct device *dev)
 	debugfs_create_file("lut", 0444, osm_dbg_dir, NULL, &osm_lut_fops);
 	debugfs_create_file("regs", 0444, osm_dbg_dir, NULL, &osm_regs_fops);
 	debugfs_create_file("seq", 0444, osm_dbg_dir, NULL, &osm_seq_fops);
+	debugfs_create_file("scm", 0444, osm_dbg_dir, NULL, &osm_scm_fops);
 	debugfs_create_file("state", 0444, osm_dbg_dir, NULL, &osm_state_fops);
 	debugfs_create_file("snapshot", 0444, osm_dbg_dir, NULL,
 			    &osm_snapshot_fops);
