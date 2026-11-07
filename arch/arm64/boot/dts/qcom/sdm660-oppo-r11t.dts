@@ -380,8 +380,8 @@
 		 * showed the sequencer and branch tables are empty, so there is
 		 * no secure-world program to hand off to.  Keep qcom,osm-no-tz
 		 * off: the clock_only diagnostic mode loads the clock program
-		 * while leaving MEM-ACC/APM untouched until their real board data
-		 * is available.
+		 * and the DT-backed APM operands while leaving MEM-ACC values
+		 * untouched until their real board data is available.
 		 */
 		qcom,osm-pll-setup;
 
