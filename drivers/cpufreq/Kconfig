@@ -207,7 +207,7 @@ comment "CPU frequency scaling drivers"
 
 config CPUFREQ_R11T_OSM
 	tristate "OPPO R11T (SDM660) OSM cpufreq driver"
-	depends on CPU_FREQ && OF && ARM64
+	depends on CPU_FREQ && OF && ARM64 && QCOM_SCM
 	help
 	  Brings up the two CPU clusters of the OPPO R11T (Qualcomm SDM660)
 	  under cpufreq control, using the OSM (One Speed Manager) lookup

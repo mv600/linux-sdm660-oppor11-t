@@ -516,7 +516,7 @@ MODULE_PARM_DESC(wdog_trace,
 static bool scm_probe;
 module_param(scm_probe, bool, 0444);
 MODULE_PARM_DESC(scm_probe,
-		 "Diagnostic-only: after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. Default false. This is strictly read-only and proves whether the secure monitor permits OSM-slot access before any secure write path is enabled.");
+		 "Diagnostic-only: after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. Default false. ret=0 means the SCM call succeeded; the returned value may legitimately be zero and is not a capability check.");
 
 static bool lval_test = false;
 module_param(lval_test, bool, 0644);
@@ -598,11 +598,12 @@ MODULE_PARM_DESC(rcgr_handoff_row,
  *
  * The "when" values are resolved from the stock R11T DTB corner tables and
  * kept in r11t_apm_* below, so they do not depend on a CPRh regulator
- * being registered by mainline.  The remaining risk is the write path:
- * CAF hands those slots to the secure world with scm_io_write() when
- * secure_init is false, while this driver has no TZ and must use a normal
- * MMIO write.  apm=2 previews every value without writing; apm=1 is the
- * opt-in live experiment.
+ * being registered by mainline.  The write path follows the DT mode.
+ * With qcom,osm-no-tz Linux owns the full APM VC set and writes it through
+ * MMIO.  On a stock/TZ boot CAF writes only 0x1048 through MMIO and hands
+ * SEQ_REG(72,15,31,76) to scm_io_write(); this driver mirrors that split
+ * with qcom_scm_io_writel().  apm=2 previews every value without writing;
+ * apm=1 is the opt-in live experiment.
  */
 static int apm;
 module_param(apm, int, 0644);
@@ -612,7 +613,7 @@ MODULE_PARM_DESC(apm,
 static int memacc;
 module_param(memacc, int, 0644);
 MODULE_PARM_DESC(memacc,
-		 "0 (default) = do not inspect MEM-ACC. 1 = read-only preview: print the CAF-derived LEVEL MAP, THRESHOLD corners, the SEQ_REG(32) L_VAL target, the SEQ_REG(28) address (slot 49) and the constants/mask a no-TZ CAF path would write; nothing is written. 2 = program the no-TZ writable MEM-ACC set: SEQ_REG(55-58)=thresholds, SEQ_REG(32)=L_VAL, SEQ_REG(49)=SEQ_REG(28) phys addr, SEQ_REG(51-54)=1..4, SEQ_REG(59)=0xff.  The sequencer slot window is WRITE-ONLY, so no readback verify exists; 88/12-14/60-68 stay 0 because the stock DTS has no crossover and no qcom,*-apcs-mem-acc-{cfg,val}.  Experimental, not stock-TZ-equivalent.");
+		 "0 (default) = do not inspect MEM-ACC. 1 = read-only preview of the CAF-derived LEVEL MAP, THRESHOLD corners and SEQ_REG(32) L_VAL target; nothing is written. 2 = program MEM-ACC. On qcom,osm-no-tz this writes the full no-TZ set (55-58,32,49,51-54,59,60-68,12-14) via MMIO. On stock/TZ this writes only CAF's non-secure subset (55-58,32) via qcom_scm_io_writel(); TZ retains 49,51-54,59,60-68,12-14. SEQ_REG(88) is written only when a crossover value exists. The slot window is write-only, so success of the SCM call is not a readback proof.");
 
 static inline void osm_write(struct osm_cluster *c, u32 val, u32 offset)
 {
@@ -916,6 +917,40 @@ static void osm_write_seq(struct osm_dev *p, unsigned int cluster,
 
 	dev_info(p->dev, "SEQ_REG(%2u) cluster%d = 0x%08x  %s\n",
 		 slot, cluster, val, what);
+}
+
+/*
+ * CAF's non-secure OSM path hands these slots to the secure monitor with
+ * scm_io_write().  qcom_scm_io_writel() returns 0 on a successful SCM call;
+ * it is not a readback, so the only thing this helper can prove is that the
+ * monitor accepted the write request.
+ */
+static int osm_scm_write_seq(struct osm_dev *p, unsigned int cluster,
+			     unsigned int slot, u32 val, const char *what)
+{
+	phys_addr_t addr = p->base_phys +
+		(unsigned long)cluster * OSM_CORE_TABLE_SIZE + SEQ_REG(slot);
+	int ret;
+
+	if (!qcom_scm_is_available()) {
+		dev_err(p->dev,
+			"SCM unavailable: cannot write SEQ_REG(%u) cluster%u (%s)\n",
+			slot, cluster, what);
+		return -ENODEV;
+	}
+
+	ret = qcom_scm_io_writel(addr, val);
+	if (ret) {
+		dev_err(p->dev,
+			"SCM write failed: SEQ_REG(%u) cluster%u addr=%pa val=0x%08x ret=%d (%s)\n",
+			slot, cluster, &addr, val, ret, what);
+		return ret;
+	}
+
+	dev_info(p->dev,
+		 "SCM SEQ_REG(%2u) cluster%d addr=%pa = 0x%08x  %s\n",
+		 slot, cluster, &addr, val, what);
+	return 0;
 }
 
 /* Same as osm_write_seq() but for raw OSM-window offsets that are not
@@ -1356,16 +1391,13 @@ static int osm_setup_itm(struct osm_dev *p)
  *
  * The corner numbers are no longer guesses -- they were resolved from
  * the stock DTB the same way CAF resolves them at runtime
- * [caf:1595-1665], see the block comment above the constants.  What is
- * still unproven is the WRITE ITSELF: on a stock boot CAF never runs
- * clk_osm_do_additional_setup() (qcom,osm-no-tz is absent from the
- * R11T DTB, so secure_init is false and the function returns at
- * [caf:2264]) and the trustzone driver does that work instead.  For
- * these particular slots CAF does not even use writel_relaxed -- on
- * the secure_init == false path it hands them to the secure world via
- * scm_io_write() [caf:2326-2337].  We have no secure world, so mode 1
- * writes with writel_relaxed() and that substitution is an assumption,
- * not a port.
+ * [caf:1595-1665], see the block comment above the constants.  The write
+ * path is selected by the same DT flag as CAF.  On a stock boot
+ * clk_osm_do_additional_setup() returns at [caf:2264] because TZ owns the
+ * sequencer setup, but clk_osm_apm_vc_setup() still runs.  Its non-secure
+ * branch writes 0x1048 through MMIO and SEQ_REG(72,15,31,76) through
+ * scm_io_write() [caf:2326-2337]; this driver mirrors that split.  With
+ * qcom,osm-no-tz it writes the full MMIO set instead.
  *
  * Mode 2 makes the intended write inspectable without committing to it:
  * it prints the value we would write next to the sequencer slot's current
@@ -1421,6 +1453,7 @@ static void osm_preview_apm(struct osm_dev *p)
 {
 	unsigned long osm_base = p->base_phys;
 	unsigned int i, k;
+	bool stock = !p->no_tz;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
 		void __iomem *b = p->base +
@@ -1428,7 +1461,8 @@ static void osm_preview_apm(struct osm_dev *p)
 		u32 thr = r11t_apm_threshold_vc[i];
 		u32 want8, have8;
 
-		dev_info(p->dev, "--- apm=2 preview cluster%u ---\n", i);
+		dev_info(p->dev, "--- apm=2 preview cluster%u (%s path) ---\n",
+			 i, stock ? "stock/TZ SCM" : "no-TZ MMIO");
 
 		if (!p->apm_mode_ctl[i] || !p->apm_ctrl_status[i]) {
 			dev_err(p->dev,
@@ -1443,6 +1477,16 @@ static void osm_preview_apm(struct osm_dev *p)
 		for (k = 0; k < ARRAY_SIZE(r11t_apm_preview); k++) {
 			const struct apm_preview *e = &r11t_apm_preview[k];
 			u32 want, have;
+
+			if (stock &&
+			    (e->slot == SEQ_SLOT_APM_THRESHOLD_VC ||
+			     e->slot == SEQ_SLOT_APM_THRESHOLD_ADDR ||
+			     e->slot == SEQ_SLOT_APM_THRESHOLD_MODE)) {
+				dev_info(p->dev,
+					 "  SEQ_REG(%2u) TZ-retained (stock path does not write) %s\n",
+					 e->slot, e->what);
+				continue;
+			}
 
 			if (!e->per_cluster) {
 				want = e->common;
@@ -1485,18 +1529,27 @@ static void osm_preview_apm(struct osm_dev *p)
 				 e->what);
 		}
 
-		/* Slot 8 sits outside the table above because its value is an
-		 * OSM-window address, printed here so the full set CAF writes
-		 * appears in one place.
-		 */
-		want8 = (u32)(osm_base + (unsigned long)i * OSM_CORE_TABLE_SIZE +
-			      SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC));
-		have8 = readl_relaxed(b + SEQ_REG(SEQ_SLOT_APM_THRESHOLD_ADDR));
-		dev_info(p->dev,
-			 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s\n",
-			 SEQ_SLOT_APM_THRESHOLD_ADDR, want8, have8,
-			 want8 == have8 ? "same" : "DIFFERS",
-			 "apm_threshold_vc_addr");
+		if (!stock) {
+			/* Slot 8 sits outside the table above because its value is
+			 * an OSM-window address.  It belongs only to the no-TZ path.
+			 */
+			want8 = (u32)(osm_base +
+				      (unsigned long)i * OSM_CORE_TABLE_SIZE +
+				      SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC));
+			have8 = readl_relaxed(b + SEQ_REG(SEQ_SLOT_APM_THRESHOLD_ADDR));
+			dev_info(p->dev,
+				 "  SEQ_REG(%2u) want 0x%08x have 0x%08x %-9s %s\n",
+				 SEQ_SLOT_APM_THRESHOLD_ADDR, want8, have8,
+				 want8 == have8 ? "same" : "DIFFERS",
+				 "apm_threshold_vc_addr");
+		} else {
+			u32 have1 = readl_relaxed(b + OSM_SEQ_REG1_OFFSET);
+
+			dev_info(p->dev,
+				 "  OSM_REG1(0x%04x) want 0x%08x have 0x%08x %-9s apm_threshold_vc (MMIO)\n",
+				 OSM_SEQ_REG1_OFFSET, thr,
+				 have1, thr == have1 ? "same" : "DIFFERS");
+		}
 
 		/* SPM_CC_CTRL is not a slot; apm=1 writes it unconditionally
 		 * and so does every other mode, but show it anyway since it is
@@ -1649,15 +1702,22 @@ static void osm_preview_memacc(struct osm_dev *p)
 			 cfg.target_row >= 0 ? cfg.lval : 0, cfg.target_row);
 		dev_info(p->dev,
 			 "  would-write SEQ_REG(55-58)=%d,%d,%d,%d "
-			 "SEQ_REG(32)=0x%08x SEQ_REG(49)=0x%08x "
-			 "SEQ_REG(51-54)=1,2,3,4 SEQ_REG(59)=0x%02x\n",
+			 "SEQ_REG(32)=0x%08x path=%s\n",
 			 cfg.threshold_vc[0], cfg.threshold_vc[1],
 			 cfg.threshold_vc[2], cfg.threshold_vc[3],
-			 cfg.target_row >= 0 ? cfg.lval : 0, (u32)seq28_addr,
-			 MEM_ACC_APM_READ_MASK);
+			 cfg.target_row >= 0 ? cfg.lval : 0,
+			 secure_no_tz ? "no-TZ-MMIO" : "stock-SCM");
+		if (secure_no_tz)
+			dev_info(p->dev,
+				 "  would-write SEQ_REG(49)=0x%08x SEQ_REG(51-54)=1,2,3,4 SEQ_REG(59)=0x%02x\n",
+				 (u32)seq28_addr, MEM_ACC_APM_READ_MASK);
+		else
+			dev_info(p->dev,
+				 "  TZ-retained SEQ_REG(49)=0x%08x SEQ_REG(51-54)=1,2,3,4 SEQ_REG(59)=0x%02x\n",
+				 (u32)seq28_addr, MEM_ACC_APM_READ_MASK);
 	}
 	dev_info(p->dev,
-		 "memacc=%d preview: derived values come from the LUT (trusted); "
+		 "memacc=%d preview: derived values come from the LUT; "
 		 "the sequencer slot window is WRITE-ONLY -- reads return a "
 		 "constant -- so no slot readback is possible and none is "
 		 "attempted.  crossover-prop=%d cfg/val-dt=%d\n",
@@ -1668,12 +1728,12 @@ static void osm_preview_memacc(struct osm_dev *p)
 			 "memacc=1: preview only, no MEM-ACC register was written.\n");
 	else
 		dev_info(p->dev,
-			 "memacc=2: preview shows what will be programmed after the sequencer is loaded.\n");
+			 "memacc=2: preview shows the values for the %s write path.\n",
+			 secure_no_tz ? "no-TZ MMIO" : "stock/TZ SCM");
 }
 
 /*
- * memacc=2: program the MEM-ACC slots CAF programs on a boot with no
- * trustzone, as far as a no-trustzone port can.
+ * memacc=2: program the MEM-ACC slots CAF programs.
  *
  * CAF's clk_osm_program_mem_acc_regs() [caf:1996-2086] has two paths:
  *
@@ -1685,23 +1745,24 @@ static void osm_preview_memacc(struct osm_dev *p)
  *       scm_io_write() for 88 (crossover, only when the DT resolved one)
  *       and for 55-58, then 32.  Slot 49 is left to TZ [caf:2059].
  *
- * This platform boots mainline with no trustzone and no SCM endpoint, so
- * the scm_io_write() path cannot run at all.  Direct MMIO is exactly what
- * the secure_init branch does and it is the only option here.
+ * The branch is selected by qcom,osm-no-tz.  osm_setup_memacc() below is the
+ * full no-TZ MMIO path.  osm_setup_memacc_scm() is the stock/TZ subset,
+ * because qcom_scm_io_writel() is available on this mainline port and CAF's
+ * non-secure branch still updates those slots after TZ setup.
  *
- * Deliberately WRITTEN (values CAF writes on a stock boot and that need
- * no DT data we lack):
+ * Deliberately WRITTEN by the no-TZ path (values CAF writes when Linux owns
+ * the OSM and that need no DT data we lack):
  *   SEQ_REG(55..58)  threshold corners, derived from the LUT
  *   SEQ_REG(32)      L_VAL of the first MEM-ACC level-3 corner
  *   SEQ_REG(49)      PHYSICAL ADDRESS of SEQ_REG(28).  CAF's non-secure
- *                    path leaves it to TZ [caf:2059], but with no TZ the
+ *                    path leaves it to TZ [caf:2074], but with no TZ the
  *                    slot would stay 0 and the MEM-ACC microcode would
  *                    dereference address 0 as soon as the thresholds are
- *                    live, so the no-TZ port must write it itself.
+ *                    live, so the no-TZ path must write it itself.
  *   SEQ_REG(51..54)  MEM-ACC constants 1..4 [caf:73]
  *   SEQ_REG(59)      MEM-ACC APM read mask 0xff [caf:201]
  *
- * Deliberately NOT WRITTEN:
+ * Deliberately NOT WRITTEN by the no-TZ path:
  *   SEQ_REG(88)      crossover: needs qcom,*-apcs-mem-acc-threshold-
  *                    voltage plus regulator-count resolution; the stock
  *                    R11T DTB has none, so CAF would not write it either.
@@ -1709,8 +1770,7 @@ static void osm_preview_memacc(struct osm_dev *p)
  *                    cfg/val arrays from qcom,*-apcs-mem-acc-{cfg,val};
  *                    absent from the stock R11T DTB (the values live in
  *                    the vendor TZ firmware), so there is nothing to
- *                    write.  This makes memacc=2 an experimental subset,
- *                    NOT the stock-TZ-equivalent configuration.
+ *                    write.
  *
  * The sequencer slot window is write-only: reads return a constant, so
  * there is no readback verification.  Verification must be by behaviour
@@ -1791,6 +1851,48 @@ static void osm_setup_memacc(struct osm_dev *p,
 	}
 }
 
+/*
+ * Stock/TZ MEM-ACC path, clk_osm_program_mem_acc_regs() [caf:2040-2084].
+ *
+ * The stock DTB leaves TZ owning SEQ_REG(49), the cfg/val arrays
+ * (12-14, 60-68), and the constants/mask (51-54, 59).  CAF only asks the
+ * monitor to update the four LUT-derived threshold corners, the optional
+ * crossover, and the L_VAL of the first level-3 corner.  Keep that set
+ * exact: writing the no-TZ-only slots here would mix two ownership models.
+ */
+static int osm_setup_memacc_scm(struct osm_dev *p,
+				const struct osm_memacc_cfg cfg[R11T_NR_CLUSTERS])
+{
+	unsigned int i, j;
+	int ret;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+
+		/* Stock R11T has no qcom,perfcl-apcs-mem-acc-threshold-voltage,
+		 * so CAF leaves mem_acc_crossover_vc at zero and does not write
+		 * SEQ_REG(88).  Do not invent a crossover value here.
+		 */
+		for (j = 0; j < 4; j++) {
+			ret = osm_scm_write_seq(p, i, 55 + j,
+						(u32)cfg[i].threshold_vc[j],
+						"memacc_threshold_vc");
+			if (ret)
+				return ret;
+		}
+
+		ret = osm_scm_write_seq(p, i, 32, cfg[i].lval, "memacc_lval");
+		if (ret)
+			return ret;
+
+		dev_info(p->dev,
+			 "memacc=2 cluster%u (%s): stock/TZ MEM-ACC set written via SCM (55-58,32); TZ retains 49,51-54,59,60-68,12-14\n",
+			 i, c->name);
+	}
+
+	return 0;
+}
+
 static int osm_setup_apm(struct osm_dev *p)
 {
 	unsigned int i;
@@ -1831,15 +1933,60 @@ static int osm_setup_apm_vc(struct osm_dev *p)
 {
 	unsigned long osm_base;
 	unsigned int i;
+	int ret;
 
 	/* CAF clk_osm_apm_vc_setup() [caf:2303-2336] has two branches:
 	 * qcom,osm-no-tz (CAF's secure_init == true) writes
 	 * SEQ_REG(1,72,8,15,31,73,76) via normal MMIO; the TZ-owned branch
-	 * writes SEQ_REG1_OFFSET(0x1048) and hands the remaining slots to
-	 * scm_io_write().  This driver only takes ownership when the DT
-	 * explicitly says qcom,osm-no-tz, so it reproduces the former branch
-	 * and never pretends to have the SCM write path.
+	 * writes SEQ_REG1_OFFSET(0x1048) via MMIO and hands
+	 * SEQ_REG(72,15,31,76) to scm_io_write().  The branch must follow
+	 * the DT mode: writing the no-TZ set on a stock boot would overwrite
+	 * TZ-owned slots, while writing the stock set without SCM silently
+	 * changes nothing.
 	 */
+	if (!p->no_tz) {
+		dev_info(p->dev,
+			 "apm=1: writing stock/TZ APM VC set (0x1048 via MMIO; SEQ_REG 72/15/31/76 via SCM)\n");
+
+		for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+			struct osm_cluster *c = &p->cluster[i];
+			u32 thr = r11t_apm_threshold_vc[i];
+			u32 pre = r11t_apm_threshold_pre[i];
+
+			/* CAF skips this MMIO write when the resolved threshold is
+			 * zero.  The stock table resolves 5/4, but keep CAF's guard
+			 * so an unusual DT does not turn "unset" into a live value.
+			 */
+			if (thr) {
+				osm_write(c, thr, OSM_SEQ_REG1_OFFSET);
+				dev_info(p->dev,
+					 "OSM_REG1 cluster%u = 0x%08x  apm_threshold_vc\n",
+					 i, thr);
+			}
+
+			ret = osm_scm_write_seq(p, i, SEQ_SLOT_APM_CROSSOVER_VC,
+						r11t_apm_crossover_vc[i],
+						"apm_crossover_vc");
+			if (ret)
+				return ret;
+			ret = osm_scm_write_seq(p, i, SEQ_SLOT_APM_THRESHOLD2,
+						thr, "apm_threshold_vc");
+			if (ret)
+				return ret;
+			ret = osm_scm_write_seq(p, i, SEQ_SLOT_APM_THRESHOLD_PRE,
+						pre, "apm_threshold_pre_vc");
+			if (ret)
+				return ret;
+			ret = osm_scm_write_seq(p, i, SEQ_SLOT_APM_CROSSOVER_MODE,
+						0x39 | (thr << 6),
+						"apm_crossover_mode");
+			if (ret)
+				return ret;
+		}
+
+		return 0;
+	}
+
 	dev_info(p->dev, "apm=1: writing qcom,osm-no-tz APM VC slots (SEQ_REG 1/72/8/15/31/73/76) via MMIO\n");
 
 	osm_base = p->base_phys;
@@ -1945,9 +2092,12 @@ static void osm_probe_scm_slot(struct osm_dev *p)
 
 	ret = qcom_scm_io_readl(addr, &scm_val);
 	dev_info(p->dev,
-		 "scm_probe: read-only addr=%pa mmio=%#010x scm_ret=%d scm=%#010x valid=%d\n",
+		 "scm_probe: read-only addr=%pa mmio=%#010x scm_ret=%d scm=%#010x read_succeeded=%d\n",
 		 &addr, mmio_val, ret, scm_val,
-		 !ret && scm_val != 0 && scm_val != U32_MAX);
+		 !ret);
+	if (!ret && !scm_val)
+		dev_info(p->dev,
+			 "scm_probe: the SCM call succeeded and returned 0; this is a slot value, not evidence that SCM is unavailable\n");
 }
 
 static int osm_validate_seq(struct osm_dev *p)
@@ -4122,7 +4272,8 @@ static int r11t_osm_probe(struct platform_device *pdev)
 				 "memacc=1: preview only, no MEM-ACC register was written. Compare the CAF-derived values before deciding whether memacc=2 is worth trying live.\n");
 		else
 			dev_warn(dev,
-				 "memacc=2: the values above will be programmed after the sequencer is loaded.  The slot window is write-only, so there is no readback verify; watch the behavioural checks (DVFS scaling, no crash).\n");
+				 "memacc=2: the values above will be written through the %s path.  The slot window is write-only, so there is no readback verify; watch the behavioural checks (DVFS scaling, no crash).\n",
+				 p->no_tz ? "no-TZ MMIO" : "stock/TZ SCM");
 	}
 
 	if (!dryrun) {
@@ -4149,12 +4300,12 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			return ret;
 		}
 
-		/* CAF gates the sequencer/ITM/APM setup on secure_init, which is
-		 * true only when qcom,osm-no-tz is present.  On a stock boot TZ
-		 * has already loaded the microcode and programmed these slots;
-		 * overwriting only part of them leaves the OSM with inconsistent
-		 * operands.  Keep that state intact unless the DT explicitly asks
-		 * Linux to take ownership.
+		/* CAF gates the sequencer/ITM/APM address setup on secure_init,
+		 * which is true only when qcom,osm-no-tz is present.  On a stock
+		 * boot TZ has already loaded the microcode and programmed those
+		 * slots; keep that state intact.  CAF nevertheless runs MEM-ACC
+		 * and APM VC for both modes [caf:3295-3301], using SCM on the
+		 * stock path.  Those two updates are handled separately below.
 		 */
 		if (p->no_tz) {
 			struct osm_memacc_cfg memacc_cfg[R11T_NR_CLUSTERS];
@@ -4237,10 +4388,47 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			osm_setup_sequencer(p);
 		} else {
 			dev_info(dev,
-				 "stock secure-init mode: preserving TZ-owned OSM sequencer/ITM/APM/MEM-ACC state; only LUT, policy, row and PLL handoff are managed here\n");
+				 "stock secure-init mode: preserving TZ-owned sequencer/ITM/APM address slots; LUT, policy, row, PLL handoff and explicit APM/MEM-ACC SCM updates are managed here\n");
+
+			/* CAF still runs MEM-ACC and APM VC after the TZ-owned
+			 * additional setup [caf:3295-3301].  Its non-secure branch
+			 * writes only the LUT-derived subset through SCM.  Keep the
+			 * same opt-in gates and fail before OSM enable if either
+			 * monitor call is rejected.
+			 */
+			if (memacc == 2) {
+				struct osm_memacc_cfg memacc_cfg[R11T_NR_CLUSTERS];
+
+				for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+					ret = osm_memacc_derive(&p->cluster[i],
+								&memacc_cfg[i]);
+					if (ret) {
+						dev_err(dev,
+							"%s: MEM-ACC thresholds not derivable (%d); refusing partial stock MEM-ACC setup\n",
+							p->cluster[i].name, ret);
+						goto stock_fail;
+					}
+				}
+
+				ret = osm_setup_memacc_scm(p, memacc_cfg);
+				if (ret)
+					goto stock_fail;
+			}
+
+			if (apm == 1) {
+				ret = osm_setup_apm_vc(p);
+				if (ret)
+					goto stock_fail;
+			}
 		}
 
 		goto no_tz_done;
+stock_fail:
+		dev_err(dev,
+			"stock/TZ OSM update failed (%d); refusing to enable OSM\n",
+			ret);
+		osmdev = NULL;
+		return ret;
 no_tz_fail:
 		dev_err(dev, "qcom,osm-no-tz initialization failed (%d); refusing to enable OSM\n",
 			ret);
@@ -4258,10 +4446,6 @@ no_tz_done:
 				dev_warn(dev, "%s: OSM debug IRQ unavailable (%d)\n",
 					 p->cluster[i].name, ret);
 		}
-		if (!p->no_tz && memacc == 2)
-			dev_warn(dev,
-				 "memacc=2 ignored in stock secure-init mode: CAF's non-secure MEM-ACC writes require SCM, and TZ owns those slots\n");
-
 		/* CAF order: bring the PLL up first, select LUT row 0, then
 		 * enable the OSM, then request the boot row.  CAF's
 		 * setup_cluster_pll() only enables the early PLL output; the
