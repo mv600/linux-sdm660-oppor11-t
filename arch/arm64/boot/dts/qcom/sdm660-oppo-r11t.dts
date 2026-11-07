@@ -375,12 +375,15 @@
 		 * trustzone driver instead, so a mainline kernel has to carry them
 		 * in DT itself.
 		 */
-		/* Stock R11T does not declare either property.  The bootloader
-		 * and secure monitor initialize the sequencer, ITM, APM and
-		 * MEM-ACC slots; Linux must preserve that state.  Add
-		 * qcom,osm-no-tz only for a deliberate no-TZ experiment, and
-		 * qcom,osm-pll-setup only when Linux should bring the PLLs up.
+		/*
+		 * Linux must bring the PLLs up itself: the SCM readback on R11T
+		 * showed the sequencer and branch tables are empty, so there is
+		 * no secure-world program to hand off to.  Keep qcom,osm-no-tz
+		 * off: the clock_only diagnostic mode loads the clock program
+		 * while leaving MEM-ACC/APM untouched until their real board data
+		 * is available.
 		 */
+		qcom,osm-pll-setup;
 
 		qcom,boost-fsm-en;
 		qcom,safe-fsm-en;
