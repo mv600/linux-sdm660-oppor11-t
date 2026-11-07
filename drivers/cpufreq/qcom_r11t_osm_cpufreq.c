@@ -1716,10 +1716,12 @@ static void osm_preview_memacc(struct osm_dev *p)
  * there is no readback verification.  Verification must be by behaviour
  * (DVFS still scales, no crash, no hang across the MEM-ACC threshold).
  *
- * CAF calls this right after clk_osm_do_additional_setup() and before
- * clk_osm_apm_vc_setup() [caf:3296-3301]; it lands here after
- * osm_setup_sequencer() and before osm_enable_hw().  APM VC and MEM-ACC
- * touch disjoint slots, so the local ordering does not matter.
+ * CAF calls this after clk_osm_do_additional_setup() (which already loaded
+ * the microcode) and before clk_osm_apm_vc_setup() [caf:3292-3301].  This
+ * port deliberately deviates from that global order: it writes MEM-ACC and
+ * APM VC first, then loads the microcode last.  That keeps a failed
+ * initialization from leaving an executing sequencer with operands that
+ * were never installed.  The slot contents themselves match CAF.
  */
 static int osm_validate_memacc(struct osm_dev *p,
 			       struct osm_memacc_cfg cfg[R11T_NR_CLUSTERS])
@@ -4223,6 +4225,11 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			ret = osm_setup_apm(p);
 			if (ret)
 				goto no_tz_fail;
+			/* Deliberate safety deviation from CAF: CAF loads the
+			 * microcode inside do_additional_setup() before MEM-ACC
+			 * and APM VC [caf:3292-3301]; here every operand is
+			 * installed first and the microcode is loaded last.
+			 */
 			osm_setup_memacc(p, memacc_cfg);
 			ret = osm_setup_apm_vc(p);
 			if (ret)
