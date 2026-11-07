@@ -615,15 +615,15 @@ MODULE_PARM_DESC(apm,
  * Linux clock-only OSM bring-up.  The stock DT describes a secure-world
  * initialized OSM, but the SCM snapshot on R11T shows the sequencer and
  * branch tables are all zero.  This mode lets Linux load the microcode and
- * the PLL/GFMUX/ITM operands needed for a clock transition while leaving
- * MEM-ACC and APM untouched.  It is deliberately opt-in and default-off:
- * frequency scaling without the vendor voltage path is a diagnostic step,
- * not a claim that the CPU supply is safe at every LUT row.
+ * the PLL/GFMUX/ITM/APM operands needed for a clock transition while leaving
+ * the MEM-ACC value path untouched.  It is deliberately opt-in and
+ * default-off: frequency scaling without the vendor voltage path is a
+ * diagnostic step, not a claim that the CPU supply is safe at every LUT row.
  */
 static bool clock_only;
 module_param(clock_only, bool, 0444);
 MODULE_PARM_DESC(clock_only,
-		 "Default false. Diagnostic: load the OSM sequencer, PLL/GFMUX and ITM operands on a stock DT, but do not program MEM-ACC or APM. Requires dryrun=0 and qcom,osm-pll-setup. This proves the clock path independently of the voltage path; do not use it as a production power policy.");
+		 "Default false. Diagnostic: load the OSM sequencer, PLL/GFMUX, ITM and APM operands on a stock DT, but do not program MEM-ACC values. Requires dryrun=0 and qcom,osm-pll-setup. This proves the clock path independently of the MEM-ACC voltage path; do not use it as a production power policy.");
 
 static int memacc;
 module_param(memacc, int, 0644);
@@ -4496,16 +4496,20 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			 * microcode inside do_additional_setup() before MEM-ACC
 			 * and APM VC [caf:3292-3301]; here every operand is
 			 * installed first and the microcode is loaded last.
+			 *
+			 * clock_only still needs both APM halves: the sequencer
+			 * uses the address/mode slots and the threshold/crossover
+			 * slots while deciding whether to leave the low-power
+			 * path.  Only the MEM-ACC value programming is skipped.
 			 */
-			if (!clock_only_stock) {
+			if (!clock_only_stock)
 				osm_setup_memacc(p, memacc_cfg);
-				ret = osm_setup_apm_vc(p);
-				if (ret)
-					goto no_tz_fail;
-			} else {
+			ret = osm_setup_apm_vc(p);
+			if (ret)
+				goto no_tz_fail;
+			if (clock_only_stock)
 				dev_info(dev,
-					 "clock_only: MEM-ACC and APM left untouched; loading sequencer for clock-path validation only\n");
-			}
+					 "clock_only: MEM-ACC values left untouched; APM and clock operands loaded for sequencer validation\n");
 			osm_setup_sequencer(p);
 		} else {
 			dev_info(dev,
