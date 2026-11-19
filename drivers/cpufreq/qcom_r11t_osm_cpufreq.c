@@ -4487,11 +4487,18 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			ret = osm_setup_itm(p);
 			if (ret)
 				goto no_tz_fail;
-			if (!clock_only_stock) {
-				ret = osm_setup_apm(p);
-				if (ret)
-					goto no_tz_fail;
-			}
+			/* APM address/mode half (SEQ_REG 2/3/77-81) is a
+			 * sequencer operand, not a voltage write: it is required
+			 * in clock_only too.  Run 42411685294 shipped with this
+			 * block still gated on !clock_only_stock, so the APM VC
+			 * thresholds went in but slots 2/3/77-81 stayed zero and
+			 * the sequencer parked at microcode 0xdc (measured
+			 * 2026-11-20, boot 7ba077af).  Only MEM-ACC values are
+			 * skipped in clock_only.
+			 */
+			ret = osm_setup_apm(p);
+			if (ret)
+				goto no_tz_fail;
 			/* Deliberate safety deviation from CAF: CAF loads the
 			 * microcode inside do_additional_setup() before MEM-ACC
 			 * and APM VC [caf:3292-3301]; here every operand is
