@@ -623,12 +623,12 @@ MODULE_PARM_DESC(apm,
 static bool clock_only;
 module_param(clock_only, bool, 0444);
 MODULE_PARM_DESC(clock_only,
-		 "Default false. Diagnostic: load the OSM sequencer, PLL/GFMUX, ITM and APM operands on a stock DT, but do not program MEM-ACC values. Requires dryrun=0 and qcom,osm-pll-setup. This proves the clock path independently of the MEM-ACC voltage path; do not use it as a production power policy.");
+		 "Default false. Diagnostic: load the OSM sequencer, PLL/GFMUX, ITM and APM operands on a stock DT, but do not program MEM-ACC values. Requires dryrun=0 and qcom,osm-pll-setup. Do not use it as a production power policy. MEASURED LIMIT on R11T (2026-11-20, run 44592587286): the microcode parks at PC 0xdc, which reads MEM-ACC cfg slots 12-14. Those slots need a 40-row MEM-ACC level map that the 8/7-row cpufreq LUT cannot produce, so this mode cannot complete a clock handoff on this board. The SCM read channel (/sys/kernel/debug/qcom_r11t_osm/scm) shows the firmware wrote only the threshold slots 55-58 and the cross-cluster pointers 4/7.");
 
 static int memacc;
 module_param(memacc, int, 0644);
 MODULE_PARM_DESC(memacc,
-		 "0 (default) = do not inspect MEM-ACC. 1 = read-only preview of the CAF-derived LEVEL MAP, THRESHOLD corners and SEQ_REG(32) L_VAL target; nothing is written. 2 = program MEM-ACC. On qcom,osm-no-tz this writes the full no-TZ set (55-58,32,49,51-54,59,60-68,12-14) via MMIO. On stock/TZ this writes only CAF's non-secure subset (55-58,32) via qcom_scm_io_writel(); TZ retains 49,51-54,59,60-68,12-14. SEQ_REG(88) is written only when a crossover value exists. The slot window is write-only, so success of the SCM call is not a readback proof.");
+		 "0 (default) = do not inspect MEM-ACC. 1 = read-only preview of the CAF-derived LEVEL MAP, THRESHOLD corners and SEQ_REG(32) L_VAL target; nothing is written. 2 = program MEM-ACC. On qcom,osm-no-tz this writes the full no-TZ set (55-58,32,49,51-54,59,60-68,12-14) via MMIO. On stock/TZ this writes only CAF's non-secure subset (55-58,32) via qcom_scm_io_writel(); TZ retains 49,51-54,59,60-68,12-14. SEQ_REG(88) is written only when a crossover value exists. The slot window is write-only, so success of the SCM call is not a readback proof. MEASURED LIMIT on R11T (2026-11-22): osm_memacc_derive() runs on the 8/7-row cpufreq LUT and yields threshold_vc {3,4,7,8} / {3,4,6,7}, but the firmware wrote {9,10,16,17} / {7,8,11,12} into slots 55-58, values that exceed the LUT corner range and only make sense against the 40-row hardware table. The derivation source is therefore wrong for this board; writing mode-2 values would install incorrect thresholds with no readback to catch it.");
 
 static inline void osm_write(struct osm_cluster *c, u32 val, u32 offset)
 {
