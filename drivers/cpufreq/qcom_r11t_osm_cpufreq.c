@@ -878,6 +878,35 @@ static void osm_probe_pll(struct osm_dev *p)
  * [caf:296-315].  This is the OSM sequencer's instruction stream and
  * branch table; without it the state machine accepts a row number and
  * then does nothing.
+ *
+ * EXCEPTION -- entry [55] (microcode offset 0xdc).
+ *
+ * CAF has 0x1c02500c here.  The R11T watchdog PC parks on exactly this
+ * word on every boot (measured 2026-11-20/22, runs 42411685294 and
+ * 44592587286, boots 7ba077af and d3bf938a): both clusters read
+ * pc=0x000000dc, cycle_counter stays 0 and the RCGR never leaves GPLL0,
+ * while DCVS_PERF_STATE_DESIRED still tracks every row request.  0xdc is
+ * not a branch-table target, so the sequencer runs into it in sequence
+ * and then stops.
+ *
+ * The board's own trustzone image carries the same sequencer program.
+ * Comparing the two word streams, the instruction immediately before the
+ * park point is byte-identical (0x1c073983) and the firmware then emits
+ * 0x1c020007 where CAF has 0x1c02500c -- same opcode 0x1c02, operand 7
+ * instead of 0x500c:
+ *
+ *   firmware: 0x1c073983, 0x1c020007
+ *   CAF/ours: 0x1c073983, 0x1c02500c
+ *
+ * 0x500c is a slot operand (prefix 0x5000, index 0x0c = MEM-ACC cfg slot
+ * 12, which this board never programs); 0x0007 is a plain immediate.
+ * Both tz (p12) and tzbak (p13) agree: the pair (0x1c073983, 0x1c020007)
+ * appears twice in each image and (0x1c073983, 0x1c02500c) never appears.
+ *
+ * So entry [55] is taken as 0x1c020007.  If the park persists after this
+ * change the operand theory is wrong and the next suspect is the rest of
+ * the stream, which only shares about 6% of its words with the firmware
+ * copy and is therefore still unverified.
  */
 static const u32 r11t_seq_instr[150] = {
 	0xc2005000, 0x2c9e3b21, 0xc0ab2cdc, 0xc2882525, 0x359dc491, 0x700a500b,
@@ -889,7 +918,7 @@ static const u32 r11t_seq_instr[150] = {
 	0x2bad0003, 0xac3aa20b, 0x0003181b, 0x0003bb40, 0xa30d239b, 0x500c181b,
 	0x5011500f, 0x181b3413, 0x853984b9, 0x0003bd80, 0xa0012ba4, 0x72050803,
 	0x500e1000, 0x500c1000, 0x1c011c0a, 0x3b181c06, 0x1c073b43, 0x1c061000,
-	0x1c073983, 0x1c02500c, 0x10001c0a, 0x70015002, 0x81031000, 0x70025003,
+	0x1c073983, 0x1c020007, 0x10001c0a, 0x70015002, 0x81031000, 0x70025003,
 	0x70035004, 0x3b441000, 0x81553985, 0x70025003, 0x50054003, 0xa1467009,
 	0x0003b1c0, 0x4005238b, 0x835a1000, 0x855c84db, 0x1000a51f, 0x84de835d,
 	0xa52c855c, 0x50061000, 0x39cd3a4c, 0x3ad03a8f, 0x10004006, 0x70065007,
