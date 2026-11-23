@@ -51,6 +51,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/arm-smccc.h>
 #include <linux/bitops.h>
 #include <linux/clk.h>
 #include <linux/cpufreq.h>
@@ -517,7 +518,7 @@ MODULE_PARM_DESC(wdog_trace,
 static int scm_probe;
 module_param(scm_probe, int, 0444);
 MODULE_PARM_DESC(scm_probe,
-		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = additionally write and read back a sentinel on SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and on unused SEQ_REG(95) as a control, then restore both previous values. 3 = also write an SCM sentinel to the unused pwrcl LUT tail row 39 spare field and verify it through MMIO, then restore the original value. This determines whether SCM writes work outside the sequencer-slot window.");
+		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = additionally write and read back a sentinel on SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and on unused SEQ_REG(95) as a control, then restore both previous values. 3 = also write an SCM sentinel to the unused pwrcl LUT tail row 39 spare field and verify it through MMIO, then restore the original value. 4 = query SCM IO command availability and issue CAF-compatible raw SCM IO calls against the same unused LUT tail field. This determines whether SCM writes work outside the sequencer-slot window and whether the IO service or raw calling convention is responsible.");
 
 static bool lval_test = false;
 module_param(lval_test, bool, 0644);
@@ -2222,6 +2223,66 @@ static void osm_scm_probe_lut_tail(struct osm_dev *p)
 		 osm_read(c, offset), osm_read(c, adjacent));
 }
 
+#define R11T_SCM_SVC_IO		0x05
+#define R11T_SCM_IO_READ		0x01
+#define R11T_SCM_IO_WRITE		0x02
+#define R11T_SCM_SVC_INFO		0x06
+#define R11T_SCM_INFO_IS_CALL_AVAIL	0x01
+
+static u32 r11t_scm_fnid(unsigned int svc, unsigned int cmd)
+{
+	return ((svc & 0xff) << 8) | (cmd & 0xff);
+}
+
+/*
+ * Query whether the secure world advertises an SCM command.  This mirrors
+ * CAF's scm_is_call_available(): the target command is passed with the SIP
+ * owner encoded in the function id.
+ */
+static bool r11t_scm_call_available(unsigned int svc, unsigned int cmd)
+{
+	unsigned long target = r11t_scm_fnid(svc, cmd) |
+			       (ARM_SMCCC_OWNER_SIP << ARM_SMCCC_OWNER_SHIFT);
+	unsigned long fn = ARM_SMCCC_CALL_VAL(ARM_SMCCC_STD_CALL,
+					      ARM_SMCCC_SMC_64,
+					      ARM_SMCCC_OWNER_SIP,
+					      r11t_scm_fnid(R11T_SCM_SVC_INFO,
+							    R11T_SCM_INFO_IS_CALL_AVAIL));
+	struct arm_smccc_res res = {};
+
+	arm_smccc_smc(fn, 1, target, 0, 0, 0, 0, 0, &res);
+	dev_info(p->dev,
+		 "scm_probe: capability svc=%u cmd=%u status=%#lx available=%u\n",
+		 svc, cmd, res.a0, !!res.a1);
+	return res.a0 == 0 && res.a1 != 0;
+}
+
+/*
+ * CAF-compatible raw SCM IO call.  The mainline qcom_scm_io_*() helpers use
+ * the same raw function id, FAST_CALL, SMC64 convention and argument layout;
+ * keeping the raw call here proves that no wrapper-layer translation is
+ * responsible for the observed no-op.
+ */
+static long r11t_scm_io_raw(unsigned int cmd, phys_addr_t addr, u32 val,
+			     u32 *readback)
+{
+	unsigned long fn = ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,
+					      ARM_SMCCC_SMC_64,
+					      ARM_SMCCC_OWNER_SIP,
+					      r11t_scm_fnid(R11T_SCM_SVC_IO,
+							    cmd));
+	struct arm_smccc_res res = {};
+	unsigned long arginfo = cmd == R11T_SCM_IO_WRITE ? 2 : 1;
+
+	if (cmd == R11T_SCM_IO_WRITE)
+		arm_smccc_smc(fn, arginfo, addr, val, 0, 0, 0, 0, &res);
+	else
+		arm_smccc_smc(fn, arginfo, addr, 0, 0, 0, 0, 0, &res);
+	if (readback)
+		*readback = res.a1;
+	return res.a0;
+}
+
 static void osm_probe_scm_slot(struct osm_dev *p)
 {
 	struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
@@ -2265,6 +2326,36 @@ static void osm_probe_scm_slot(struct osm_dev *p)
 
 	if (scm_probe >= 3)
 		osm_scm_probe_lut_tail(p);
+
+	if (scm_probe >= 4) {
+		struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
+		const unsigned int offset = OSM_SPARE_REG +
+					    (OSM_TABLE_SIZE - 1) * OSM_REG_SIZE;
+		phys_addr_t addr = p->base_phys + offset;
+		unsigned int before = osm_read(c, offset);
+		unsigned int raw_read = 0;
+		long status;
+
+		r11t_scm_call_available(R11T_SCM_SVC_IO, R11T_SCM_IO_READ);
+		r11t_scm_call_available(R11T_SCM_SVC_IO, R11T_SCM_IO_WRITE);
+
+		status = r11t_scm_io_raw(R11T_SCM_IO_WRITE, addr,
+					  0x5A5A0039, NULL);
+		dev_info(p->dev,
+			 "scm_probe: raw IO write addr=%pa status=%#lx mmio=%#010x\n",
+			 &addr, status, osm_read(c, offset));
+
+		status = r11t_scm_io_raw(R11T_SCM_IO_READ, addr, 0,
+					  &raw_read);
+		dev_info(p->dev,
+			 "scm_probe: raw IO read addr=%pa status=%#lx value=%#010x mmio=%#010x\n",
+			 &addr, status, raw_read, osm_read(c, offset));
+
+		osm_write(c, before, offset);
+		osm_mb(c);
+		dev_info(p->dev, "scm_probe: raw IO test restored mmio=%#010x\n",
+			 osm_read(c, offset));
+	}
 }
 
 static int osm_validate_seq(struct osm_dev *p)
