@@ -518,7 +518,7 @@ MODULE_PARM_DESC(wdog_trace,
 static int scm_probe;
 module_param(scm_probe, int, 0444);
 MODULE_PARM_DESC(scm_probe,
-		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = additionally write and read back a sentinel on SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and on unused SEQ_REG(95) as a control, then restore both previous values. 3 = also write an SCM sentinel to the unused pwrcl LUT tail row 39 spare field and verify it through MMIO, then restore the original value. 4 = query SCM IO command availability and issue CAF-compatible raw SCM IO calls against the same unused LUT tail field. 5 = repeat the raw IO calls with the SMC32 convention selected by CAF when its runtime probe chooses ARMv8_32. 6 = write, read back, and restore the vendor R11 Gladiator ACE hang-detect threshold through SCM as a control outside the OSM window. This determines whether SCM writes work outside the sequencer-slot window and whether the IO service or calling convention is responsible.");
+		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = additionally write and read back a sentinel on SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and on unused SEQ_REG(95) as a control, then restore both previous values. 3 = also write an SCM sentinel to the unused pwrcl LUT tail row 39 spare field and verify it through MMIO, then restore the original value. 4 = query SCM IO command availability and issue CAF-compatible raw SCM IO calls against the same unused LUT tail field. 5 = repeat the raw IO calls with the SMC32 convention selected by CAF when its runtime probe chooses ARMv8_32. 6 = write, read back, and restore the vendor R11 Gladiator ACE hang-detect threshold through SCM as a control outside the OSM window. 7 = read-only survey of all vendor R11 SCM IO control addresses used by hang-detect and TCSR. This determines whether SCM writes work outside the sequencer-slot window and whether the IO service or calling convention is responsible.");
 
 static bool lval_test = false;
 module_param(lval_test, bool, 0644);
@@ -2339,6 +2339,42 @@ static bool osm_scm_probe_control(struct osm_dev *p)
 	return !ret && after == test_value && restored == before;
 }
 
+/*
+ * Read-only survey of the SCM IO addresses used by the vendor R11 drivers.
+ * No value is written.  The addresses come from the R11T stock DT:
+ * Gladiator thresholds/config, core hang-detect thresholds/config, and the
+ * TCSR boot-misc-detect register.
+ */
+static void osm_scm_probe_control_survey(struct osm_dev *p)
+{
+	static const phys_addr_t addrs[] = {
+		0x179d141c, 0x179d1420, 0x179d1424, 0x179d1428,
+		0x179d142c, 0x179d1430, 0x179d1434,
+		0x179880b0, 0x179880b8, 0x179980b0, 0x179980b8,
+		0x179a80b0, 0x179a80b8, 0x179b80b0, 0x179b80b8,
+		0x178880b0, 0x178880b8, 0x178980b0, 0x178980b8,
+		0x178a80b0, 0x178a80b8, 0x178b80b0, 0x178b80b8,
+		0x1fd3000,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(addrs); i++) {
+		unsigned int value = 0, raw64 = 0, raw32 = 0;
+		long status64, status32;
+		int ret;
+
+		ret = qcom_scm_io_readl(addrs[i], &value);
+		status64 = r11t_scm_io_raw(R11T_SCM_IO_READ, addrs[i], 0,
+					    &raw64, true);
+		status32 = r11t_scm_io_raw(R11T_SCM_IO_READ, addrs[i], 0,
+					    &raw32, false);
+		dev_info(p->dev,
+			 "scm_probe: survey addr=%pa main=%#010x main_ret=%d raw64=%#010x raw64_status=%#lx raw32=%#010x raw32_status=%#lx\n",
+			 &addrs[i], value, ret, raw64, status64, raw32,
+			 status32);
+	}
+}
+
 static void osm_probe_scm_slot(struct osm_dev *p)
 {
 	struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
@@ -2415,6 +2451,9 @@ static void osm_probe_scm_slot(struct osm_dev *p)
 
 	if (scm_probe >= 6)
 		osm_scm_probe_control(p);
+
+	if (scm_probe >= 7)
+		osm_scm_probe_control_survey(p);
 
 	if (scm_probe >= 5) {
 		struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
