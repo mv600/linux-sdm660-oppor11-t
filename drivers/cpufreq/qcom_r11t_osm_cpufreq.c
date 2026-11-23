@@ -517,7 +517,7 @@ MODULE_PARM_DESC(wdog_trace,
 static int scm_probe;
 module_param(scm_probe, int, 0444);
 MODULE_PARM_DESC(scm_probe,
-		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = same read, then write a sentinel through SCM and read it back, to establish whether the slot layer is verifiable at all. Both modes only touch SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and the previous value is restored.");
+		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = additionally write and read back a sentinel on SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and on unused SEQ_REG(95) as a control, then restore both previous values. This establishes whether the SCM slot layer is verifiable and whether slot 1 is special.");
 
 static bool lval_test = false;
 module_param(lval_test, bool, 0644);
@@ -2129,12 +2129,60 @@ static void osm_setup_wdog_trace(struct osm_dev *p)
 	}
 }
 
+/*
+ * One SCM write/read round trip on a single sequencer slot.
+ *
+ * The slot window's MMIO read alias does not return the slot contents on
+ * this board, so MMIO is sampled only for comparison; the SCM value is the
+ * one that counts.  The previous SCM value is restored afterwards.  Returns
+ * true only when the sentinel itself read back through SCM.
+ */
+static bool osm_scm_probe_one(struct osm_dev *p, unsigned int slot, u32 sentinel)
+{
+	struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
+	phys_addr_t addr = p->base_phys + SEQ_REG(slot);
+	unsigned int mmio_before, mmio_after;
+	unsigned int scm_before = 0, scm_after = 0, scm_restored = 0;
+	bool matched;
+	int ret;
+
+	mmio_before = osm_read(c, SEQ_REG(slot));
+	ret = qcom_scm_io_readl(addr, &scm_before);
+	dev_info(p->dev,
+		 "scm_probe: slot %u addr=%pa mmio_before=%#010x scm_before=%#010x scm_ret=%d\n",
+		 slot, &addr, mmio_before, scm_before, ret);
+	if (ret)
+		return false;
+
+	ret = qcom_scm_io_writel(addr, sentinel);
+	dev_info(p->dev, "scm_probe: slot %u write sentinel %#010x ret=%d\n",
+		 slot, sentinel, ret);
+	if (ret)
+		return false;
+
+	ret = qcom_scm_io_readl(addr, &scm_after);
+	mmio_after = osm_read(c, SEQ_REG(slot));
+	matched = !ret && scm_after == sentinel;
+	dev_info(p->dev,
+		 "scm_probe: slot %u after write scm=%#010x mmio=%#010x expected=%#010x %s\n",
+		 slot, scm_after, mmio_after, sentinel,
+		 matched ? "MATCH" : "MISMATCH");
+
+	ret = qcom_scm_io_writel(addr, scm_before);
+	if (!ret)
+		ret = qcom_scm_io_readl(addr, &scm_restored);
+	dev_info(p->dev,
+		 "scm_probe: slot %u restored to %#010x readback=%#010x ret=%d\n",
+		 slot, scm_before, scm_restored, ret);
+
+	return matched;
+}
+
 static void osm_probe_scm_slot(struct osm_dev *p)
 {
 	struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
 	phys_addr_t addr;
-	unsigned int mmio_val, scm_val = 0, after = 0;
-	u32 sentinel = 0x5A5A0001;
+	unsigned int mmio_val, scm_val = 0;
 	int ret;
 
 	if (!scm_probe)
@@ -2162,30 +2210,14 @@ static void osm_probe_scm_slot(struct osm_dev *p)
 		return;
 
 	/*
-	 * Mode 2 establishes whether the slot layer is verifiable at all:
-	 * write a value nothing else uses, then read it back through the same
-	 * secure channel.  SEQ_REG(1) is used because the stock/TZ APM VC path
-	 * writes 0x1048 and never this slot, so the sentinel cannot collide
-	 * with anything the driver or the firmware programmed.  The previous
-	 * value is restored afterwards.
+	 * Slot 1 is the APM threshold the stock/TZ path never writes (it writes
+	 * 0x1048 instead).  Slot 95 is the control: no sequencer program on this
+	 * board references it, since the firmware program's highest slot
+	 * reference is 25.  If 95 round-trips and 1 does not, the SCM channel
+	 * works and slot 1 is special.
 	 */
-	ret = qcom_scm_io_writel(addr, sentinel);
-	dev_info(p->dev,
-		 "scm_probe: write sentinel 0x%08x to addr=%pa ret=%d\n",
-		 sentinel, &addr, ret);
-	if (ret)
-		return;
-
-	ret = qcom_scm_io_readl(addr, &after);
-	dev_info(p->dev,
-		 "scm_probe: readback addr=%pa ret=%d val=0x%08x expected=0x%08x %s\n",
-		 &addr, ret, after, sentinel,
-		 (!ret && after == sentinel) ? "MATCH" : "MISMATCH");
-
-	ret = qcom_scm_io_writel(addr, scm_val);
-	dev_info(p->dev,
-		 "scm_probe: restored addr=%pa to 0x%08x ret=%d\n",
-		 &addr, scm_val, ret);
+	osm_scm_probe_one(p, SEQ_SLOT_APM_THRESHOLD_VC, 0x5A5A0001);
+	osm_scm_probe_one(p, 95, 0x5A5A0095);
 }
 
 static int osm_validate_seq(struct osm_dev *p)
