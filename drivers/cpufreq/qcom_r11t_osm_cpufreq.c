@@ -514,10 +514,10 @@ module_param(wdog_trace, bool, 0644);
 MODULE_PARM_DESC(wdog_trace,
 		 "Enable OSM TRACE_CTRL bit 30 after the sequencer is loaded so the watchdog snapshot is meaningful. Default false: this changes one documented trace-control bit and is diagnostic-only.");
 
-static bool scm_probe;
-module_param(scm_probe, bool, 0444);
+static int scm_probe;
+module_param(scm_probe, int, 0444);
 MODULE_PARM_DESC(scm_probe,
-		 "Diagnostic-only: after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. Default false. ret=0 means the SCM call succeeded; the returned value may legitimately be zero and is not a capability check.");
+		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = same read, then write a sentinel through SCM and read it back, to establish whether the slot layer is verifiable at all. Both modes only touch SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and the previous value is restored.");
 
 static bool lval_test = false;
 module_param(lval_test, bool, 0644);
@@ -2133,7 +2133,8 @@ static void osm_probe_scm_slot(struct osm_dev *p)
 {
 	struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
 	phys_addr_t addr;
-	unsigned int mmio_val, scm_val = 0;
+	unsigned int mmio_val, scm_val = 0, after = 0;
+	u32 sentinel = 0x5A5A0001;
 	int ret;
 
 	if (!scm_probe)
@@ -2152,11 +2153,39 @@ static void osm_probe_scm_slot(struct osm_dev *p)
 	ret = qcom_scm_io_readl(addr, &scm_val);
 	dev_info(p->dev,
 		 "scm_probe: read-only addr=%pa mmio=%#010x scm_ret=%d scm=%#010x read_succeeded=%d\n",
-		 &addr, mmio_val, ret, scm_val,
-		 !ret);
+		 &addr, mmio_val, ret, scm_val, !ret);
 	if (!ret && !scm_val)
 		dev_info(p->dev,
 			 "scm_probe: the SCM call succeeded and returned 0; this is a slot value, not evidence that SCM is unavailable\n");
+
+	if (scm_probe < 2)
+		return;
+
+	/*
+	 * Mode 2 establishes whether the slot layer is verifiable at all:
+	 * write a value nothing else uses, then read it back through the same
+	 * secure channel.  SEQ_REG(1) is used because the stock/TZ APM VC path
+	 * writes 0x1048 and never this slot, so the sentinel cannot collide
+	 * with anything the driver or the firmware programmed.  The previous
+	 * value is restored afterwards.
+	 */
+	ret = qcom_scm_io_writel(addr, sentinel);
+	dev_info(p->dev,
+		 "scm_probe: write sentinel 0x%08x to addr=%pa ret=%d\n",
+		 sentinel, &addr, ret);
+	if (ret)
+		return;
+
+	ret = qcom_scm_io_readl(addr, &after);
+	dev_info(p->dev,
+		 "scm_probe: readback addr=%pa ret=%d val=0x%08x expected=0x%08x %s\n",
+		 &addr, ret, after, sentinel,
+		 (!ret && after == sentinel) ? "MATCH" : "MISMATCH");
+
+	ret = qcom_scm_io_writel(addr, scm_val);
+	dev_info(p->dev,
+		 "scm_probe: restored addr=%pa to 0x%08x ret=%d\n",
+		 &addr, scm_val, ret);
 }
 
 static int osm_validate_seq(struct osm_dev *p)
