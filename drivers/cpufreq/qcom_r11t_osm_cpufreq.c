@@ -518,7 +518,7 @@ MODULE_PARM_DESC(wdog_trace,
 static int scm_probe;
 module_param(scm_probe, int, 0444);
 MODULE_PARM_DESC(scm_probe,
-		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = additionally write and read back a sentinel on SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and on unused SEQ_REG(95) as a control, then restore both previous values. 3 = also write an SCM sentinel to the unused pwrcl LUT tail row 39 spare field and verify it through MMIO, then restore the original value. 4 = query SCM IO command availability and issue CAF-compatible raw SCM IO calls against the same unused LUT tail field. 5 = repeat the raw IO calls with the SMC32 convention selected by CAF when its runtime probe chooses ARMv8_32. 6 = write, read back, and restore the vendor R11 Gladiator ACE hang-detect threshold through SCM as a control outside the OSM window. 7 = read-only survey of all vendor R11 SCM IO control addresses used by hang-detect and TCSR. This determines whether SCM writes work outside the sequencer-slot window and whether the IO service or calling convention is responsible.");
+		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = additionally write and read back a sentinel on SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and on unused SEQ_REG(95) as a control, then restore both previous values. 3 = also write an SCM sentinel to the unused pwrcl LUT tail row 39 spare field and verify it through MMIO, then restore the original value. 4 = query SCM IO command availability and issue CAF-compatible raw SCM IO calls against the same unused LUT tail field. 5 = repeat the raw IO calls with the SMC32 convention selected by CAF when its runtime probe chooses ARMv8_32. 6 = write, read back, and restore the vendor R11 core hang-detect threshold through SCM as a control outside the OSM window. 7 = read-only survey of all vendor R11 SCM IO control addresses used by hang-detect and TCSR. This determines whether SCM writes work outside the sequencer-slot window and whether the IO service or calling convention is responsible.");
 
 static bool lval_test = false;
 module_param(lval_test, bool, 0644);
@@ -2288,17 +2288,17 @@ static long r11t_scm_io_raw(unsigned int cmd, phys_addr_t addr, u32 val,
 /*
  * Control test for the SCM IO path outside the OSM window.
  *
- * The R11T stock DT exposes the Gladiator ACE hang-detect threshold at
- * 0x179d141c, and the vendor R11 driver programs that threshold through
- * scm_io_write().  Increase the current threshold by one, read it back
- * through SCM, and immediately restore the original value.  No delay is
- * inserted between the write and restore.
+ * The R11T stock DT exposes the silver CPU0 core hang-detect threshold at
+ * 0x179880b0, and the vendor R11 driver programs that threshold through
+ * scm_io_write().  The live value is expected to be U32_MAX.  Lower it by
+ * one, read it back through SCM, and immediately restore the original value.
+ * Any unexpected precondition rejects the write.
  */
-#define R11T_GLA_ACE_THRESHOLD		0x179d141c
+#define R11T_CORE_SILVER_CPU0_THRESHOLD	0x179880b0
 
 static bool osm_scm_probe_control(struct osm_dev *p)
 {
-	phys_addr_t addr = R11T_GLA_ACE_THRESHOLD;
+	phys_addr_t addr = R11T_CORE_SILVER_CPU0_THRESHOLD;
 	unsigned int before = 0, test_value;
 	unsigned int after = 0, restored = 0;
 	int ret;
@@ -2309,14 +2309,14 @@ static bool osm_scm_probe_control(struct osm_dev *p)
 		 &addr, before, ret);
 	if (ret)
 		return false;
-	if (!before || before == U32_MAX) {
+	if (before != U32_MAX) {
 		dev_warn(p->dev,
 			 "scm_probe: control value %#010x is unsafe for a reversible write\n",
 			 before);
 		return false;
 	}
 
-	test_value = before + 1;
+	test_value = before - 1;
 	ret = qcom_scm_io_writel(addr, test_value);
 	dev_info(p->dev,
 		 "scm_probe: control write addr=%pa value=%#010x ret=%d\n",
