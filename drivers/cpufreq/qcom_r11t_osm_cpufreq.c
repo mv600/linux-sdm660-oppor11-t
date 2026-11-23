@@ -2239,7 +2239,8 @@ static u32 r11t_scm_fnid(unsigned int svc, unsigned int cmd)
  * CAF's scm_is_call_available(): the target command is passed with the SIP
  * owner encoded in the function id.
  */
-static bool r11t_scm_call_available(unsigned int svc, unsigned int cmd)
+static bool r11t_scm_call_available(struct osm_dev *p, unsigned int svc,
+					   unsigned int cmd)
 {
 	unsigned long target = r11t_scm_fnid(svc, cmd) |
 			       (ARM_SMCCC_OWNER_SIP << ARM_SMCCC_OWNER_SHIFT);
@@ -2336,8 +2337,8 @@ static void osm_probe_scm_slot(struct osm_dev *p)
 		unsigned int raw_read = 0;
 		long status;
 
-		r11t_scm_call_available(R11T_SCM_SVC_IO, R11T_SCM_IO_READ);
-		r11t_scm_call_available(R11T_SCM_SVC_IO, R11T_SCM_IO_WRITE);
+		r11t_scm_call_available(p, R11T_SCM_SVC_IO, R11T_SCM_IO_READ);
+		r11t_scm_call_available(p, R11T_SCM_SVC_IO, R11T_SCM_IO_WRITE);
 
 		status = r11t_scm_io_raw(R11T_SCM_IO_WRITE, addr,
 					  0x5A5A0039, NULL);
