@@ -626,6 +626,11 @@ module_param(clock_only, bool, 0444);
 MODULE_PARM_DESC(clock_only,
 		 "Default false. Diagnostic: load the OSM sequencer, PLL/GFMUX, ITM and APM operands on a stock DT, but do not program MEM-ACC values. Requires dryrun=0 and qcom,osm-pll-setup. Do not use it as a production power policy. MEASURED LIMIT on R11T (2026-11-20, run 44592587286): the microcode parks at PC 0xdc, which reads MEM-ACC cfg slots 12-14. Those slots need a 40-row MEM-ACC level map that the 8/7-row cpufreq LUT cannot produce, so this mode cannot complete a clock handoff on this board. The SCM read channel (/sys/kernel/debug/qcom_r11t_osm/scm) shows the firmware wrote only the threshold slots 55-58 and the cross-cluster pointers 4/7.");
 
+static bool slot1_mmio_test;
+module_param(slot1_mmio_test, bool, 0444);
+MODULE_PARM_DESC(slot1_mmio_test,
+		 "Default false. Diagnostic-only: write pwrcl SEQ_REG(1)=5 through ordinary MMIO after all clock_only operands and microcode are prepared, but before OSM enable. Requires clock_only=1. The slot window readback is diagnostic only and cannot prove the stored value.");
+
 static int memacc;
 module_param(memacc, int, 0644);
 MODULE_PARM_DESC(memacc,
@@ -4244,6 +4249,43 @@ static int osm_snapshot_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+static void osm_slot1_mmio_test_write(struct osm_dev *p)
+{
+	struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
+	u32 before, after;
+
+	before = osm_read(c, SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC));
+	osm_write(c, r11t_apm_threshold_vc[R11T_CLUSTER_PWRCL],
+		  SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC));
+	osm_mb(c);
+	after = osm_read(c, SEQ_REG(SEQ_SLOT_APM_THRESHOLD_VC));
+
+	dev_info(p->dev,
+		 "slot1_mmio_test: pwrcl SEQ_REG(1) MMIO write value=%u before=%#010x after=%#010x (readback is diagnostic only)\n",
+		 r11t_apm_threshold_vc[R11T_CLUSTER_PWRCL], before, after);
+}
+
+static void osm_slot1_mmio_test_log(struct osm_dev *p, const char *stage)
+{
+	struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
+	u32 rcgr_cfg = 0;
+	u32 pll_lval = 0;
+
+	if (p->rcgr_base[R11T_CLUSTER_PWRCL])
+		rcgr_cfg = readl_relaxed(p->rcgr_base[R11T_CLUSTER_PWRCL] +
+					 RCGR_CFG);
+	if (p->pll_base[R11T_CLUSTER_PWRCL])
+		pll_lval = readl_relaxed(p->pll_base[R11T_CLUSTER_PWRCL] +
+					 PLL_L_VAL);
+
+	dev_info(p->dev,
+		 "slot1_mmio_test: %s cycle_counter=%u wdog_pstate=%#010x desired_row=%u rcgr_src=%#x pll_lval=%#x\n",
+		 stage, osm_read(c, OSM_CYCLE_COUNTER_STATUS),
+		 osm_read(c, OSM_WDOG_DOMAIN_PSTATE),
+		 osm_read(c, OSM_DCVS_PERF_STATE_DESIRED),
+		 rcgr_cfg & RCGR_CFG_SRC_MASK, pll_lval);
+}
+
 static int osm_snapshot_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, osm_snapshot_show, NULL);
@@ -4400,6 +4442,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	}
 	if (clock_only && (apm || memacc)) {
 		dev_err(dev, "clock_only is mutually exclusive with apm/memacc writes\n");
+		return -EINVAL;
+	}
+	if (slot1_mmio_test && !clock_only) {
+		dev_err(dev, "slot1_mmio_test requires clock_only=1\n");
 		return -EINVAL;
 	}
 
@@ -4878,6 +4924,11 @@ static int r11t_osm_probe(struct platform_device *pdev)
 				dev_info(dev,
 					 "clock_only: MEM-ACC values left untouched; APM and clock operands loaded for sequencer validation\n");
 			osm_setup_sequencer(p);
+
+			if (slot1_mmio_test) {
+				osm_slot1_mmio_test_log(p, "before enable");
+				osm_slot1_mmio_test_write(p);
+			}
 		} else {
 			dev_info(dev,
 				 "stock secure-init mode: preserving TZ-owned sequencer/ITM/APM address slots; LUT, policy, row, PLL handoff and explicit APM/MEM-ACC SCM updates are managed here\n");
@@ -5010,6 +5061,11 @@ no_tz_done:
 			}
 		}
 
+		if (slot1_mmio_test) {
+			udelay(20 * 1000);
+			osm_slot1_mmio_test_log(p, "after enable");
+		}
+
 		osm_setup_wdog_trace(p);
 		osm_probe_scm_slot(p);
 
@@ -5039,6 +5095,11 @@ no_tz_done:
 					 p->cluster[i].name, row, w);
 			}
 		}
+		if (slot1_mmio_test) {
+			udelay(20 * 1000);
+			osm_slot1_mmio_test_log(p, "after boot row request");
+		}
+
 	} else {
 		dev_warn(dev,
 			 "dryrun=1: OSM table NOT written, ENABLE_REG untouched, frequency left as the bootloader set it. /sys/kernel/debug/qcom_r11t_osm/regs is all zero in this mode, so it CANNOT be compared against lut. To go live: rmmod qcom_r11t_osm_cpufreq; modprobe qcom_r11t_osm_cpufreq dryrun=0 -- then regs will hold the two per-cluster tables and CAN be compared. Reboot to clear the hardware table again.\n");
