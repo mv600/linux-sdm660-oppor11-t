@@ -517,7 +517,7 @@ MODULE_PARM_DESC(wdog_trace,
 static int scm_probe;
 module_param(scm_probe, int, 0444);
 MODULE_PARM_DESC(scm_probe,
-		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = additionally write and read back a sentinel on SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and on unused SEQ_REG(95) as a control, then restore both previous values. This establishes whether the SCM slot layer is verifiable and whether slot 1 is special.");
+		 "Default 0. Diagnostic-only. 1 = after OSM enable, read the pwrcl APM threshold sequencer slot through qcom_scm_io_readl() and the normal MMIO alias. 2 = additionally write and read back a sentinel on SEQ_REG(1), which the stock/TZ APM VC path never writes (it writes 0x1048 instead), and on unused SEQ_REG(95) as a control, then restore both previous values. 3 = also write an SCM sentinel to the unused pwrcl LUT tail row 39 spare field and verify it through MMIO, then restore the original value. This determines whether SCM writes work outside the sequencer-slot window.");
 
 static bool lval_test = false;
 module_param(lval_test, bool, 0644);
@@ -2178,6 +2178,50 @@ static bool osm_scm_probe_one(struct osm_dev *p, unsigned int slot, u32 sentinel
 	return matched;
 }
 
+/*
+ * Test whether an SCM write reaches the ordinary MMIO-visible OSM LUT.
+ *
+ * Row 39 cannot be selected on pwrcl: the cpufreq policy exposes only rows
+ * 0..7 and osm_set_row() rejects every larger index.  The spare field is
+ * restored through MMIO before returning, even if the SCM write failed.
+ */
+static void osm_scm_probe_lut_tail(struct osm_dev *p)
+{
+	struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
+	const unsigned int row = OSM_TABLE_SIZE - 1;
+	const unsigned int offset = OSM_SPARE_REG + row * OSM_REG_SIZE;
+	const unsigned int adjacent = OSM_SPARE_REG + (row - 1) * OSM_REG_SIZE;
+	const u32 sentinel = 0x5A5A0039;
+	phys_addr_t addr = p->base_phys + offset;
+	unsigned int mmio_before, adjacent_before, mmio_after;
+	unsigned int scm_before = 0, scm_after = 0;
+	int ret;
+
+	mmio_before = osm_read(c, offset);
+	adjacent_before = osm_read(c, adjacent);
+	ret = qcom_scm_io_readl(addr, &scm_before);
+	dev_info(p->dev,
+		 "scm_probe: LUT tail row=%u offset=%#x addr=%pa mmio_before=%#010x adjacent_before=%#010x scm_before=%#010x scm_ret=%d\n",
+		 row, offset, &addr, mmio_before, adjacent_before, scm_before, ret);
+
+	ret = qcom_scm_io_writel(addr, sentinel);
+	dev_info(p->dev, "scm_probe: LUT tail write sentinel %#010x ret=%d\n",
+		 sentinel, ret);
+	if (!ret)
+		ret = qcom_scm_io_readl(addr, &scm_after);
+	mmio_after = osm_read(c, offset);
+	dev_info(p->dev,
+		 "scm_probe: LUT tail after write mmio=%#010x scm=%#010x expected=%#010x mmio_changed=%d %s\n",
+		 mmio_after, scm_after, sentinel, mmio_after != mmio_before,
+		 mmio_after == sentinel ? "MATCH" : "MISMATCH");
+
+	osm_write(c, mmio_before, offset);
+	osm_mb(c);
+	dev_info(p->dev,
+		 "scm_probe: LUT tail restored mmio=%#010x adjacent=%#010x\n",
+		 osm_read(c, offset), osm_read(c, adjacent));
+}
+
 static void osm_probe_scm_slot(struct osm_dev *p)
 {
 	struct osm_cluster *c = &p->cluster[R11T_CLUSTER_PWRCL];
@@ -2218,6 +2262,9 @@ static void osm_probe_scm_slot(struct osm_dev *p)
 	 */
 	osm_scm_probe_one(p, SEQ_SLOT_APM_THRESHOLD_VC, 0x5A5A0001);
 	osm_scm_probe_one(p, 95, 0x5A5A0095);
+
+	if (scm_probe >= 3)
+		osm_scm_probe_lut_tail(p);
 }
 
 static int osm_validate_seq(struct osm_dev *p)
