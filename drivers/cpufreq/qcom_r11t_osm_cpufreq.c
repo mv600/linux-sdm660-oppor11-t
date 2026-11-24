@@ -5062,7 +5062,7 @@ no_tz_done:
 		}
 
 		if (slot1_mmio_test) {
-			udelay(20 * 1000);
+			msleep(20);
 			osm_slot1_mmio_test_log(p, "after enable");
 		}
 
@@ -5096,7 +5096,7 @@ no_tz_done:
 			}
 		}
 		if (slot1_mmio_test) {
-			udelay(20 * 1000);
+			msleep(20);
 			osm_slot1_mmio_test_log(p, "after boot row request");
 		}
 
