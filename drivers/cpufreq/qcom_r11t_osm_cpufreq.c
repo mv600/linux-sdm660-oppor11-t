@@ -658,6 +658,11 @@ module_param(tz_p12_state_probe, bool, 0444);
 MODULE_PARM_DESC(tz_p12_state_probe,
 		 "Diagnostic: with tz_p12=1, read the full CAF-programmed OSM status set before the TZ payload load, after OSM enable and after the boot row request, cross-check the watchdog page through SCM and scan the 0x1C00 page for read aliases. Strictly read-only; requires tz_p12=1.");
 
+static bool tz_p12_live_probe;
+module_param(tz_p12_live_probe, bool, 0444);
+MODULE_PARM_DESC(tz_p12_live_probe,
+		 "Diagnostic: with tz_p12=1, record ENABLE_REG before any OSM write, then diff three register pages between two samples and time the cycle counter, to decide whether the OSM block is clocked and running at all. Strictly read-only; requires tz_p12=1.");
+
 static bool slot1_mmio_test;
 module_param(slot1_mmio_test, bool, 0444);
 MODULE_PARM_DESC(slot1_mmio_test,
@@ -2414,6 +2419,95 @@ static void osm_setup_wdog_trace(struct osm_dev *p)
 		dev_info(p->dev, "%s: watchdog trace enabled, TRACE_CTRL=%#010x\n",
 			 c->name, osm_read(c, OSM_TRACE_CTRL));
 	}
+}
+
+/*
+ * A14: decide whether the OSM block is running at all.
+ *
+ * A13 showed every CAF-programmed status register in its expected state while
+ * PC stayed 0xdc and the cycle counter stayed 0.  A cycle counter that is
+ * enabled (CC_CTRL bit 0) and clocked at 200 MHz must advance by roughly
+ * 200000 counts per millisecond, so a frozen zero is not a policy detail: it
+ * means either the counter is not fed or the whole block is not on a clock.
+ *
+ * This probe separates those cases without writing anything.  It records
+ * ENABLE_REG as early as the driver can read it, then takes two snapshots of
+ * three register pages and reports only the words that changed.  A live block
+ * must show at least one moving word; a completely frozen window is positive
+ * evidence that the block is not being clocked, regardless of what CFG_RCGR
+ * says.
+ */
+#define OSM_LIVE_GAP_US		2000
+
+static void osm_tz_p12_live_page(struct osm_dev *p, const char *stage,
+				 unsigned int page_off, unsigned int words)
+{
+	unsigned int i, n;
+	u32 *a, *b;
+
+	a = kmalloc_array(words, sizeof(*a), GFP_KERNEL);
+	b = kmalloc_array(words, sizeof(*b), GFP_KERNEL);
+	if (!a || !b)
+		goto out;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		unsigned int changed = 0;
+
+		for (n = 0; n < words; n++)
+			a[n] = osm_read(c, page_off + n * 4);
+		udelay(OSM_LIVE_GAP_US);
+		for (n = 0; n < words; n++)
+			b[n] = osm_read(c, page_off + n * 4);
+
+		for (n = 0; n < words; n++)
+			if (a[n] != b[n])
+				changed++;
+
+		dev_info(p->dev,
+			 "tz_p12_live_probe: %s cluster%u page=%#05x words=%u gap_us=%u changed=%u\n",
+			 stage, i, page_off, words, OSM_LIVE_GAP_US, changed);
+		for (n = 0; n < words; n++)
+			if (a[n] != b[n])
+				dev_info(p->dev,
+					 "tz_p12_live_probe: %s cluster%u page=%#05x off=%#05x a=%#010x b=%#010x\n",
+					 stage, i, page_off, page_off + n * 4,
+					 a[n], b[n]);
+	}
+
+out:
+	kfree(a);
+	kfree(b);
+}
+
+static void osm_tz_p12_live_probe(struct osm_dev *p, const char *stage)
+{
+	unsigned int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 cc_first, cc_last;
+		unsigned int n;
+		u32 enable = osm_read(c, OSM_ENABLE_REG);
+
+		dev_info(p->dev,
+			 "tz_p12_live_probe: %s cluster%u enable=%#x cc_ctrl=%#010x\n",
+			 stage, i, enable, osm_read(c, OSM_CYCLE_COUNTER_CTRL));
+
+		cc_first = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+		for (n = 0; n < 10; n++) {
+			udelay(1000);
+			cc_last = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+		}
+		dev_info(p->dev,
+			 "tz_p12_live_probe: %s cluster%u cycle_first=%u cycle_last=%u cycle_advanced=%u\n",
+			 stage, i, cc_first, cc_last, cc_last != cc_first);
+	}
+
+	/* Each cluster owns a 0x2000 window: the last page is only 0x100. */
+	osm_tz_p12_live_page(p, stage, 0x1000, 256);
+	osm_tz_p12_live_page(p, stage, 0x1C00, 256);
+	osm_tz_p12_live_page(p, stage, 0x1F00, 64);
 }
 
 /*
@@ -5049,6 +5143,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		dev_err(dev, "tz_p12_state_probe requires tz_p12=1\n");
 		return -EINVAL;
 	}
+	if (tz_p12_live_probe && !tz_p12) {
+		dev_err(dev, "tz_p12_live_probe requires tz_p12=1\n");
+		return -EINVAL;
+	}
 	if (slot1_mmio_test && !clock_only) {
 		dev_err(dev, "slot1_mmio_test requires clock_only=1\n");
 		return -EINVAL;
@@ -5360,6 +5458,15 @@ static int r11t_osm_probe(struct platform_device *pdev)
 
 	osmdev = p;
 
+	if (tz_p12_live_probe) {
+		for (i = 0; i < R11T_NR_CLUSTERS; i++)
+			dev_info(dev,
+				 "tz_p12_live_probe: earliest cluster%u enable=%#x cc_ctrl=%#010x
+",
+				 i, osm_read(&p->cluster[i], OSM_ENABLE_REG),
+				 osm_read(&p->cluster[i], OSM_CYCLE_COUNTER_CTRL));
+	}
+
 	if (pll_probe) {
 		osm_probe_pll(p);
 		osm_dump_rcgr(p);
@@ -5451,6 +5558,8 @@ static int r11t_osm_probe(struct platform_device *pdev)
 				osm_tz_p12_apm_probe_state(p, "before TZ payload");
 			if (tz_p12_state_probe)
 				osm_tz_p12_state_dump(p, "before TZ payload");
+			if (tz_p12_live_probe)
+				osm_tz_p12_live_probe(p, "before TZ payload");
 			osm_setup_tz_p12(p);
 			if (tz_p12_probe)
 				osm_tz_p12_probe_payload(p);
@@ -5722,6 +5831,10 @@ no_tz_done:
 			osm_tz_p12_state_scm_crosscheck(p, "after enable");
 			osm_tz_p12_state_alias_scan(p, "after enable");
 		}
+		if (tz_p12_live_probe) {
+			msleep(20);
+			osm_tz_p12_live_probe(p, "after enable");
+		}
 		if (tz_p12) {
 			msleep(20);
 			osm_log_tz_p12_state(p, "after enable");
@@ -5775,6 +5888,10 @@ no_tz_done:
 			msleep(20);
 			osm_tz_p12_state_dump(p, "after boot row request");
 			osm_tz_p12_state_scm_crosscheck(p, "after boot row request");
+		}
+		if (tz_p12_live_probe) {
+			msleep(20);
+			osm_tz_p12_live_probe(p, "after boot row request");
 		}
 		if (tz_p12) {
 			msleep(20);
