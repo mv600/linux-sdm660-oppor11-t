@@ -106,6 +106,7 @@
 #define OSM_CYCLE_COUNTER_USE_XO_EDGE	BIT(8)	/* [caf:114] */
 #define OSM_TRACE_CTRL			0x1F38	/* [caf:203] */
 #define OSM_TRACE_WDOG_STATUS		BIT(30)	/* [caf:207] */
+#define OSM_TRACE_EN			BIT(0)	/* [caf:206] */
 #define OSM_LLM_SW_OVERRIDE		0x1038	/* [caf:158] */
 #define OSM_SEQ_REG1_OFFSET		0x1048	/* [caf:76] */
 
@@ -475,6 +476,9 @@ struct osm_dev {
 	/* apcs_common window (resource "apcs_common") for ITM/APM debug. */
 	void __iomem *apcs_common;
 	bool apm_topology_logged;
+	/* Exact TRACE_CTRL value captured before the A12 trace probe. */
+	u32 trace_ctrl_orig[R11T_NR_CLUSTERS];
+	bool trace_ctrl_saved;
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
 	bool per_policy_governor;
 	/* qcom,osm-no-tz asks Linux to perform the initialization that the
@@ -643,6 +647,11 @@ static bool tz_p12_apm_probe;
 module_param(tz_p12_apm_probe, bool, 0444);
 MODULE_PARM_DESC(tz_p12_apm_probe,
 		 "Diagnostic: with tz_p12=1, sample the APM mode/status registers, APCS OSM clock, per-cluster RCGR and OSM watchdog state before the TZ payload load, after OSM enable and after the boot row request. Read-only; requires tz_p12=1.");
+
+static bool tz_p12_trace_probe;
+module_param(tz_p12_trace_probe, bool, 0444);
+MODULE_PARM_DESC(tz_p12_trace_probe,
+		 "Diagnostic: with tz_p12=1, set the CAF trace master enable (TRACE_CTRL bit 0) on top of the existing watchdog-status bit, sample both clusters 12 times across at least 1 ms after OSM enable and after the boot row request, and restore the exact original TRACE_CTRL. Requires tz_p12=1; only TRACE_CTRL is written.");
 
 static bool slot1_mmio_test;
 module_param(slot1_mmio_test, bool, 0444);
@@ -2399,6 +2408,143 @@ static void osm_setup_wdog_trace(struct osm_dev *p)
 		osm_mb(c);
 		dev_info(p->dev, "%s: watchdog trace enabled, TRACE_CTRL=%#010x\n",
 			 c->name, osm_read(c, OSM_TRACE_CTRL));
+	}
+}
+
+/*
+ * A12: decide whether the sequencer executes at all, instead of whether the
+ * watchdog view can see it.  CAF exposes two independent TRACE_CTRL bits:
+ * BIT(0) enables the trace block master and BIT(30) injects watchdog status.
+ * The driver has only ever written BIT(30).  This probe records the exact
+ * original value, adds BIT(0) on top of it, samples pstate/PC/cycle long
+ * enough to see movement, and puts the original value back.  TRACE_CTRL is
+ * the only register it writes.
+ */
+#define OSM_TRACE_PROBE_SAMPLES	12
+#define OSM_TRACE_PROBE_INTERVAL_US	100
+
+static void osm_tz_p12_trace_save(struct osm_dev *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		p->trace_ctrl_orig[i] =
+			osm_read(&p->cluster[i], OSM_TRACE_CTRL);
+		dev_info(p->dev,
+			 "tz_p12_trace_probe: cluster%u saved TRACE_CTRL=%#010x trace_en=%u wdog_status=%u\n",
+			 i, p->trace_ctrl_orig[i],
+			 !!(p->trace_ctrl_orig[i] & OSM_TRACE_EN),
+			 !!(p->trace_ctrl_orig[i] & OSM_TRACE_WDOG_STATUS));
+	}
+	p->trace_ctrl_saved = true;
+}
+
+static void osm_tz_p12_trace_setup(struct osm_dev *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 before = osm_read(c, OSM_TRACE_CTRL);
+		u32 want = (p->trace_ctrl_saved ? p->trace_ctrl_orig[i] : before) |
+			   OSM_TRACE_EN;
+		u32 after;
+
+		osm_write(c, want, OSM_TRACE_CTRL);
+		osm_mb(c);
+		after = osm_read(c, OSM_TRACE_CTRL);
+		dev_info(p->dev,
+			 "tz_p12_trace_probe: cluster%u setup before=%#010x wrote=%#010x after=%#010x trace_en=%u readback_ok=%u\n",
+			 i, before, want, after,
+			 !!(after & OSM_TRACE_EN), after == want);
+	}
+}
+
+static void osm_tz_p12_trace_sample(struct osm_dev *p, const char *stage)
+{
+	unsigned int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 first_pstate = 0, first_pc = 0, first_cc = 0;
+		u32 last_pstate = 0, last_pc = 0, last_cc = 0;
+		u32 first_desired = 0, last_desired = 0;
+		u32 first_enable = 0, last_enable = 0;
+		u32 first_trace = 0, last_trace = 0;
+		u32 first_rcgr = 0, last_rcgr = 0;
+		unsigned int n;
+		bool pc_changed = false, cc_advanced = false;
+
+		for (n = 0; n < OSM_TRACE_PROBE_SAMPLES; n++) {
+			u32 pstate = osm_read(c, OSM_WDOG_DOMAIN_PSTATE);
+			u32 pc = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
+			u32 cc = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+			u32 desired = osm_read(c, OSM_DCVS_PERF_STATE_DESIRED);
+			u32 enable = osm_read(c, OSM_ENABLE_REG);
+			u32 trace = osm_read(c, OSM_TRACE_CTRL);
+			u32 rcgr = 0;
+
+			if (p->rcgr_base[i])
+				rcgr = readl_relaxed(p->rcgr_base[i] + RCGR_CFG);
+
+			if (!n) {
+				first_pstate = pstate;
+				first_pc = pc;
+				first_cc = cc;
+				first_desired = desired;
+				first_enable = enable;
+				first_trace = trace;
+				first_rcgr = rcgr;
+			} else {
+				pc_changed |= pc != first_pc;
+				cc_advanced |= cc != first_cc;
+			}
+			last_pstate = pstate;
+			last_pc = pc;
+			last_cc = cc;
+			last_desired = desired;
+			last_enable = enable;
+			last_trace = trace;
+			last_rcgr = rcgr;
+
+			if (n + 1 < OSM_TRACE_PROBE_SAMPLES)
+				udelay(OSM_TRACE_PROBE_INTERVAL_US);
+		}
+
+		dev_info(p->dev,
+			 "tz_p12_trace_probe: %s cluster%u samples=%u interval_us=%u trace=%#010x enable=%#x pstate=%#010x/%#010x pc=%#010x/%#010x pc_changed=%u cycle=%u/%u cycle_advanced=%u desired=%u/%u rcgr=%#010x/%#010x src=%#x\n",
+			 stage, i, OSM_TRACE_PROBE_SAMPLES,
+			 OSM_TRACE_PROBE_INTERVAL_US, last_trace, last_enable,
+			 first_pstate, last_pstate, first_pc, last_pc, pc_changed,
+			 first_cc, last_cc, cc_advanced,
+			 first_desired, last_desired, first_rcgr, last_rcgr,
+			 last_rcgr & RCGR_CFG_SRC_MASK);
+	}
+}
+
+static void osm_tz_p12_trace_restore(struct osm_dev *p)
+{
+	unsigned int i;
+
+	if (!p->trace_ctrl_saved)
+		return;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 restore = p->trace_ctrl_orig[i];
+		u32 after;
+
+		osm_write(c, restore, OSM_TRACE_CTRL);
+		osm_mb(c);
+		after = osm_read(c, OSM_TRACE_CTRL);
+		dev_info(p->dev,
+			 "tz_p12_trace_probe: cluster%u restore=%#010x after=%#010x exact=%u trace_en=%u\n",
+			 i, restore, after, after == restore,
+			 !!(after & OSM_TRACE_EN));
+		if (after != restore)
+			dev_err(p->dev,
+				"tz_p12_trace_probe: cluster%u TRACE_CTRL restore mismatch\n",
+				i);
 	}
 }
 
@@ -4728,6 +4874,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		dev_err(dev, "tz_p12_apm_probe requires tz_p12=1\n");
 		return -EINVAL;
 	}
+	if (tz_p12_trace_probe && !tz_p12) {
+		dev_err(dev, "tz_p12_trace_probe requires tz_p12=1\n");
+		return -EINVAL;
+	}
 	if (slot1_mmio_test && !clock_only) {
 		dev_err(dev, "slot1_mmio_test requires clock_only=1\n");
 		return -EINVAL;
@@ -5378,6 +5528,12 @@ no_tz_done:
 		}
 
 		osm_setup_wdog_trace(p);
+		if (tz_p12_trace_probe) {
+			osm_tz_p12_trace_save(p);
+			osm_tz_p12_trace_setup(p);
+			usleep_range(1000, 2000);
+			osm_tz_p12_trace_sample(p, "after enable");
+		}
 		if (tz_p12_probe) {
 			msleep(20);
 			osm_tz_p12_probe_state(p, "after enable");
@@ -5422,6 +5578,11 @@ no_tz_done:
 		if (slot1_mmio_test) {
 			msleep(20);
 			osm_slot1_mmio_test_log(p, "after boot row request");
+		}
+		if (tz_p12_trace_probe) {
+			usleep_range(1000, 2000);
+			osm_tz_p12_trace_sample(p, "after boot row request");
+			osm_tz_p12_trace_restore(p);
 		}
 		if (tz_p12_probe) {
 			msleep(20);
