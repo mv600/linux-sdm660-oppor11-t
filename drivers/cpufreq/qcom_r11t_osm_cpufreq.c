@@ -474,6 +474,7 @@ struct osm_dev {
 	void __iomem *apm_base[R11T_NR_CLUSTERS];
 	/* apcs_common window (resource "apcs_common") for ITM/APM debug. */
 	void __iomem *apcs_common;
+	bool apm_topology_logged;
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
 	bool per_policy_governor;
 	/* qcom,osm-no-tz asks Linux to perform the initialization that the
@@ -637,6 +638,11 @@ static bool tz_p12_probe;
 module_param(tz_p12_probe, bool, 0444);
 MODULE_PARM_DESC(tz_p12_probe,
 		 "Diagnostic: with tz_p12=1, probe whether OSM-window MMIO writes are visible through MMIO and SCM, and log the OSM clock/enable/watchdog state. Requires tz_p12=1. Probes are reversible and restore the exact TZ payload word; they do not change the CAF or default paths.");
+
+static bool tz_p12_apm_probe;
+module_param(tz_p12_apm_probe, bool, 0444);
+MODULE_PARM_DESC(tz_p12_apm_probe,
+		 "Diagnostic: with tz_p12=1, sample the APM mode/status registers, APCS OSM clock, per-cluster RCGR and OSM watchdog state before the TZ payload load, after OSM enable and after the boot row request. Read-only; requires tz_p12=1.");
 
 static bool slot1_mmio_test;
 module_param(slot1_mmio_test, bool, 0444);
@@ -2275,6 +2281,106 @@ static void osm_tz_p12_probe_state(struct osm_dev *p, const char *stage)
 			 stage, i, enable, trace, pstate, pstate2, pc, pc2,
 			 cc, cc2, desired, rcgr_cmd, rcgr_cfg,
 			 rcgr_cfg & RCGR_CFG_SRC_MASK, apcs_cmd, apcs_cfg);
+	}
+}
+
+/*
+ * A11: track the APM/CPRh handshake around the TZ payload load.
+ *
+ * The TZ program references slot 2 (apm-mode-ctl) and slot 3
+ * (apm-ctrl-status) immediately before the parked PC 0xdc.  This probe is
+ * strictly read-only: it records the APM registers, the APCS OSM clock, the
+ * per-cluster RCGR and the OSM watchdog/cycle state at three stages so the
+ * log can distinguish "APM never acknowledges" from "APM and clock look
+ * healthy, another operand is wrong".
+ */
+static u32 osm_tz_p12_apm_read(void __iomem *base, phys_addr_t page,
+			      u32 addr)
+{
+	if (!base || !addr || addr < page || addr - page >= 0x1000)
+		return 0;
+
+	return readl_relaxed(base + (addr - page));
+}
+
+static void osm_tz_p12_apm_probe_topology(struct osm_dev *p)
+{
+	struct device_node *np = p->dev->of_node;
+	unsigned int i;
+
+	dev_info(p->dev,
+		 "tz_p12_apm_probe: topology qcom_saw=%u saw_phandles=%d\n",
+		 of_find_property(np, "qcom,saw", NULL) != NULL,
+		 of_count_phandle_with_args(np, "qcom,saw", NULL));
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct device_node *cpu_np;
+		unsigned int cpu = cpumask_first(p->cluster[i].cpus);
+
+		cpu_np = of_get_cpu_node(cpu, NULL);
+		dev_info(p->dev,
+			 "tz_p12_apm_probe: topology cluster%u cpu%u power_domains=%u osm_power_domains=%u\n",
+			 i, cpu,
+			 cpu_np ? of_find_property(cpu_np, "power-domains", NULL) != NULL : 0,
+			 of_find_property(np, "power-domains", NULL) != NULL);
+		of_node_put(cpu_np);
+	}
+}
+
+static void osm_tz_p12_apm_probe_state(struct osm_dev *p, const char *stage)
+{
+	unsigned int i;
+
+	if (!p->apm_topology_logged) {
+		osm_tz_p12_apm_probe_topology(p);
+		p->apm_topology_logged = true;
+	}
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 apm_mode, apm_status;
+		phys_addr_t apm_page;
+		u32 apcs_cmd = 0, apcs_cfg = 0;
+		u32 rcgr_cmd = 0, rcgr_cfg = 0;
+		u32 enable, trace, pstate, pc, cc, desired;
+		u32 pc2, cc2, root_off;
+		bool apm_mapped = p->apm_base[i] != NULL;
+
+		apm_page = (p->apm_mode_ctl[i] ? p->apm_mode_ctl[i] :
+			    p->apm_ctrl_status[i]) & ~0xFFFULL;
+		apm_mode = osm_tz_p12_apm_read(p->apm_base[i], apm_page,
+					       p->apm_mode_ctl[i]);
+		apm_status = osm_tz_p12_apm_read(p->apm_base[i], apm_page,
+						 p->apm_ctrl_status[i]);
+
+		if (p->apcs_common) {
+			apcs_cmd = readl_relaxed(p->apcs_common +
+						 APCS_COMMON_LMH_CMD_RCGR);
+			apcs_cfg = readl_relaxed(p->apcs_common +
+						 APCS_COMMON_LMH_CFG_RCGR);
+		}
+		if (p->rcgr_base[i]) {
+			rcgr_cmd = readl_relaxed(p->rcgr_base[i] + RCGR_CMD);
+			rcgr_cfg = readl_relaxed(p->rcgr_base[i] + RCGR_CFG);
+		}
+
+		root_off = !!(apcs_cmd & BIT(31));
+		enable = osm_read(c, OSM_ENABLE_REG);
+		trace = osm_read(c, OSM_TRACE_CTRL);
+		pstate = osm_read(c, OSM_WDOG_DOMAIN_PSTATE);
+		pc = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
+		cc = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+		desired = osm_read(c, OSM_DCVS_PERF_STATE_DESIRED);
+		udelay(50);
+		pc2 = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
+		cc2 = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+
+		dev_info(p->dev,
+			 "tz_p12_apm_probe: %s cluster%u apm_mapped=%u apm_mode=%#010x apm_status=%#010x apcs_cmd=%#010x/%#010x root_off=%u rcgr=%#010x/%#010x src=%#x enable=%#x trace=%#010x pstate=%#010x pc=%#010x/%#010x cycle=%u/%u desired=%u\n",
+			 stage, i, apm_mapped, apm_mode, apm_status,
+			 apcs_cmd, apcs_cfg, root_off,
+			 rcgr_cmd, rcgr_cfg, rcgr_cfg & RCGR_CFG_SRC_MASK,
+			 enable, trace, pstate, pc, pc2, cc, cc2, desired);
 	}
 }
 
@@ -4618,6 +4724,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		dev_err(dev, "tz_p12_probe requires tz_p12=1\n");
 		return -EINVAL;
 	}
+	if (tz_p12_apm_probe && !tz_p12) {
+		dev_err(dev, "tz_p12_apm_probe requires tz_p12=1\n");
+		return -EINVAL;
+	}
 	if (slot1_mmio_test && !clock_only) {
 		dev_err(dev, "slot1_mmio_test requires clock_only=1\n");
 		return -EINVAL;
@@ -5016,6 +5126,8 @@ static int r11t_osm_probe(struct platform_device *pdev)
 				osm_write(c, BVAL(23, 16, 0xF), SPM_CC_CTRL);
 				osm_mb(c);
 			}
+			if (tz_p12_apm_probe)
+				osm_tz_p12_apm_probe_state(p, "before TZ payload");
 			osm_setup_tz_p12(p);
 			if (tz_p12_probe)
 				osm_tz_p12_probe_payload(p);
@@ -5271,6 +5383,10 @@ no_tz_done:
 			osm_tz_p12_probe_state(p, "after enable");
 			osm_tz_p12_probe_after_enable(p);
 		}
+		if (tz_p12_apm_probe) {
+			msleep(20);
+			osm_tz_p12_apm_probe_state(p, "after enable");
+		}
 		if (tz_p12) {
 			msleep(20);
 			osm_log_tz_p12_state(p, "after enable");
@@ -5310,6 +5426,10 @@ no_tz_done:
 		if (tz_p12_probe) {
 			msleep(20);
 			osm_tz_p12_probe_state(p, "after boot row request");
+		}
+		if (tz_p12_apm_probe) {
+			msleep(20);
+			osm_tz_p12_apm_probe_state(p, "after boot row request");
 		}
 		if (tz_p12) {
 			msleep(20);
