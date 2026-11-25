@@ -633,6 +633,11 @@ module_param(tz_p12, bool, 0444);
 MODULE_PARM_DESC(tz_p12,
 		 "Diagnostic: load the stock TZ p12 95-slot table, 49-entry branch table, and 182-container microcode into both OSM clusters exactly as recovered from the trustzone descriptor. Requires dryrun=0 clock_only=1 and the stock secure-initialization path. This bypasses CAF sequencer-slot writes; it is an A/B test for the OSM watchdog PC, not a production policy.");
 
+static bool tz_p12_probe;
+module_param(tz_p12_probe, bool, 0444);
+MODULE_PARM_DESC(tz_p12_probe,
+		 "Diagnostic: with tz_p12=1, probe whether OSM-window MMIO writes are visible through MMIO and SCM, and log the OSM clock/enable/watchdog state. Requires tz_p12=1. Probes are reversible and restore the exact TZ payload word; they do not change the CAF or default paths.");
+
 static bool slot1_mmio_test;
 module_param(slot1_mmio_test, bool, 0444);
 MODULE_PARM_DESC(slot1_mmio_test,
@@ -2149,6 +2154,127 @@ static void osm_log_tz_p12_state(struct osm_dev *p, const char *stage)
 			 stage, i, pc1, pc2, pc1 != pc2, cc1, cc2,
 			 osm_read(c, OSM_DCVS_PERF_STATE_DESIRED),
 			 rcgr_cfg & RCGR_CFG_SRC_MASK);
+	}
+}
+
+/*
+ * A10 probe: separate "the write did not land" from "this read channel
+ * cannot see it".  The OSM slot/branch/microcode alias is not trustworthy
+ * for readback, and A5 showed that SCM IO is not a universal substitute
+ * inside this window.  Each probe therefore records both channels before
+ * and after a reversible write back to the exact word loaded by tz_p12.
+ */
+static void osm_tz_p12_probe_word(struct osm_dev *p, const char *stage,
+				  unsigned int cluster, const char *what,
+				  unsigned int off, u32 original, u32 sentinel)
+{
+	struct osm_cluster *c = &p->cluster[cluster];
+	phys_addr_t addr = p->base_phys +
+		(phys_addr_t)cluster * OSM_CORE_TABLE_SIZE + off;
+	u32 mmio_before, mmio_after, mmio_restored;
+	u32 scm_before = 0, scm_after = 0, scm_restored = 0;
+	int ret_before, ret_after, ret_restored;
+
+	mmio_before = osm_read(c, off);
+	ret_before = qcom_scm_io_readl(addr, &scm_before);
+
+	osm_write(c, sentinel, off);
+	osm_mb(c);
+	mmio_after = osm_read(c, off);
+	ret_after = qcom_scm_io_readl(addr, &scm_after);
+
+	/* Restore the exact word loaded by tz_p12, not a readback alias. */
+	osm_write(c, original, off);
+	osm_mb(c);
+	mmio_restored = osm_read(c, off);
+	ret_restored = qcom_scm_io_readl(addr, &scm_restored);
+
+	dev_info(p->dev,
+		 "tz_p12_probe: %s cluster%u %s off=%#x addr=%pa original=%#010x sentinel=%#010x mmio=%#010x/%#010x/%#010x scm=%#010x/%#010x/%#010x mmio_changed=%u mmio_restored=%u scm_match=%u scm_restored=%u ret=%d/%d/%d\n",
+		 stage, cluster, what, off, &addr, original, sentinel,
+		 mmio_before, mmio_after, mmio_restored,
+		 scm_before, scm_after, scm_restored,
+		 mmio_after != mmio_before, mmio_restored == original,
+		 scm_after == sentinel, scm_restored == scm_before,
+		 ret_before, ret_after, ret_restored);
+}
+
+static void osm_tz_p12_probe_payload(struct osm_dev *p)
+{
+	const u32 last_slot = R11T_TZ_P12_SLOT_COUNT - 1;
+	const u32 last_branch = R11T_TZ_P12_BRANCH_COUNT - 1;
+	const u32 last_mc = R11T_TZ_P12_MICROCODE_COUNT - 1;
+
+	dev_info(p->dev,
+		 "tz_p12_probe: starting reversible pre-enable write/view probes on pwrcl\n");
+
+	/* Used operand slot: slot 1 is the APM threshold operand. */
+	osm_tz_p12_probe_word(p, "before enable", R11T_CLUSTER_PWRCL,
+			      "slot", SEQ_REG(1),
+			      r11t_tz_p12_pwrcl_slots[1], 0x5A5A0001);
+	/* Unused control slot: slot 95 must not be referenced by p12. */
+	osm_tz_p12_probe_word(p, "before enable", R11T_CLUSTER_PWRCL,
+			      "slot", SEQ_REG(last_slot),
+			      r11t_tz_p12_pwrcl_slots[last_slot], 0x5A5A0095);
+	/* Last branch entry and last microcode container. */
+	osm_tz_p12_probe_word(p, "before enable", R11T_CLUSTER_PWRCL,
+			      "branch", SEQ_CFG_BR_ADDR + last_branch * 4,
+			      r11t_tz_p12_pwrcl_branch[last_branch],
+			      0x5A5A00B1);
+	osm_tz_p12_probe_word(p, "before enable", R11T_CLUSTER_PWRCL,
+			      "microcode", SEQ_MEM_ADDR + last_mc * 4,
+			      r11t_tz_p12_microcode[last_mc],
+			      0x5A5A00C1);
+}
+
+static void osm_tz_p12_probe_after_enable(struct osm_dev *p)
+{
+	const u32 last_slot = R11T_TZ_P12_SLOT_COUNT - 1;
+
+	/* Only the unused slot: the sequencer may be running now. */
+	osm_tz_p12_probe_word(p, "after enable", R11T_CLUSTER_PWRCL,
+			      "slot", SEQ_REG(last_slot),
+			      r11t_tz_p12_pwrcl_slots[last_slot], 0x5A5A0096);
+}
+
+static void osm_tz_p12_probe_state(struct osm_dev *p, const char *stage)
+{
+	unsigned int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 rcgr_cmd = 0, rcgr_cfg = 0;
+		u32 apcs_cmd = 0, apcs_cfg = 0;
+		u32 pstate, pc, cc, enable, trace, desired;
+		u32 pstate2, pc2, cc2;
+
+		if (p->rcgr_base[i]) {
+			rcgr_cmd = readl_relaxed(p->rcgr_base[i] + RCGR_CMD);
+			rcgr_cfg = readl_relaxed(p->rcgr_base[i] + RCGR_CFG);
+		}
+		if (p->apcs_common) {
+			apcs_cmd = readl_relaxed(p->apcs_common +
+						 APCS_COMMON_LMH_CMD_RCGR);
+			apcs_cfg = readl_relaxed(p->apcs_common +
+						 APCS_COMMON_LMH_CFG_RCGR);
+		}
+
+		pstate = osm_read(c, OSM_WDOG_DOMAIN_PSTATE);
+		pc = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
+		cc = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+		enable = osm_read(c, OSM_ENABLE_REG);
+		trace = osm_read(c, OSM_TRACE_CTRL);
+		desired = osm_read(c, OSM_DCVS_PERF_STATE_DESIRED);
+		udelay(p->cc_delay ? p->cc_delay : 5);
+		pstate2 = osm_read(c, OSM_WDOG_DOMAIN_PSTATE);
+		pc2 = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
+		cc2 = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+
+		dev_info(p->dev,
+			 "tz_p12_probe: %s cluster%u enable=%#x trace=%#010x pstate=%#010x/%#010x pc=%#010x/%#010x cycle=%u/%u desired=%u rcgr=%#010x/%#010x src=%#x apcs=%#010x/%#010x\n",
+			 stage, i, enable, trace, pstate, pstate2, pc, pc2,
+			 cc, cc2, desired, rcgr_cmd, rcgr_cfg,
+			 rcgr_cfg & RCGR_CFG_SRC_MASK, apcs_cmd, apcs_cfg);
 	}
 }
 
@@ -4488,6 +4614,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		dev_err(dev, "tz_p12 cannot be combined with other OSM write diagnostics\n");
 		return -EINVAL;
 	}
+	if (tz_p12_probe && !tz_p12) {
+		dev_err(dev, "tz_p12_probe requires tz_p12=1\n");
+		return -EINVAL;
+	}
 	if (slot1_mmio_test && !clock_only) {
 		dev_err(dev, "slot1_mmio_test requires clock_only=1\n");
 		return -EINVAL;
@@ -4887,6 +5017,8 @@ static int r11t_osm_probe(struct platform_device *pdev)
 				osm_mb(c);
 			}
 			osm_setup_tz_p12(p);
+			if (tz_p12_probe)
+				osm_tz_p12_probe_payload(p);
 			goto no_tz_done;
 		}
 
@@ -5134,6 +5266,11 @@ no_tz_done:
 		}
 
 		osm_setup_wdog_trace(p);
+		if (tz_p12_probe) {
+			msleep(20);
+			osm_tz_p12_probe_state(p, "after enable");
+			osm_tz_p12_probe_after_enable(p);
+		}
 		if (tz_p12) {
 			msleep(20);
 			osm_log_tz_p12_state(p, "after enable");
@@ -5169,6 +5306,10 @@ no_tz_done:
 		if (slot1_mmio_test) {
 			msleep(20);
 			osm_slot1_mmio_test_log(p, "after boot row request");
+		}
+		if (tz_p12_probe) {
+			msleep(20);
+			osm_tz_p12_probe_state(p, "after boot row request");
 		}
 		if (tz_p12) {
 			msleep(20);
