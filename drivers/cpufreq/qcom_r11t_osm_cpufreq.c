@@ -73,6 +73,8 @@
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 
+#include "qcom_r11t_osm_tz_p12.h"
+
 /*
  * OSM (One Speed Manager) register map, offsets inside the "osm" reg region.
  */
@@ -626,6 +628,11 @@ module_param(clock_only, bool, 0444);
 MODULE_PARM_DESC(clock_only,
 		 "Default false. Diagnostic: load the OSM sequencer, PLL/GFMUX, ITM and APM operands on a stock DT, but do not program MEM-ACC values. Requires dryrun=0 and qcom,osm-pll-setup. Do not use it as a production power policy. MEASURED LIMIT on R11T (2026-11-20, run 44592587286): the microcode parks at PC 0xdc, which reads MEM-ACC cfg slots 12-14. Those slots need a 40-row MEM-ACC level map that the 8/7-row cpufreq LUT cannot produce, so this mode cannot complete a clock handoff on this board. The SCM read channel (/sys/kernel/debug/qcom_r11t_osm/scm) shows the firmware wrote only the threshold slots 55-58 and the cross-cluster pointers 4/7.");
 
+static bool tz_p12;
+module_param(tz_p12, bool, 0444);
+MODULE_PARM_DESC(tz_p12,
+		 "Diagnostic: load the stock TZ p12 95-slot table, 49-entry branch table, and 182-container microcode into both OSM clusters exactly as recovered from the trustzone descriptor. Requires dryrun=0 clock_only=1 and the stock secure-initialization path. This bypasses CAF sequencer-slot writes; it is an A/B test for the OSM watchdog PC, not a production policy.");
+
 static bool slot1_mmio_test;
 module_param(slot1_mmio_test, bool, 0444);
 MODULE_PARM_DESC(slot1_mmio_test,
@@ -880,18 +887,18 @@ static void osm_probe_pll(struct osm_dev *p)
 }
 
 
-/* r11t_seq_instr: 150 entries, copied verbatim from CAF [caf:263-294] /
- * [caf:296-315].  This is the OSM sequencer's instruction stream and
- * branch table; without it the state machine accepts a row number and
- * then does nothing.
+/*
+ * Historical misaligned view of the TZ p12 program.
  *
- * SUPERSEDED 2026-11-22: the whole table below is now the board's own
- * firmware program, not CAF's.  See the comment above r11t_seq_br_instr
- * for how it was recovered and what is still unverified.  The earlier
- * single-word fix at entry [55] (0x1c02500c -> 0x1c020007, commit
- * 955609168) was measured to make no difference: the watchdog PC still
- * parked at 0xdc with the change in place, so the operand theory was
- * wrong.  It is kept here only as a record of a disproven hypothesis.
+ * A8 proved that this is not the trustzone program. It is exactly the
+ * first 177 words obtained by starting two bytes into the p12 source and
+ * repacking on a four-byte boundary. The initial 0x5000 slot-0 operand is
+ * lost, every halfword instruction boundary is shifted, and the final nine
+ * p12 halfword instructions are absent. The branch table below is also
+ * rotated left by one entry.
+ *
+ * Keep this array only as the historical A/B baseline. The tz_p12 path uses
+ * qcom_r11t_osm_tz_p12.h, which contains the original descriptor payload.
  */
 static const u32 r11t_seq_instr[177] = {
 	0xc2005019, 0x2c9d3b20, 0xc0ab2cdb, 0xc288251a, 0x359cc491, 0x700a500b,
@@ -926,35 +933,7 @@ static const u32 r11t_seq_instr[177] = {
 	0x1c008dd3, 0x10001c2f, 0x1c308dc3,
 };
 
-/* r11t_seq_instr / r11t_seq_br_instr: 177 instructions and 49 branch
- * targets, recovered from this board's own trustzone image.
- *
- * History: the CAF tables (150 instructions, 47 branches) left the
- * sequencer parked at microcode PC 0xdc on every boot, with the cycle
- * counter at 0 and the RCGR stuck on GPLL0.  A single-word operand fix
- * did not move the PC, so the CAF table was compared against the
- * firmware as a whole: the two share only 39 of 150 words in order, so
- * they are different programs rather than a corrupted copy of one.
- *
- * The board's TZ image (tz, mmcblk1p12; tzbak, p13) carries the program
- * twice, byte-identical over 177 words:
- *   copy A  file offset 0xff69a
- *   copy B  file offset 0xff972
- * and a 49-entry branch table at 0xffc4a, stored as offset<<16 with the
- * low half zero; the values below are the decoded offsets.  Both copies
- * of the branch table were verified to agree.
- *
- * What is verified: the two microcode copies are identical, the branch
- * table is self-consistent (every target is < 0x2c2, i.e. inside the 177
- * words), and the firmware's slot references (1-9, 11, 12, 14, 19-25)
- * overlap ours (0-9, 11, 12, 14-23) in all but five slots.
- *
- * What is NOT verified: whether the firmware program expects the same
- * slot CONTENTS that osm_setup_seq() writes.  The firmware never
- * references slots 0, 15, 16, 17 or 18, all of which our setup writes,
- * so its operand source may differ.  That can only be settled on the
- * device by watching the watchdog PC, cycle counter and RCGR.
- */
+/* Historical A/B branch baseline. See the r11t_seq_instr comment above. */
 static const u32 r11t_seq_br_instr[49] = {
 	0x280, 0x28e, 0x0f0, 0x108, 0x118, 0x0d8, 0x0de, 0x0a8,
 	0x0b8, 0x132, 0x100, 0x1a4, 0x1cc, 0x1d0, 0x142, 0x16e,
@@ -2117,11 +2096,67 @@ static void osm_setup_sequencer(struct osm_dev *p)
 	}
 }
 
+static void osm_setup_tz_p12(struct osm_dev *p)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		const u32 *slots = i == R11T_CLUSTER_PWRCL ?
+			r11t_tz_p12_pwrcl_slots : r11t_tz_p12_perfcl_slots;
+		const u32 *branches = i == R11T_CLUSTER_PWRCL ?
+			r11t_tz_p12_pwrcl_branch : r11t_tz_p12_perfcl_branch;
+
+		for (j = 0; j < R11T_TZ_P12_SLOT_COUNT; j++)
+			osm_write_seq_raw(p, i, SEQ_REG(j), slots[j]);
+		osm_mb(&p->cluster[i]);
+
+		for (j = 0; j < R11T_TZ_P12_BRANCH_COUNT; j++)
+			osm_write_seq_raw(p, i, SEQ_CFG_BR_ADDR + j * 4,
+					  branches[j]);
+		osm_mb(&p->cluster[i]);
+
+		for (j = 0; j < R11T_TZ_P12_MICROCODE_COUNT; j++)
+			osm_write_seq_raw(p, i, SEQ_MEM_ADDR + j * 4,
+					  r11t_tz_p12_microcode[j]);
+		osm_mb(&p->cluster[i]);
+
+		dev_info(p->dev,
+			 "cluster%u: TZ p12 loaded (%u slots, %u branches, %u microcode containers)\n",
+			 i, R11T_TZ_P12_SLOT_COUNT, R11T_TZ_P12_BRANCH_COUNT,
+			 R11T_TZ_P12_MICROCODE_COUNT);
+	}
+}
+
+static void osm_log_tz_p12_state(struct osm_dev *p, const char *stage)
+{
+	unsigned int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 pc1 = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
+		u32 cc1 = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+		u32 rcgr_cfg = 0;
+		u32 pc2, cc2;
+
+		udelay(p->cc_delay ? p->cc_delay : 5);
+		pc2 = osm_read(c, OSM_WDOG_PROGRAM_COUNTER);
+		cc2 = osm_read(c, OSM_CYCLE_COUNTER_STATUS);
+		if (p->rcgr_base[i])
+			rcgr_cfg = readl_relaxed(p->rcgr_base[i] + RCGR_CFG);
+
+		dev_info(p->dev,
+			 "tz_p12: %s cluster%u pc=%#010x/%#010x changed=%u cycle=%u/%u desired_row=%u rcgr_src=%#x\n",
+			 stage, i, pc1, pc2, pc1 != pc2, cc1, cc2,
+			 osm_read(c, OSM_DCVS_PERF_STATE_DESIRED),
+			 rcgr_cfg & RCGR_CFG_SRC_MASK);
+	}
+}
+
 static void osm_setup_wdog_trace(struct osm_dev *p)
 {
 	unsigned int i;
 
-	if (!wdog_trace)
+	if (!wdog_trace && !tz_p12)
 		return;
 
 	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
@@ -4444,6 +4479,15 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		dev_err(dev, "clock_only is mutually exclusive with apm/memacc writes\n");
 		return -EINVAL;
 	}
+	if (tz_p12 && (!clock_only || dryrun)) {
+		dev_err(dev, "tz_p12 requires dryrun=0 clock_only=1\n");
+		return -EINVAL;
+	}
+	if (tz_p12 && (apm || memacc || slot1_mmio_test || lval_test ||
+		       pll_bringup_test || rcgr_handoff_test || scm_probe)) {
+		dev_err(dev, "tz_p12 cannot be combined with other OSM write diagnostics\n");
+		return -EINVAL;
+	}
 	if (slot1_mmio_test && !clock_only) {
 		dev_err(dev, "slot1_mmio_test requires clock_only=1\n");
 		return -EINVAL;
@@ -4621,6 +4665,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	p->mem_acc_threshold_prop =
 		of_property_read_bool(dev->of_node,
 				      "qcom,perfcl-apcs-mem-acc-threshold-voltage");
+	if (tz_p12 && p->no_tz) {
+		dev_err(dev, "tz_p12 requires the stock secure-initialization path\n");
+		return -EINVAL;
+	}
 
 	platform_set_drvdata(pdev, p);
 
@@ -4823,6 +4871,25 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		 * and APM VC for both modes [caf:3295-3301], using SCM on the
 		 * stock path.  Those two updates are handled separately below.
 		 */
+		if (tz_p12) {
+			if (!of_property_read_bool(dev->of_node,
+						   "qcom,osm-pll-setup")) {
+				dev_err(dev,
+					"tz_p12 requires qcom,osm-pll-setup; sequencer cannot hand off to an unprepared PLL\n");
+				osmdev = NULL;
+				return -EINVAL;
+			}
+
+			for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+				struct osm_cluster *c = &p->cluster[i];
+
+				osm_write(c, BVAL(23, 16, 0xF), SPM_CC_CTRL);
+				osm_mb(c);
+			}
+			osm_setup_tz_p12(p);
+			goto no_tz_done;
+		}
+
 		if (p->no_tz || clock_only) {
 			struct osm_memacc_cfg memacc_cfg[R11T_NR_CLUSTERS];
 			bool clock_only_stock = clock_only && !p->no_tz;
@@ -5067,6 +5134,10 @@ no_tz_done:
 		}
 
 		osm_setup_wdog_trace(p);
+		if (tz_p12) {
+			msleep(20);
+			osm_log_tz_p12_state(p, "after enable");
+		}
 		osm_probe_scm_slot(p);
 
 		/* CAF's clk_set_rate(boot_rate): row 4 for pwrcl (1401.6 MHz)
@@ -5098,6 +5169,10 @@ no_tz_done:
 		if (slot1_mmio_test) {
 			msleep(20);
 			osm_slot1_mmio_test_log(p, "after boot row request");
+		}
+		if (tz_p12) {
+			msleep(20);
+			osm_log_tz_p12_state(p, "after boot row request");
 		}
 
 	} else {
