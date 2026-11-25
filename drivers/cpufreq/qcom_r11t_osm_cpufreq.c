@@ -653,6 +653,11 @@ module_param(tz_p12_trace_probe, bool, 0444);
 MODULE_PARM_DESC(tz_p12_trace_probe,
 		 "Diagnostic: with tz_p12=1, set the CAF trace master enable (TRACE_CTRL bit 0) on top of the existing watchdog-status bit, sample both clusters 12 times across at least 1 ms after OSM enable and after the boot row request, and restore the exact original TRACE_CTRL. Requires tz_p12=1; only TRACE_CTRL is written.");
 
+static bool tz_p12_state_probe;
+module_param(tz_p12_state_probe, bool, 0444);
+MODULE_PARM_DESC(tz_p12_state_probe,
+		 "Diagnostic: with tz_p12=1, read the full CAF-programmed OSM status set before the TZ payload load, after OSM enable and after the boot row request, cross-check the watchdog page through SCM and scan the 0x1C00 page for read aliases. Strictly read-only; requires tz_p12=1.");
+
 static bool slot1_mmio_test;
 module_param(slot1_mmio_test, bool, 0444);
 MODULE_PARM_DESC(slot1_mmio_test,
@@ -2408,6 +2413,168 @@ static void osm_setup_wdog_trace(struct osm_dev *p)
 		osm_mb(c);
 		dev_info(p->dev, "%s: watchdog trace enabled, TRACE_CTRL=%#010x\n",
 			 c->name, osm_read(c, OSM_TRACE_CTRL));
+	}
+}
+
+/*
+ * A13: audit the execution-state read channel before trusting it.
+ *
+ * A11 recorded PC 0xdc before the TZ payload was loaded, while A8 proved the
+ * sequencer and microcode slots were still zero at that point.  Either the
+ * core really is parked there with no program, or this offset aliases a
+ * constant and every PC/cycle conclusion since A10 is unusable.  This probe
+ * is read-only.  It records the registers CAF programs before ENABLE_REG,
+ * cross-checks the watchdog locations through SCM, and scans the 0x1C00 page
+ * for repeated values so an alias cannot be hidden behind a summary.
+ */
+#define OSM_STATE_WDOG_PAGE_OFF		0x1C00
+#define OSM_STATE_WDOG_PAGE_WORDS	64
+
+static const struct {
+	u32 off;
+	const char *name;
+} osm_state_status_regs[] = {
+	{ OSM_ENABLE_REG, "enable" },
+	{ CC_ZERO_BEHAV_CTRL, "cc_zero" },
+	{ SPM_CC_HYSTERESIS, "spm_cc_hyst" },
+	{ SPM_CC_DCVS_DISABLE, "spm_cc_dcvs_dis" },
+	{ SPM_CORE_RET_MAPPING, "spm_core_ret" },
+	{ SPM_CC_CTRL, "spm_cc_ctrl" },
+	{ LLM_FREQ_VOTE_HYSTERESIS, "llm_freq_hyst" },
+	{ LLM_VOLT_VOTE_HYSTERESIS, "llm_volt_hyst" },
+	{ LLM_INTF_DCVS_DISABLE, "llm_dcvs_dis" },
+	{ FSM_VMIN_REDUC_ENABLE, "vmin_en" },
+	{ FSM_VMIN_REDUC_TIMER, "vmin_timer" },
+	{ FSM_PDN_CTRL, "pdn_fsm_ctrl" },
+	{ FSM_CC_BOOST_TIMER0, "cc_boost_t0" },
+	{ FSM_CC_BOOST_TIMER1, "cc_boost_t1" },
+	{ FSM_CC_BOOST_TIMER2, "cc_boost_t2" },
+	{ FSM_DCVS_BOOST_TIMER0, "dcvs_boost_t0" },
+	{ FSM_DCVS_BOOST_TIMER1, "dcvs_boost_t1" },
+	{ FSM_DCVS_BOOST_TIMER2, "dcvs_boost_t2" },
+	{ FSM_PS_BOOST_TIMER0, "ps_boost_t0" },
+	{ FSM_PS_BOOST_TIMER1, "ps_boost_t1" },
+	{ FSM_PS_BOOST_TIMER2, "ps_boost_t2" },
+	{ FSM_BOOST_SYNC_DELAY, "boost_sync" },
+	{ FSM_DROOP_CTRL, "droop_ctrl" },
+	{ FSM_DROOP_RELEASE_TIMER, "droop_release" },
+	{ FSM_DROOP_UNSTALL_TIMER, "droop_unstall" },
+	{ FSM_DROOP_WAIT_REL_TIMER0, "droop_wait_t0" },
+	{ FSM_DROOP_WAIT_REL_TIMER1, "droop_wait_t1" },
+	{ FSM_DROOP_PROG_SYNC_DELAY, "droop_sync" },
+	{ FSM_DCVS_DROOP_TIMER, "dcvs_droop" },
+	{ FSM_PLL_SW_OVERRIDE_EN, "pll_sw_ovr" },
+	{ OSM_CYCLE_COUNTER_CTRL, "cc_ctrl" },
+	{ OSM_CYCLE_COUNTER_STATUS, "cc_status" },
+	{ OSM_WDOG_DOMAIN_PSTATE, "wdog_pstate" },
+	{ OSM_WDOG_PROGRAM_COUNTER, "wdog_pc" },
+	{ OSM_DCVS_PERF_STATE_DESIRED, "desired_row" },
+};
+
+static void osm_tz_p12_state_dump(struct osm_dev *p, const char *stage)
+{
+	unsigned int i, r;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 apcs_cmd = 0, apcs_cfg = 0;
+		u32 rcgr_cmd = 0, rcgr_cfg = 0;
+
+		if (p->apcs_common) {
+			apcs_cmd = readl_relaxed(p->apcs_common +
+						 APCS_COMMON_LMH_CMD_RCGR);
+			apcs_cfg = readl_relaxed(p->apcs_common +
+						 APCS_COMMON_LMH_CFG_RCGR);
+		}
+		if (p->rcgr_base[i]) {
+			rcgr_cmd = readl_relaxed(p->rcgr_base[i] + RCGR_CMD);
+			rcgr_cfg = readl_relaxed(p->rcgr_base[i] + RCGR_CFG);
+		}
+
+		dev_info(p->dev,
+			 "tz_p12_state_probe: %s cluster%u apcs_cmd=%#010x apcs_cfg=%#010x root_off=%u rcgr_cmd=%#010x rcgr_cfg=%#010x src=%#x\n",
+			 stage, i, apcs_cmd, apcs_cfg, !!(apcs_cmd & BIT(31)),
+			 rcgr_cmd, rcgr_cfg, rcgr_cfg & RCGR_CFG_SRC_MASK);
+
+		for (r = 0; r < ARRAY_SIZE(osm_state_status_regs); r++)
+			dev_info(p->dev,
+				 "tz_p12_state_probe: %s cluster%u %s[%#05x]=%#010x\n",
+				 stage, i, osm_state_status_regs[r].name,
+				 osm_state_status_regs[r].off,
+				 osm_read(c, osm_state_status_regs[r].off));
+	}
+}
+
+static void osm_tz_p12_state_scm_crosscheck(struct osm_dev *p,
+					    const char *stage)
+{
+	unsigned int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		struct {
+			const char *name;
+			u32 off;
+		} regs[] = {
+			{ "pstate", OSM_WDOG_DOMAIN_PSTATE },
+			{ "pc", OSM_WDOG_PROGRAM_COUNTER },
+			{ "cc_status", OSM_CYCLE_COUNTER_STATUS },
+			{ "cc_ctrl", OSM_CYCLE_COUNTER_CTRL },
+		};
+		unsigned int r;
+
+		for (r = 0; r < ARRAY_SIZE(regs); r++) {
+			phys_addr_t addr = p->base_phys +
+				(phys_addr_t)i * OSM_CORE_TABLE_SIZE +
+				regs[r].off;
+			u32 mmio = osm_read(c, regs[r].off);
+			u32 scm = 0;
+			int ret;
+
+			ret = qcom_scm_io_readl(addr, &scm);
+			dev_info(p->dev,
+				 "tz_p12_state_probe: %s cluster%u scm_%s off=%#05x addr=%pa mmio=%#010x scm=%#010x match=%u ret=%d\n",
+				 stage, i, regs[r].name, regs[r].off, &addr,
+				 mmio, scm, ret == 0 && mmio == scm, ret);
+		}
+	}
+}
+
+static void osm_tz_p12_state_alias_scan(struct osm_dev *p, const char *stage)
+{
+	unsigned int i;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 words[OSM_STATE_WDOG_PAGE_WORDS];
+		unsigned int n, k, distinct = 0;
+
+		for (n = 0; n < OSM_STATE_WDOG_PAGE_WORDS; n++)
+			words[n] = osm_read(c, OSM_STATE_WDOG_PAGE_OFF + n * 4);
+
+		for (n = 0; n < OSM_STATE_WDOG_PAGE_WORDS; n++) {
+			bool seen = false;
+
+			for (k = 0; k < n; k++)
+				if (words[k] == words[n]) {
+					seen = true;
+					break;
+				}
+			if (!seen)
+				distinct++;
+		}
+
+		dev_info(p->dev,
+			 "tz_p12_state_probe: %s cluster%u wdog_page off=%#05x words=%u distinct=%u\n",
+			 stage, i, OSM_STATE_WDOG_PAGE_OFF,
+			 OSM_STATE_WDOG_PAGE_WORDS, distinct);
+
+		for (n = 0; n < OSM_STATE_WDOG_PAGE_WORDS; n += 4)
+			dev_info(p->dev,
+				 "tz_p12_state_probe: %s cluster%u wdog_page[%#05x]=%#010x %#010x %#010x %#010x\n",
+				 stage, i, OSM_STATE_WDOG_PAGE_OFF + n * 4,
+				 words[n], words[n + 1], words[n + 2],
+				 words[n + 3]);
 	}
 }
 
@@ -4878,6 +5045,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		dev_err(dev, "tz_p12_trace_probe requires tz_p12=1\n");
 		return -EINVAL;
 	}
+	if (tz_p12_state_probe && !tz_p12) {
+		dev_err(dev, "tz_p12_state_probe requires tz_p12=1\n");
+		return -EINVAL;
+	}
 	if (slot1_mmio_test && !clock_only) {
 		dev_err(dev, "slot1_mmio_test requires clock_only=1\n");
 		return -EINVAL;
@@ -5278,6 +5449,8 @@ static int r11t_osm_probe(struct platform_device *pdev)
 			}
 			if (tz_p12_apm_probe)
 				osm_tz_p12_apm_probe_state(p, "before TZ payload");
+			if (tz_p12_state_probe)
+				osm_tz_p12_state_dump(p, "before TZ payload");
 			osm_setup_tz_p12(p);
 			if (tz_p12_probe)
 				osm_tz_p12_probe_payload(p);
@@ -5543,6 +5716,12 @@ no_tz_done:
 			msleep(20);
 			osm_tz_p12_apm_probe_state(p, "after enable");
 		}
+		if (tz_p12_state_probe) {
+			msleep(20);
+			osm_tz_p12_state_dump(p, "after enable");
+			osm_tz_p12_state_scm_crosscheck(p, "after enable");
+			osm_tz_p12_state_alias_scan(p, "after enable");
+		}
 		if (tz_p12) {
 			msleep(20);
 			osm_log_tz_p12_state(p, "after enable");
@@ -5591,6 +5770,11 @@ no_tz_done:
 		if (tz_p12_apm_probe) {
 			msleep(20);
 			osm_tz_p12_apm_probe_state(p, "after boot row request");
+		}
+		if (tz_p12_state_probe) {
+			msleep(20);
+			osm_tz_p12_state_dump(p, "after boot row request");
+			osm_tz_p12_state_scm_crosscheck(p, "after boot row request");
 		}
 		if (tz_p12) {
 			msleep(20);
