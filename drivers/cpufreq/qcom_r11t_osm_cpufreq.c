@@ -5461,8 +5461,7 @@ static int r11t_osm_probe(struct platform_device *pdev)
 	if (tz_p12_live_probe) {
 		for (i = 0; i < R11T_NR_CLUSTERS; i++)
 			dev_info(dev,
-				 "tz_p12_live_probe: earliest cluster%u enable=%#x cc_ctrl=%#010x
-",
+				 "tz_p12_live_probe: earliest cluster%u enable=%#x cc_ctrl=%#010x\n",
 				 i, osm_read(&p->cluster[i], OSM_ENABLE_REG),
 				 osm_read(&p->cluster[i], OSM_CYCLE_COUNTER_CTRL));
 	}
