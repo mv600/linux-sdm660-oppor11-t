@@ -613,6 +613,11 @@ MODULE_PARM_DESC(rcgr_handoff_row,
  *
  * -1 (default) leaves the PLL alone.
  */
+static bool pll_reset_probe;
+module_param(pll_reset_probe, bool, 0444);
+MODULE_PARM_DESC(pll_reset_probe,
+		 "Test-only: log PLL_STATUS across the CAF MODE 0/2/6/7 sequence. A lock bit that never drops proves MODE is not asserting reset. Default false.");
+
 static int rcgr_live_row = -1;
 module_param(rcgr_live_row, int, 0444);
 MODULE_PARM_DESC(rcgr_live_row,
@@ -3732,9 +3737,27 @@ static int osm_pll_setup_cluster(struct osm_dev *p, int cl, u32 l_val)
 	readl_relaxed(b + PLL_MODE);
 	udelay(PLL_WAIT_LOCK_TIME_US);
 
+	/* If MODE 0x6 really asserts reset, lock must drop here.  A PLL that
+	 * keeps reporting lock through its own reset sequence is telling us
+	 * that MODE is not doing what its name says, and every later "locked"
+	 * reading is stale state rather than proof of a new divider.
+	 */
+	if (pll_reset_probe)
+		dev_info(p->dev,
+			 "%s: MODE 0x2 -> 0x6 transition: STATUS=0x%08x (lock %u) L_VAL=0x%02x\n",
+			 p->cluster[cl].name, readl_relaxed(b + PLL_STATUS),
+			 !!(readl_relaxed(b + PLL_STATUS) & PLL_LOCK_DET_MASK),
+			 readl_relaxed(b + PLL_L_VAL) & 0xff);
+
 	writel_relaxed(PLL_MODE_RESET, b + PLL_MODE);
 	readl_relaxed(b + PLL_MODE);
 	usleep_range(50, 75);
+
+	if (pll_reset_probe)
+		dev_info(p->dev,
+			 "%s: after MODE=0x6: STATUS=0x%08x (lock %u)\n",
+			 p->cluster[cl].name, readl_relaxed(b + PLL_STATUS),
+			 !!(readl_relaxed(b + PLL_STATUS) & PLL_LOCK_DET_MASK));
 
 	writel_relaxed(PLL_MODE_MAIN, b + PLL_MODE);
 	return osm_pll_wait_lock(p, cl);
