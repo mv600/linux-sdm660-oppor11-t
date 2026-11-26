@@ -160,6 +160,16 @@
 #define PLL_WAIT_LOCK_TIME_US 10
 /* PLL_USER_CTL output gates, from Qualcomm HALclkFabiaPLL.h. */
 #define PLL_USER_CTRL_MAIN_OUT  BIT(0)
+/*
+ * Fabia PLL_MODE bits, from mainline drivers/clk/qcom/clk-alpha-pll.c.
+ * PLL_MODE_MAIN (0x7) is only OUTCTRL|BYPASSNL|RESET_N, so writing
+ * PLL_L_VAL updates the register file but not the divider the PLL is
+ * running on.  Fabia's set_rate() raises PLL_UPDATE and waits for the
+ * ACK_LATCH handshake for exactly that reason.
+ */
+#define PLL_UPDATE		BIT(22)
+#define PLL_UPDATE_BYPASS	BIT(23)
+#define PLL_ACK_LATCH		BIT(29)
 /* --------------------------------------------------------------- */
 /* Sequencer registers.  These are offsets into the OSM window     */
 /* (OSM_BASE), NOT into the PLL window -- caf:414-417 writes them   */
@@ -599,6 +609,17 @@ static int rcgr_handoff_row = 1;
 module_param(rcgr_handoff_row, int, 0444);
 MODULE_PARM_DESC(rcgr_handoff_row,
 		 "LUT row for rcgr_handoff_test. Default 1 (633.6 MHz on pwrcl). Row 0 is GPLL0 and is rejected.");
+
+/*
+ * pll_latch: raise PLL_UPDATE and complete the Fabia ACK_LATCH handshake
+ * after programming PLL_L_VAL.  Default on for the test paths only; the
+ * production path never reaches this code, so its behaviour is unchanged.
+ * Set to 0 to reproduce the A18 baseline (L_VAL written, never latched).
+ */
+static bool pll_latch = true;
+module_param(pll_latch, bool, 0444);
+MODULE_PARM_DESC(pll_latch,
+		 "Default true. Test-only: after writing PLL_L_VAL, raise PLL_UPDATE and wait for the Fabia ACK_LATCH handshake (mainline __clk_alpha_pll_update_latch()). Set 0 to reproduce the unlatched A18 baseline.");
 
 /*
  * apm: gate the Array Power Mux programming.  DEFAULT OFF, deliberately.
@@ -3687,7 +3708,83 @@ static int osm_pll_wait_lock(struct osm_dev *p, int cl)
 	return -ETIMEDOUT;
 }
 
-static int osm_pll_setup_cluster(struct osm_dev *p, int cl, u32 l_val)
+/*
+ * Fabia latch handshake, mirroring mainline __clk_alpha_pll_update_latch().
+ *
+ * Programming PLL_L_VAL alone only updates the register file: the divider
+ * inside the PLL keeps the value it captured when the PLL left reset.  That
+ * is why A18 measured 633.6 MHz for L_VAL 33 and then the same 4.97 ns/iter
+ * for L_VAL 47, 58 and 96 -- the readback changed, the clock did not.
+ *
+ * Raise PLL_UPDATE, wait for hardware to retire it, then wait for
+ * PLL_ACK_LATCH to clear and give the output 10 us to settle.  When
+ * PLL_UPDATE_BYPASS is set the hardware leaves UPDATE raised until the
+ * latch is acknowledged, so clear it explicitly in that case.
+ */
+static int osm_pll_update_latch(struct osm_dev *p, int cl)
+{
+	void __iomem *b = p->pll_base[cl];
+	unsigned int waited;
+	u32 mode, old;
+
+	old = readl_relaxed(b + PLL_MODE);
+
+	writel_relaxed(old | PLL_UPDATE, b + PLL_MODE);
+	readl_relaxed(b + PLL_MODE);
+	udelay(1);
+
+	if (old & PLL_UPDATE_BYPASS) {
+		for (waited = 0; waited < 1000; waited++) {
+			if (readl_relaxed(b + PLL_MODE) & PLL_ACK_LATCH)
+				break;
+			udelay(1);
+		}
+		if (waited == 1000) {
+			dev_err(p->dev,
+				"%s: PLL latch never acknowledged: MODE=0x%08x\n",
+				p->cluster[cl].name, readl_relaxed(b + PLL_MODE));
+			return -ETIMEDOUT;
+		}
+		writel_relaxed(readl_relaxed(b + PLL_MODE) & ~PLL_UPDATE,
+			       b + PLL_MODE);
+		readl_relaxed(b + PLL_MODE);
+	} else {
+		for (waited = 0; waited < 1000; waited++) {
+			if (!(readl_relaxed(b + PLL_MODE) & PLL_UPDATE))
+				break;
+			udelay(1);
+		}
+		if (waited == 1000) {
+			dev_err(p->dev,
+				"%s: PLL_UPDATE did not retire: MODE=0x%08x\n",
+				p->cluster[cl].name, readl_relaxed(b + PLL_MODE));
+			return -ETIMEDOUT;
+		}
+	}
+
+	for (waited = 0; waited < 1000; waited++) {
+		if (!(readl_relaxed(b + PLL_MODE) & PLL_ACK_LATCH))
+			break;
+		udelay(1);
+	}
+	if (waited == 1000) {
+		dev_err(p->dev,
+			"%s: PLL ACK_LATCH never cleared: MODE=0x%08x\n",
+			p->cluster[cl].name, readl_relaxed(b + PLL_MODE));
+		return -ETIMEDOUT;
+	}
+
+	udelay(10);
+	mode = readl_relaxed(b + PLL_MODE);
+	dev_info(p->dev,
+		 "%s: PLL latch done: MODE 0x%08x -> 0x%08x L_VAL=0x%02x\n",
+		 p->cluster[cl].name, old, mode,
+		 readl_relaxed(b + PLL_L_VAL) & 0xff);
+	return 0;
+}
+
+static int osm_pll_setup_cluster(struct osm_dev *p, int cl, u32 l_val,
+				 bool latch)
 {
 	void __iomem *b = p->pll_base[cl];
 
@@ -3714,7 +3811,17 @@ static int osm_pll_setup_cluster(struct osm_dev *p, int cl, u32 l_val)
 	usleep_range(50, 75);
 
 	writel_relaxed(PLL_MODE_MAIN, b + PLL_MODE);
-	return osm_pll_wait_lock(p, cl);
+
+	if (osm_pll_wait_lock(p, cl))
+		return -ETIMEDOUT;
+
+	/* The PLL is enabled and locked but still holds the previous divider
+	 * until the update latch is clocked through.
+	 */
+	if (latch)
+		return osm_pll_update_latch(p, cl);
+
+	return 0;
 }
 
 static int osm_pll_lock_row(struct osm_dev *p, int cl, unsigned int row)
@@ -3738,7 +3845,7 @@ static int osm_pll_lock_row(struct osm_dev *p, int cl, unsigned int row)
 
 	dev_info(p->dev, "%s: locking PLL at row %u (%u kHz), L_VAL %u\n",
 		 c->name, row, div_u64(c->lut[row].frequency, 1000), want_lval);
-	return osm_pll_setup_cluster(p, cl, want_lval);
+	return osm_pll_setup_cluster(p, cl, want_lval, pll_latch);
 }
 
 /*
@@ -4174,8 +4281,11 @@ static int osm_pll_prepare_prod(struct osm_dev *p, int cl, unsigned int row)
 	 * requested after ENABLE_REG and the sequencer then writes the row's
 	 * own divider.  Programming the boot L_VAL here would make a failure
 	 * look like success: the PLL would already run at the target rate.
+	 *
+	 * No update latch here: this path keeps its A17 behaviour exactly.
+	 * Only the dryrun diagnostics latch a new divider.
 	 */
-	ret = osm_pll_setup_cluster(p, cl, 0x20);
+	ret = osm_pll_setup_cluster(p, cl, 0x20, false);
 	osm_lval_dump(p, cl, ret ? "setup-failed" : "setup-locked");
 	if (ret)
 		return ret;
