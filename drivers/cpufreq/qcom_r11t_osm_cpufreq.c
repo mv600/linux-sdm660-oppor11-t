@@ -479,6 +479,9 @@ struct osm_dev {
 	/* Exact TRACE_CTRL value captured before the A12 trace probe. */
 	u32 trace_ctrl_orig[R11T_NR_CLUSTERS];
 	bool trace_ctrl_saved;
+	/* Exact DCVS interrupt-enable values captured before the A16 probe. */
+	u32 met_en_orig[R11T_NR_CLUSTERS][3];
+	bool met_en_saved;
 	struct osm_cluster cluster[R11T_NR_CLUSTERS];
 	bool per_policy_governor;
 	/* qcom,osm-no-tz asks Linux to perform the initialization that the
@@ -662,6 +665,11 @@ static bool tz_p12_live_probe;
 module_param(tz_p12_live_probe, bool, 0444);
 MODULE_PARM_DESC(tz_p12_live_probe,
 		 "Diagnostic: with tz_p12=1, record ENABLE_REG before any OSM write, then diff three register pages between two samples and time the cycle counter, to decide whether the OSM block is clocked and running at all. Strictly read-only; requires tz_p12=1.");
+
+static bool tz_p12_met_probe;
+module_param(tz_p12_met_probe, bool, 0444);
+MODULE_PARM_DESC(tz_p12_met_probe,
+		 "Diagnostic: with tz_p12=1, enable CAF's three DCVS completion interrupts (deviation 0x1f18, corrected 0x1f24, met 0x1f30), request one non-zero row, and log whether the hardware acknowledges the request through the already-registered IRQs. Restores the exact original enable values. Requires tz_p12=1.");
 
 static bool slot1_mmio_test;
 module_param(slot1_mmio_test, bool, 0444);
@@ -2508,6 +2516,155 @@ static void osm_tz_p12_live_probe(struct osm_dev *p, const char *stage)
 	osm_tz_p12_live_page(p, stage, 0x1000, 256);
 	osm_tz_p12_live_page(p, stage, 0x1C00, 256);
 	osm_tz_p12_live_page(p, stage, 0x1F00, 64);
+}
+
+/*
+ * A16: ask the sequencer to acknowledge a row request.
+ *
+ * A15 showed that neither WDOG_PROGRAM_COUNTER nor CYCLE_COUNTER_STATUS is a
+ * live execution view: the first is a boot-time latch (0x1C70..0x1C7C is
+ * bit-identical on both clusters and frozen at a 2.54 s XO timestamp) and the
+ * second never leaves zero.  CAF's own runtime acknowledgment is the DCVS
+ * interrupt set: "met" means the requested operating point was reached,
+ * "deviation" means the OSM saw the request and could not meet it, and
+ * "corrected" means it retried and settled elsewhere.  The driver already
+ * registers both cluster IRQs and counts them; only the three enables are
+ * never written.
+ *
+ * This probe writes those three enables, requests one row, and restores the
+ * exact original values.  It touches no slot, branch, microcode, RCGR, PLL,
+ * APM or MEM-ACC register.  Any of the three status bits firing proves the
+ * sequencer executes; none firing, with the enables confirmed set, is strong
+ * evidence it never reaches the checkpoint.
+ */
+#define OSM_MET_EN_REG_COUNT	3
+
+static const u32 osm_met_en_regs[OSM_MET_EN_REG_COUNT] = {
+	OSM_DCVS_DEVIATION_EN,
+	OSM_DCVS_CORRECTED_EN,
+	OSM_DCVS_MET_EN,
+};
+
+static const u32 osm_met_stat_regs[OSM_MET_EN_REG_COUNT] = {
+	OSM_DCVS_DEVIATION_STAT,
+	OSM_DCVS_CORRECTED_STAT,
+	OSM_DCVS_MET_STAT,
+};
+
+static const u32 osm_met_clear_regs[OSM_MET_EN_REG_COUNT] = {
+	OSM_DCVS_DEVIATION_CLEAR,
+	OSM_DCVS_CORRECTED_CLEAR,
+	OSM_DCVS_MET_CLEAR,
+};
+
+static const char * const osm_met_names[OSM_MET_EN_REG_COUNT] = {
+	"deviation", "corrected", "met",
+};
+
+static void osm_tz_p12_met_save(struct osm_dev *p)
+{
+	unsigned int i, k;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+
+		for (k = 0; k < OSM_MET_EN_REG_COUNT; k++)
+			p->met_en_orig[i][k] = osm_read(c, osm_met_en_regs[k]);
+		dev_info(p->dev,
+			 "tz_p12_met_probe: cluster%u saved en deviation=%#010x corrected=%#010x met=%#010x stat=%#010x/%#010x/%#010x\n",
+			 i, p->met_en_orig[i][0], p->met_en_orig[i][1],
+			 p->met_en_orig[i][2],
+			 osm_read(c, osm_met_stat_regs[0]),
+			 osm_read(c, osm_met_stat_regs[1]),
+			 osm_read(c, osm_met_stat_regs[2]));
+	}
+	p->met_en_saved = true;
+}
+
+static void osm_tz_p12_met_arm(struct osm_dev *p)
+{
+	unsigned int i, k;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+
+		/* Drop any stale status first, then unmask bit 0 only. */
+		for (k = 0; k < OSM_MET_EN_REG_COUNT; k++) {
+			osm_write(c, BIT(0), osm_met_clear_regs[k]);
+			osm_write(c, 1, osm_met_en_regs[k]);
+		}
+		osm_mb(c);
+		dev_info(p->dev,
+			 "tz_p12_met_probe: cluster%u armed en deviation=%#010x corrected=%#010x met=%#010x\n",
+			 i, osm_read(c, osm_met_en_regs[0]),
+			 osm_read(c, osm_met_en_regs[1]),
+			 osm_read(c, osm_met_en_regs[2]));
+	}
+}
+
+static void osm_tz_p12_met_sample(struct osm_dev *p, const char *stage)
+{
+	unsigned int i, k;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		u32 stat[OSM_MET_EN_REG_COUNT], en[OSM_MET_EN_REG_COUNT];
+		unsigned long flags;
+		u32 irq_count, irq_dev, irq_corr, irq_met;
+
+		for (k = 0; k < OSM_MET_EN_REG_COUNT; k++) {
+			stat[k] = osm_read(c, osm_met_stat_regs[k]);
+			en[k] = osm_read(c, osm_met_en_regs[k]);
+		}
+		spin_lock_irqsave(&c->irq_lock, flags);
+		irq_count = c->irq_count;
+		irq_dev = c->irq_deviation_count;
+		irq_corr = c->irq_corrected_count;
+		irq_met = c->irq_met_count;
+		spin_unlock_irqrestore(&c->irq_lock, flags);
+
+		dev_info(p->dev,
+			 "tz_p12_met_probe: %s cluster%u stat deviation=%#010x corrected=%#010x met=%#010x en=%#010x/%#010x/%#010x irq=%u/%u/%u/%u desired=%u\n",
+			 stage, i, stat[0], stat[1], stat[2],
+			 en[0], en[1], en[2],
+			 irq_count, irq_dev, irq_corr, irq_met,
+			 osm_read(c, OSM_DCVS_PERF_STATE_DESIRED));
+	}
+}
+
+static void osm_tz_p12_met_restore(struct osm_dev *p)
+{
+	unsigned int i, k;
+
+	if (!p->met_en_saved)
+		return;
+
+	for (i = 0; i < R11T_NR_CLUSTERS; i++) {
+		struct osm_cluster *c = &p->cluster[i];
+		bool ok = true;
+
+		for (k = 0; k < OSM_MET_EN_REG_COUNT; k++)
+			osm_write(c, p->met_en_orig[i][k], osm_met_en_regs[k]);
+		osm_mb(c);
+		for (k = 0; k < OSM_MET_EN_REG_COUNT; k++) {
+			u32 now = osm_read(c, osm_met_en_regs[k]);
+
+			if (now != p->met_en_orig[i][k]) {
+				dev_err(p->dev,
+					"tz_p12_met_probe: cluster%u %s enable restore mismatch %#010x != %#010x\n",
+					i, osm_met_names[k], now,
+					p->met_en_orig[i][k]);
+				ok = false;
+			}
+		}
+		dev_info(p->dev,
+			 "tz_p12_met_probe: cluster%u restored %s en=%#010x/%#010x/%#010x\n",
+			 i, ok ? "ok" : "MISMATCH",
+			 osm_read(c, osm_met_en_regs[0]),
+			 osm_read(c, osm_met_en_regs[1]),
+			 osm_read(c, osm_met_en_regs[2]));
+	}
+	p->met_en_saved = false;
 }
 
 /*
@@ -5147,6 +5304,10 @@ static int r11t_osm_probe(struct platform_device *pdev)
 		dev_err(dev, "tz_p12_live_probe requires tz_p12=1\n");
 		return -EINVAL;
 	}
+	if (tz_p12_met_probe && !tz_p12) {
+		dev_err(dev, "tz_p12_met_probe requires tz_p12=1\n");
+		return -EINVAL;
+	}
 	if (slot1_mmio_test && !clock_only) {
 		dev_err(dev, "slot1_mmio_test requires clock_only=1\n");
 		return -EINVAL;
@@ -5809,6 +5970,11 @@ no_tz_done:
 		}
 
 		osm_setup_wdog_trace(p);
+		if (tz_p12_met_probe) {
+			osm_tz_p12_met_save(p);
+			osm_tz_p12_met_arm(p);
+			osm_tz_p12_met_sample(p, "armed, before boot row");
+		}
 		if (tz_p12_trace_probe) {
 			osm_tz_p12_trace_save(p);
 			osm_tz_p12_trace_setup(p);
@@ -5869,6 +6035,11 @@ no_tz_done:
 		if (slot1_mmio_test) {
 			msleep(20);
 			osm_slot1_mmio_test_log(p, "after boot row request");
+		}
+		if (tz_p12_met_probe) {
+			msleep(20);
+			osm_tz_p12_met_sample(p, "after boot row request");
+			osm_tz_p12_met_restore(p);
 		}
 		if (tz_p12_trace_probe) {
 			usleep_range(1000, 2000);
